@@ -1,0 +1,49 @@
+{
+  "crowdstrike": [
+    {
+      "action": "load_url",
+      "url": "https://crowdstrike.wd5.myworkdayjobs.com/en-US/crowdstrikecareers?locationCountry=bc33aa3152ec42d4995f4791a106ed09"
+    },
+    {
+      "action": "data_extract",
+      "focus_scope": "section[data-automation-id='jobResults']>ul[role='list']>li",
+      "extract_steps": [
+        {
+          "action": "extract",
+          "as_column": "JobID",
+          "xpath": "ul[data-automation-id='subtitle']",
+          "attr_target": null
+        },
+        {
+          "action": "extract",
+          "as_column": "JobTitle",
+          "xpath": "a[data-automation-id='jobTitle']",
+          "attr_target": null
+        },
+        {
+          "action": "extract",
+          "data_type": "url",
+          "as_column": "JobUrl",
+          "xpath": "a[data-automation-id='jobTitle']",
+          "attr_target": "href"
+        },
+        {
+          "action": "redirect",
+          "using_column": "JobUrl"
+        },
+        {
+          "action": "sleep"
+        },
+        {
+          "action": "extract",
+          "as_column": "JobDesc",
+          "xpath": "div[data-automation-id='jobPostingDescription']",
+          "attr_target": null
+        },
+        {
+          "action": "next"
+        }
+      ]
+    }
+  ]
+}
