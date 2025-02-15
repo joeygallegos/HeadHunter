@@ -4,6 +4,9 @@ from selenium import webdriver
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 
+import gspread
+from google.oauth2.service_account import Credentials
+
 import pprint
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse
@@ -11,6 +14,34 @@ from urllib.parse import urlparse
 # Custom object
 from browser import Browser
 
+# Load config
+with open("config.json", "r") as config_file:
+    config = json.load(config_file)
+
+def init_google_sheet():
+    creds = Credentials.from_service_account_file(config['GOOGLE_CREDENTIALS_PATH'], scopes=["https://www.googleapis.com/auth/spreadsheets"])
+    client = gspread.authorize(creds)
+    return client.open_by_key(config['SHEET_ID']).worksheet(config['SHEET_NAME'])
+
+# Initialize worksheet globally
+worksheet = init_google_sheet()
+
+def append_to_google_sheet(data):
+    """
+    Appends a row of data to the global Google Sheet worksheet.
+    
+    :param data: List of values to be appended as a row
+    """
+    try:
+        worksheet.append_row(data, value_input_option="RAW")
+        print("Data successfully appended to Google Sheet.")
+    except Exception as e:
+        print(f"Error: {e}")
+
+def job_id_exists(job_id):
+    """Check if the JobID already exists in the sheet."""
+    existing_ids = worksheet.col_values(1)  # Assuming JobID is in column A (index 1)
+    return job_id in existing_ids
 
 def do_steps():
     # Set up Chrome WebDriver
@@ -147,8 +178,15 @@ def do_steps():
 
                     jobs.append(job_data)
 
-        browser.save_to_json(jobs, f"{site}_job_postings.json")
+                    job_id = job_data.get("JobID")
+                    if job_id and not job_id_exists(job_id):
+                        row = [job_data.get("JobID", ""), job_data.get("JobTitle", ""), job_data.get("JobUrl", ""), job_data.get("JobDesc", "")]
+                        append_to_google_sheet(row)
+                        print(f"Added job: {job_id}")
+                    else:
+                        print(f"Skipped job (already exists): {job_id}")
 
+        browser.save_to_json(jobs, f"{site}_job_postings.json")
 
 if __name__ == "__main__":
     command = input("Enter command (scrape/steps): ").lower()
