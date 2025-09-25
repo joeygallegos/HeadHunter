@@ -87,11 +87,6 @@ class Browser:
     def get_driver(self):
         return self.driver
 
-    @staticmethod
-    def save_to_json(data, filename):
-        with open(filename, "w") as json_file:
-            json.dump(data, json_file, indent=4)
-
     def find_element_safely(self, by, locator, retries=3):
         attempt = 0
         while attempt < retries:

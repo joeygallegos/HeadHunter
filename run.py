@@ -13,6 +13,7 @@ import sys
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse
 from urllib.parse import urljoin
+import getpass
 
 # Custom object
 from browser import Browser
@@ -20,6 +21,11 @@ from selenium.common.exceptions import NoSuchElementException
 
 # Load config from the directory of this file
 script_dir = os.path.dirname(os.path.abspath(__file__))
+OUTPUT_DIR = os.path.join(script_dir, "output")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+print(f"[diag] user={getpass.getuser()} cwd={os.getcwd()} script_dir={script_dir}")
+
 config_path = os.path.join(script_dir, "config.json")
 if not os.path.exists(config_path):
     raise FileNotFoundError("config.json file not found. Please ensure it exists in the script directory.")
@@ -27,8 +33,7 @@ if not os.path.exists(config_path):
 with open(config_path, "r") as config_file:
     config = json.load(config_file)
 
-# Global variables
-global test
+# Global variable to indicate if we are running in test mode
 test = False  # Flag to indicate if we are running in test mode
 
 # Initialize Google Sheets API
@@ -37,6 +42,20 @@ def init_google_sheet():
     creds = Credentials.from_service_account_file(creds_path, scopes=["https://www.googleapis.com/auth/spreadsheets"])
     client = gspread.authorize(creds)
     return client.open_by_key(config['SHEET_ID']).worksheet(config['SHEET_NAME'])
+
+def save_site_json(site: str, jobs: list, output_dir: str = OUTPUT_DIR) -> str:
+    """
+    Write jobs to <output_dir>/<site>_job_postings.json using an absolute path.
+    Atomic-ish replace to avoid partial files if the task gets interrupted.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    out_path = os.path.join(output_dir, f"{site}_job_postings.json")
+    tmp_path = out_path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(jobs, f, ensure_ascii=False, indent=4)
+    os.replace(tmp_path, out_path)  # works across Windows/Unix on same volume
+    print(f"[save] wrote {out_path}")
+    return out_path
 
 # Take the job description and pluck relevant keywords
 def extract_keywords(job_description, top_n=10):
@@ -88,7 +107,7 @@ def job_id_exists(job_id):
     existing_ids = worksheet.col_values(1)  # Assuming JobID is in column A (index 1)
     return job_id in existing_ids
 
-def do_steps(test=False):
+def do_steps():
     """
     Executes a series of automated browser steps for job scraping as defined in a steps.json file.
 
@@ -367,7 +386,7 @@ def do_steps(test=False):
             jobs = remove_canned_text(jobs)
 
             # Save the jobs to a JSON file for the site            
-            browser.save_to_json(jobs, f"{site}_job_postings.json")
+            save_site_json(site, jobs)
             
             # Attempt to add the jobs to the Google Sheet and JSON file
             attempt_add_jobs(jobs)
@@ -429,6 +448,7 @@ def attempt_add_jobs(jobs=None):
     """
     Adds new jobs to the Google Sheet and JSON file.
     Processes an array of job dictionaries, checking for duplicates and extracting relevant fields.
+    Only adds discovery date for new jobs.
     """
     if not jobs or not isinstance(jobs, list):
         print("No jobs provided to attempt_add_jobs.")
@@ -439,6 +459,7 @@ def attempt_add_jobs(jobs=None):
             continue
         job_id = job_data.get("JobID")
         if job_id and not job_id_exists(job_id):
+            discovery_date = time.strftime("%m/%d/%Y")
             job_desc = job_data.get("JobDesc", "")
             job_level = get_job_level(job_data)
             pay_list = scan_for_pay_range(job_desc)
@@ -454,6 +475,8 @@ def attempt_add_jobs(jobs=None):
                 job_desc,
                 job_level,
                 job_pay,
+                "",  # Placeholder for Swipe
+                discovery_date  # Only set for new jobs
             ]
 
             # If not in test mode, append to Google Sheet
@@ -476,11 +499,14 @@ def get_job_level(job_data=None):
     job_title = job_data.get("JobTitle", "")
     job_title_lower = job_title.lower()
 
-    senior_keywords = ["senior", "sr.", "lead", "manager", "director", "iii"]
+    leader_keywords = ["vp", "director", "manager", "head", "chief"]
+    senior_keywords = ["senior", "sr.", "lead", "iii"]
     junior_keywords = ["junior", "jr.", "entry-level", "associate", "trainee"]
     architect_keywords = ["architect", "principal"]
 
-    if any(keyword in job_title_lower for keyword in senior_keywords):
+    if any(keyword in job_title_lower for keyword in leader_keywords):
+        return "Leader"
+    elif any(keyword in job_title_lower for keyword in senior_keywords):
         return "Senior"
     elif any(keyword in job_title_lower for keyword in junior_keywords):
         return "Junior"
@@ -546,7 +572,8 @@ if __name__ == "__main__":
     if command == "steps":
         do_steps()
     elif command == "test":
-        do_steps(True)
+        test = True
+        do_steps()
     elif command == "download":
         nltk.download('punkt')
         nltk.download('averaged_perceptron_tagger_eng')

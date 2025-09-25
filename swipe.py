@@ -38,17 +38,84 @@ def get_jobs():
         job['JobDescHighlighted'] = highlight_as_you_will(job.get('JobTitle', ''), job.get('JobDesc', ''))
     return filtered_jobs
 
-def highlight_as_you_will(job_title, job_desc):
+# Normalize curly quotes to straight so regexes are reliable, but keep 1:1 length
+def _normalize(s: str) -> str:
+    return (s.replace("’", "'")
+             .replace("‘", "'")
+             .replace("“", '"')
+             .replace("”", '"'))
+
+def highlight_as_you_will(job_title: str, job_desc: str) -> str:
     if not job_title or not job_desc:
         return job_desc or ""
-    # Regex: Find "As a [anything] you will..." until first period
-    pattern = rf"(As a\s+.*?you will.*?\.)"
-    def replacer(match):
-        return f"<mark class='bg-yellow-200'>{html.escape(match.group(1))}</mark>"
-    # Only highlight the first match
-    highlighted = re.sub(pattern, replacer, job_desc, count=1, flags=re.IGNORECASE | re.DOTALL)
-    return highlighted
 
+    text = job_desc
+    norm = _normalize(text)
+
+    # Sentence-ish end: stop at ., !, or ? (optionally followed by closing quote/paren) then space or end
+    END = r'[.!?](?:["\')\]]+)?(?:\s|$)'
+
+    # One pattern per rule; we’ll only take the first match for each
+    patterns = [
+        # "As a ... you will ..." — keep it bounded to the sentence
+        rf'\bAs\s+a\b[^.!?]{{0,300}}?\byou\s+will\b[^.!?]*?{END}',
+
+        # Headed sections; avoid Sr./Jr. false stops by checking the char before the dot
+        rf'\bAbout the Role:\s*[^.!?]*?(?<!S)(?<!J)\.{1}(?:\s|$)',
+        rf"\bWhat You(?:'|’)ll Do:\s*[^.!?]*?(?<!S)(?<!J)\.{1}(?:\s|$)",
+
+        rf'\bIn this role\b[^.!?]*?{END}',
+        rf'\bYou will own\b[^.!?]*?{END}',
+        rf'\bYou will be responsible for\b[^.!?]*?{END}',
+        rf'\bYou will lead\b[^.!?]*?{END}',
+        rf'\bYou will manage\b[^.!?]*?{END}',
+        rf'\bAs part of this\b[^.!?]*?{END}',
+        rf'\bThis role will be responsible for\b[^.!?]*?{END}',
+        rf'\bWe seek a\b[^.!?]*?{END}',
+    ]
+
+    flags = re.IGNORECASE
+
+    # Collect at most one span per pattern on the normalized text
+    spans = []
+    for pat in patterns:
+        m = re.search(pat, norm, flags)
+        if m:
+            start, end = m.span()
+            spans.append((start, end))
+
+    if not spans:
+        # Nothing matched; just escape entire text for safety
+        return html.escape(text)
+
+    # Sort and de-overlap: keep earlier, longer spans first where they collide
+    spans.sort()
+    dedup = []
+    last_end = -1
+    for s, e in spans:
+        if s >= last_end:
+            dedup.append((s, e))
+            last_end = e
+        else:
+            # Overlap: keep whichever span is larger (prevents "stepping")
+            prev_s, prev_e = dedup[-1]
+            if (e - s) > (prev_e - prev_s):
+                dedup[-1] = (s, e)
+                last_end = e
+            # else keep previous; drop this one
+
+    # Render once: escape everything, wrap matched slices
+    out = []
+    cursor = 0
+    for s, e in dedup:
+        if cursor < s:
+            out.append(html.escape(text[cursor:s]))
+        out.append(f"<mark class='bg-yellow-200'>{html.escape(text[s:e])}</mark>")
+        cursor = e
+    if cursor < len(text):
+        out.append(html.escape(text[cursor:]))
+
+    return ''.join(out)
 
 @app.route('/')
 def index():
@@ -67,15 +134,14 @@ def index():
                     <h2 class="text-2xl font-bold mb-2" x-text="currentJob().JobTitle || 'No Title'"></h2>
                     <p class="mb-1">
                         <span class="font-semibold">Level:</span>
-                        <span 
-                            x-text="currentJob().JobLevel || ''"
-                            :class="{
-                                'bg-red-500 text-white px-2 rounded': (currentJob().JobLevel || '').toLowerCase() === 'architect',
-                                'bg-orange-400 text-white px-2 rounded': (currentJob().JobLevel || '').toLowerCase() === 'senior'
-                            }"
-                        ></span>
+                        <span
+                        x-text="currentJob().JobLevel || ''"
+                        :class="`text-white px-2 rounded ${levelClass()}`">
+                        </span>
                     </p>
-                    <p class="mb-4"><span class="font-semibold">Pay:</span> <span x-text="currentJob().JobPay || ''"></span></p>
+                    <p class="mb-1"><span class="font-semibold">Pay:</span> <span x-text="currentJob().JobPay || ''"></span></p>
+                    <p class="mb-1"><span class="font-semibold">Discovery Date:</span> <span x-text="currentJob().DiscoveryDate || ''"></span></p>
+                    <p class="mb-1"><span class="font-semibold">ID:</span> <span x-text="currentJob().JobID || ''"></span></p>
                     <p class="mb-2" x-html="currentJob().JobDescHighlighted || 'No Description'"></p>
                     <p class="mb-1"><span class="font-semibold">Keywords:</span> <span x-text="currentJob().Keywords || ''"></span></p>
                     <template x-if="currentJob().JobUrl">
@@ -112,6 +178,17 @@ def index():
                     },
                     currentJob() {
                         return this.jobs[this.idx] || {};
+                    },
+                    levelClass() {
+                        const lvl = (this.currentJob().JobLevel || '').toLowerCase();
+                        const map = {
+                            architect: 'bg-red-500',
+                            senior:    'bg-orange-400',
+                            leader:    'bg-gray-400',    // <- use gray-*, not slate-* on Tailwind v2
+                            junior:    'bg-blue-400',
+                            unknown:   'bg-gray-400',
+                        };
+                        return map[lvl] || 'bg-gray-300';
                     },
                     swipe(action) {
                         fetch('/swipe', {
