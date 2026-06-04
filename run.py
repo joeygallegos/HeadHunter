@@ -1,6 +1,7 @@
 # /run.py
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import getpass
 import hashlib
 import logging
@@ -10,21 +11,17 @@ import time
 from logging.handlers import RotatingFileHandler
 from typing import Any, Dict, List
 
-# Ensure package import from any cwd
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
-# Load .env here so env vars are available to this module
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# SQLAlchemy
 from sqlalchemy import select, func
 from sqlalchemy.exc import IntegrityError
 
-# Project imports
 from app.scraper import StepScraper
 from app.json_writer import save_site_json
 from app.utils import (
@@ -34,28 +31,17 @@ from app.utils import (
     scan_for_pay_range,
     remove_canned_text,
 )
-from app.models import (
-    SessionLocal,
-    init_db,
-    IntegrationRun,
-    Job,
-    JobChange,
-)
+from app.models import SessionLocal, init_db, IntegrationRun, Job, JobChange
 
 OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 
-# -------------------------------
-# Logging (single-file)
-# -------------------------------
-
+# ------------------------------- logging -------------------------------
 _LOGGER_NAME = "app"
 _LOG_DIR = None
 _RUN_FILE_HANDLER: RotatingFileHandler | None = None
 
 
 class _ContextAdapter(logging.LoggerAdapter):
-    """Inject stable fields so every line has run/site/job (why: actionable logs)."""
-
     def process(self, msg, kwargs):
         extra = dict(self.extra)
         incoming = kwargs.get("extra") or {}
@@ -65,8 +51,6 @@ class _ContextAdapter(logging.LoggerAdapter):
 
 
 class DefaultContextFilter(logging.Filter):
-    """Guarantee required fields exist on *all* records to avoid KeyError."""
-
     def filter(self, record: logging.LogRecord) -> bool:
         if not hasattr(record, "run_id"):
             record.run_id = "-"
@@ -78,8 +62,6 @@ class DefaultContextFilter(logging.Filter):
 
 
 class Timer:
-    """Duration helper, logs success/failure durations."""
-
     def __init__(self, label: str, logger: logging.Logger, **ctx):
         self.label = label
         self.logger = _ContextAdapter(logger, ctx)
@@ -128,31 +110,18 @@ def setup_logging(
     log_dir = _ensure_log_dir()
     level = (level or os.getenv("LOG_LEVEL", "INFO")).upper()
     sql_level = (sql_level or os.getenv("LOG_SQL", "WARNING")).upper()
-
-    fmt = (
-        "%(asctime)s %(levelname)s "
-        "run=%(run_id)s site=%(site)s job=%(job_id)s "
-        "%(name)s:%(funcName)s:%(lineno)d | %(message)s"
-    )
+    fmt = "%(asctime)s %(levelname)s run=%(run_id)s site=%(site)s job=%(job_id)s %(name)s:%(funcName)s:%(lineno)d | %(message)s"
     datefmt = "%Y-%m-%d %H:%M:%S"
-
-    # Root logger
     root = logging.getLogger()
     for h in list(root.handlers):
         root.removeHandler(h)
     root.setLevel(getattr(logging, level, logging.INFO))
-
-    # Defaulting filter to prevent KeyError on third-party records
-    default_filter = DefaultContextFilter()
-
-    # Console
+    df = DefaultContextFilter()
     sh = logging.StreamHandler(sys.stdout)
     sh.setLevel(getattr(logging, level, logging.INFO))
     sh.setFormatter(logging.Formatter(fmt=fmt, datefmt=datefmt))
-    sh.addFilter(default_filter)
+    sh.addFilter(df)
     root.addHandler(sh)
-
-    # Rotating app.log
     fh = RotatingFileHandler(
         os.path.join(log_dir, "app.log"),
         maxBytes=10_000_000,
@@ -161,23 +130,17 @@ def setup_logging(
     )
     fh.setLevel(getattr(logging, level, logging.INFO))
     fh.setFormatter(logging.Formatter(fmt=fmt, datefmt=datefmt))
-    fh.addFilter(default_filter)
+    fh.addFilter(df)
     root.addHandler(fh)
-
-    # Also attach to root so *all* child loggers inherit the default fields
-    root.addFilter(default_filter)
-
-    # SQLAlchemy logs
+    root.addFilter(df)
     logging.getLogger("sqlalchemy.engine").setLevel(
         getattr(logging, sql_level, logging.WARNING)
     )
     logging.getLogger("sqlalchemy.pool").setLevel(
         getattr(logging, sql_level, logging.WARNING)
     )
-
     logger = logging.getLogger(_LOGGER_NAME)
 
-    # Unhandled exception capture
     def _excepthook(exc_type, exc, tb):
         _ContextAdapter(logger, {"run_id": "-", "site": "-", "job_id": "-"}).critical(
             "Unhandled exception", exc_info=(exc_type, exc, tb)
@@ -189,7 +152,6 @@ def setup_logging(
 
 
 def add_run_file_handler(run_label: str) -> None:
-    """Attach a per-run rotating file if not yet attached."""
     global _RUN_FILE_HANDLER
     if _RUN_FILE_HANDLER:
         return
@@ -198,13 +160,8 @@ def add_run_file_handler(run_label: str) -> None:
     path = os.path.join(_LOG_DIR, f"run_{run_label}.log")
     h = RotatingFileHandler(path, maxBytes=50_000_000, backupCount=1, encoding="utf-8")
     h.setLevel(logging.DEBUG)
-    fmt = (
-        "%(asctime)s %(levelname)s "
-        "run=%(run_id)s site=%(site)s job=%(job_id)s "
-        "%(name)s:%(funcName)s:%(lineno)d | %(message)s"
-    )
+    fmt = "%(asctime)s %(levelname)s run=%(run_id)s site=%(site)s job=%(job_id)s %(name)s:%(funcName)s:%(lineno)d | %(message)s"
     h.setFormatter(logging.Formatter(fmt=fmt, datefmt="%Y-%m-%d %H:%M:%S"))
-    # IMPORTANT: add the same defaulting filter here too
     h.addFilter(DefaultContextFilter())
     logging.getLogger().addHandler(h)
     _RUN_FILE_HANDLER = h
@@ -222,15 +179,12 @@ def log_startup_environment(logger: logging.LoggerAdapter) -> None:
         "DATABASE_URL": _mask_url(os.getenv("DATABASE_URL")),
         "LOG_LEVEL": os.getenv("LOG_LEVEL", ""),
         "LOG_SQL": os.getenv("LOG_SQL", ""),
+        "ITEM_DELAY_MS": os.getenv("ITEM_DELAY_MS", ""),
     }
     logger.info("startup env %s | base_dir=%s", env, BASE_DIR)
 
 
-# -------------------------------
-# Helpers
-# -------------------------------
-
-
+# ------------------------------- helpers -------------------------------
 def _norm_text(x: str | None) -> str:
     return (x or "").replace("\u202f", " ").replace("\u00a0", " ").strip()
 
@@ -248,17 +202,28 @@ def _changed_fields(old: Job, new: Job) -> List[str]:
 
 
 def _normalize_job(site: str, run_id: int, job_data: Dict[str, Any]) -> Job | None:
-    job_id = str(job_data.get("JobID", "")).strip()
+    job_id = _norm_text(str(job_data.get("JobID", "")))
+    job_id = job_id.strip()
     if not job_id:
         return None
-    title = _norm_text(str(job_data.get("JobTitle", "")).strip())
-    url = _norm_text(str(job_data.get("JobUrl", "")).strip())
-    desc = _norm_text(str(job_data.get("JobDesc", "")).strip())
-    keywords = ", ".join(extract_keywords(desc))
+
+    title = _norm_text(str(job_data.get("JobTitle", "")))
+    url = _norm_text(str(job_data.get("JobUrl", "")))
+    desc = _norm_text(str(job_data.get("JobDesc", "")))
+
+    # Make keywords stable across runs (avoid reorder-triggered updates)
+    kw = extract_keywords(desc) or []
+    kw = sorted({k.strip() for k in kw if k and k.strip()})
+    keywords = ", ".join(kw)
+
     level = get_job_level(title)
-    pay_hits = scan_for_pay_range(desc)
+
+    pay_hits = scan_for_pay_range(desc) or []
     pay = pay_hits[0] if pay_hits else "Unknown"
-    discovery_date = time.strftime("%m/%d/%Y")
+
+    # NOTE: Keep setting discovery_date here for inserts,
+    # but DO NOT copy it onto existing rows during updates.
+    discovery_date = datetime.now(timezone.utc)
 
     job = Job(
         job_id=job_id,
@@ -276,11 +241,7 @@ def _normalize_job(site: str, run_id: int, job_data: Dict[str, Any]) -> Job | No
     return job
 
 
-# -------------------------------
-# Delta logic
-# -------------------------------
-
-
+# ------------------------------- delta logic -------------------------------
 def _process_site(
     s,
     site: str,
@@ -292,22 +253,14 @@ def _process_site(
     per_job_commit: bool,
     logger,
 ) -> None:
-    """Perform inserts/updates/missing for a single site."""
     site_log = get_logger(run_id=run_id, site=site)
     if not jobs_raw:
         site_log.info("no jobs for site")
         return
 
-    with Timer(f"{site} preproc+save_json", logger=site_log):
-        jobs_raw = remove_canned_text(jobs_raw)
-        os.makedirs(OUTPUT_DIR, exist_ok=True)
-        save_site_json(OUTPUT_DIR, site, jobs_raw)
-
-    existing_by_id: Dict[str, Job] = {
-        row.job_id: row
-        for row in s.execute(select(Job).where(Job.site == site)).scalars()
-    }
-    missing_ids = set(existing_by_id.keys())
+    def _canon_job_id(x: str | None) -> str:
+        # Canonical form for comparisons (prevents case/whitespace mismatch issues)
+        return _norm_text(x or "").strip().lower()
 
     def _do_commit():
         try:
@@ -317,18 +270,87 @@ def _process_site(
             site_log.exception("commit failed")
             raise
 
-    for jd in jobs_raw:
-        job_obj = _normalize_job(site, run_id, jd)
-        job_id = str(jd.get("JobID", "")).strip() or "-"
-        row_log = get_logger(run_id=run_id, site=site, job_id=job_id)
+    with Timer(f"{site} preproc+save_json", logger=site_log):
+        jobs_raw = remove_canned_text(jobs_raw)
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        save_site_json(OUTPUT_DIR, site, jobs_raw)
 
+    # Load existing jobs for the site, keyed by canonical job_id
+    existing_rows = s.execute(select(Job).where(Job.site == site)).scalars().all()
+    existing_by_cid: Dict[str, Job] = {
+        _canon_job_id(r.job_id): r for r in existing_rows
+    }
+    missing_cids = set(existing_by_cid.keys())
+
+    def _fetch_existing_by_cid(cid: str) -> Job | None:
+        # In case of collation/case-insensitive uniqueness, find the existing row reliably
+        return (
+            s.execute(
+                select(Job).where(
+                    Job.site == site,
+                    func.lower(func.trim(Job.job_id)) == cid,
+                )
+            )
+            .scalars()
+            .first()
+        )
+
+    def _run_op(op_fn, row_log, on_integrity=None):
+        if per_job_commit:
+            try:
+                op_fn()
+                _do_commit()
+                return True
+            except IntegrityError:
+                s.rollback()
+                counters["error_count"] += 1
+                row_log.exception("integrity error")
+                if on_integrity:
+                    on_integrity()
+                return False
+
+        if use_savepoints:
+            try:
+                with s.begin_nested():
+                    op_fn()
+                return True
+            except IntegrityError:
+                counters["error_count"] += 1
+                row_log.exception("integrity error (savepoint)")
+                if on_integrity:
+                    on_integrity()
+                return False
+
+        # No savepoints: must rollback on IntegrityError or session becomes unusable
+        try:
+            op_fn()
+            return True
+        except IntegrityError:
+            s.rollback()
+            counters["error_count"] += 1
+            row_log.exception("integrity error (no sp)")
+            if on_integrity:
+                on_integrity()
+            return False
+
+    for jd in jobs_raw:
+        job_id_text = _norm_text(str(jd.get("JobID", ""))) or "-"
+        row_log = get_logger(run_id=run_id, site=site, job_id=job_id_text)
+
+        job_obj = _normalize_job(site, run_id, jd)
         if not job_obj:
             counters["error_count"] += 1
             row_log.warning("skip row: missing JobID")
             continue
 
         counters["total_seen"] += 1
-        prev = existing_by_id.get(job_obj.job_id)
+
+        cid = _canon_job_id(job_obj.job_id)
+
+        # If we saw this ID in the scrape, it is not missing (even if insert/update fails later)
+        missing_cids.discard(cid)
+
+        prev = existing_by_cid.get(cid)
 
         def _insert_job():
             job_obj.is_active = True
@@ -343,6 +365,7 @@ def _process_site(
                     job_id_text=job_obj.job_id,
                     site=site,
                     change_type="insert",
+                    change_source="site",
                     old_hash=None,
                     new_hash=job_obj.content_hash,
                     changed_fields="title,url,desc,keywords,level,pay",
@@ -350,28 +373,34 @@ def _process_site(
             )
             counters["inserted_count"] += 1
             row_log.info("inserted")
-            existing_by_id[job_obj.job_id] = job_obj
+            existing_by_cid[cid] = job_obj
 
-        def _update_job():
-            old_hash = prev.content_hash
-            changed = _changed_fields(prev, job_obj)
-            prev.title = job_obj.title
-            prev.url = job_obj.url
-            prev.desc = job_obj.desc
-            prev.keywords = job_obj.keywords
-            prev.level = job_obj.level
-            prev.pay = job_obj.pay
-            prev.discovery_date = job_obj.discovery_date
-            prev.content_hash = job_obj.content_hash
-            prev.is_active = True
-            prev.last_seen_run_id = run_id
+        def _update_existing(target: Job):
+            old_hash = target.content_hash
+            changed = _changed_fields(target, job_obj)
+
+            target.title = job_obj.title
+            target.url = job_obj.url
+            target.desc = job_obj.desc
+            target.keywords = job_obj.keywords
+            target.level = job_obj.level
+            target.pay = job_obj.pay
+
+            # CRITICAL FIX: never overwrite discovery_date on update
+            # target.discovery_date stays as first-seen timestamp
+
+            target.content_hash = job_obj.content_hash
+            target.is_active = True
+            target.last_seen_run_id = run_id
+
             s.add(
                 JobChange(
                     run_id=run_id,
-                    job_pk=prev.id,
-                    job_id_text=prev.job_id,
+                    job_pk=target.id,
+                    job_id_text=target.job_id,
                     site=site,
                     change_type="update",
+                    change_source="site",
                     old_hash=old_hash,
                     new_hash=job_obj.content_hash,
                     changed_fields=",".join(changed),
@@ -380,77 +409,57 @@ def _process_site(
             counters["updated_count"] += 1
             row_log.info("updated fields=%s", changed)
 
-        if prev is None:
-            if per_job_commit:
-                try:
-                    _insert_job()
-                    _do_commit()
-                except IntegrityError:
-                    s.rollback()
-                    counters["error_count"] += 1
-                    row_log.exception("insert integrity error")
-                continue
-            elif use_savepoints:
-                try:
-                    with s.begin_nested():
-                        _insert_job()
-                except IntegrityError:
-                    counters["error_count"] += 1
-                    row_log.exception("insert integrity error (savepoint)")
-                continue
-            else:
-                try:
-                    _insert_job()
-                except IntegrityError:
-                    counters["error_count"] += 1
-                    row_log.exception("insert integrity error (no sp)")
-                continue
-
-        # Existing
-        missing_ids.discard(job_obj.job_id)
-        if prev.content_hash != job_obj.content_hash:
-            if per_job_commit:
-                try:
-                    _update_job()
-                    _do_commit()
-                except IntegrityError:
-                    s.rollback()
-                    counters["error_count"] += 1
-                    row_log.exception("update integrity error")
-            elif use_savepoints:
-                try:
-                    with s.begin_nested():
-                        _update_job()
-                except IntegrityError:
-                    counters["error_count"] += 1
-                    row_log.exception("update integrity error (savepoint)")
-            else:
-                try:
-                    _update_job()
-                except IntegrityError:
-                    counters["error_count"] += 1
-                    row_log.exception("update integrity error (no sp)")
-        else:
-            prev.is_active = True
-            prev.last_seen_run_id = run_id
-            if per_job_commit:
-                _do_commit()
-            else:
-                counters["unchanged_count"] += 1
+        def _touch_existing(target: Job):
+            # Seen but content unchanged
+            target.is_active = True
+            target.last_seen_run_id = run_id
+            counters["unchanged_count"] += 1
             row_log.debug("unchanged")
 
-    # Mark missing after processing all seen items
-    if missing_ids:
-        site_log.info("marking missing count=%d", len(missing_ids))
-        rows = (
-            s.execute(
-                select(Job).where(Job.site == site, Job.job_id.in_(list(missing_ids)))
+        if prev is None:
+
+            def _on_insert_integrity():
+                # If insert failed, treat the existing row as "seen" and update/touch it
+                existing = _fetch_existing_by_cid(cid)
+                if not existing:
+                    return
+                existing_by_cid[cid] = existing
+                # We already missing_cids.discard(cid) above, so it won't be marked missing.
+                if existing.content_hash != job_obj.content_hash:
+                    _run_op(lambda: _update_existing(existing), row_log)
+                else:
+                    _run_op(lambda: _touch_existing(existing), row_log)
+
+            _run_op(_insert_job, row_log, on_integrity=_on_insert_integrity)
+            continue
+
+        # Existing row path
+        if prev.content_hash != job_obj.content_hash:
+            _run_op(lambda: _update_existing(prev), row_log)
+        else:
+            _run_op(lambda: _touch_existing(prev), row_log)
+
+    # Mark missing: anything previously active that we did NOT see this run
+    if missing_cids:
+        # Convert canonical IDs back to stored job_id values for querying
+        missing_job_ids = [
+            existing_by_cid[cid].job_id
+            for cid in missing_cids
+            if cid in existing_by_cid
+        ]
+        if missing_job_ids:
+            site_log.info("marking missing count=%d", len(missing_job_ids))
+            rows = (
+                s.execute(
+                    select(Job).where(Job.site == site, Job.job_id.in_(missing_job_ids))
+                )
+                .scalars()
+                .all()
             )
-            .scalars()
-            .all()
-        )
-        for r in rows:
-            if r.is_active:
+
+            for r in rows:
+                if not r.is_active:
+                    continue
 
                 def _mark_missing():
                     r.is_active = False
@@ -461,6 +470,7 @@ def _process_site(
                             job_id_text=r.job_id,
                             site=site,
                             change_type="missing",
+                            change_source="site",
                             old_hash=r.content_hash,
                             new_hash=None,
                             changed_fields="",
@@ -471,28 +481,19 @@ def _process_site(
                         "marked missing"
                     )
 
-                if per_job_commit:
-                    _mark_missing()
-                    _do_commit()
-                elif use_savepoints:
-                    with s.begin_nested():
-                        _mark_missing()
-                else:
-                    _mark_missing()
+                _run_op(
+                    _mark_missing, get_logger(run_id=run_id, site=site, job_id=r.job_id)
+                )
 
 
-# -------------------------------
-# Main
-# -------------------------------
-
-
+# ------------------------------- main -------------------------------
 def main():
     setup_logging()
     base_log = get_logger()
     log_startup_environment(base_log)
 
     if len(sys.argv) < 2:
-        base_log.error("Usage: python run.py [initdb|steps|test|download]")
+        base_log.error("Usage: python run.py [initdb|steps|test|download|reprocess]")
         sys.exit(1)
 
     cmd = sys.argv[1].lower()
@@ -500,6 +501,24 @@ def main():
         with Timer("NLTK ensure", logger=base_log):
             ensure_nltk()
         base_log.info("NLTK ready")
+        sys.exit(0)
+
+    if cmd == "reprocess":
+        # loop all jobs and reprocess job levels
+        with SessionLocal() as s:
+            rows = s.execute(select(Job)).scalars().all()
+            for i, r in enumerate(rows, 1):
+                r.level = get_job_level(r.title)
+
+                if r.level == "Unknown":
+                    print(
+                        f"Failed reprocess job_id={r.job_id} level={r.level} - title={r.title}"
+                    )
+                s.add(r)
+                if i % 25 == 0:
+                    print(f"Processed {i} jobs...")
+            s.commit()
+            base_log.info("reprocessed %d jobs", len(rows))
         sys.exit(0)
 
     commit_mode = os.getenv("DB_COMMIT_MODE", "all_at_end").lower()
@@ -511,7 +530,6 @@ def main():
 
     with Timer("init_db", logger=base_log):
         init_db()
-
     test_mode = cmd == "test"
     steps_path = os.path.join(BASE_DIR, "test.json" if test_mode else "steps.json")
 
@@ -519,6 +537,7 @@ def main():
         ensure_nltk()
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+    # Open run row
     with SessionLocal.begin() as s:
         run = IntegrationRun(
             user=getpass.getuser(), mode=("test" if test_mode else "steps")
@@ -532,10 +551,7 @@ def main():
     run_log = get_logger(run_id=run_id)
     run_log.info("run opened | commit_mode=%s | steps_path=%s", commit_mode, steps_path)
 
-    with Timer("scraper.run", logger=run_log):
-        scraper = StepScraper(steps_path, headless=False)
-        site_to_jobs = scraper.run()
-    run_log.info("scraper returned sites=%d", len(site_to_jobs))
+    scraper = StepScraper(steps_path)
 
     counters = {
         "total_seen": 0,
@@ -548,10 +564,12 @@ def main():
 
     try:
         if commit_mode == "per_job":
+            run_log.info("streaming mode: persisting per job")
             with SessionLocal() as s:
-                for site, jobs_raw in site_to_jobs.items():
+                for site, jobs_raw in scraper.run_iter():
+                    site_log = get_logger(run_id=run_id, site=site)
                     if not jobs_raw:
-                        get_logger(run_id=run_id, site=site).info("skip empty site")
+                        site_log.info("skip empty site")
                         continue
                     with Timer(f"persist {site}", logger=run_log, site=site):
                         _process_site(
@@ -564,14 +582,25 @@ def main():
                             per_job_commit=True,
                             logger=run_log,
                         )
+                    site_log.info(
+                        "site persisted (per_job) | totals so far new=%d upd=%d miss=%d same=%d err=%d",
+                        counters["inserted_count"],
+                        counters["updated_count"],
+                        counters["missing_count"],
+                        counters["unchanged_count"],
+                        counters["error_count"],
+                    )
 
         elif commit_mode == "per_site":
-            with SessionLocal() as s:
-                for site, jobs_raw in site_to_jobs.items():
-                    if not jobs_raw:
-                        get_logger(run_id=run_id, site=site).info("skip empty site")
-                        continue
-                    with s.begin():
+            run_log.info("streaming mode: persisting per site")
+            for site, jobs_raw in scraper.run_iter():
+                site_log = get_logger(run_id=run_id, site=site)
+                if not jobs_raw:
+                    site_log.info("skip empty site")
+                    continue
+                site_log.info("begin site transaction")
+                try:
+                    with SessionLocal.begin() as s:
                         with Timer(f"persist {site}", logger=run_log, site=site):
                             _process_site(
                                 s,
@@ -583,13 +612,29 @@ def main():
                                 per_job_commit=False,
                                 logger=run_log,
                             )
+                    site_log.info(
+                        "commit site transaction (ok) | totals so far new=%d upd=%d miss=%d same=%d err=%d",
+                        counters["inserted_count"],
+                        counters["updated_count"],
+                        counters["missing_count"],
+                        counters["unchanged_count"],
+                        counters["error_count"],
+                    )
+                except Exception:
+                    site_log.exception("rollback site transaction (error)")
+                    continue
 
         else:  # all_at_end
+            run_log.info("bulk mode: scraping all then one big transaction")
+            with Timer("scraper.run", logger=run_log):
+                site_to_jobs = scraper.run()
+            run_log.info("scraper returned sites=%d", len(site_to_jobs))
             with SessionLocal() as s:
-                with s.begin():
+                with s.begin():  # one big transaction
                     for site, jobs_raw in site_to_jobs.items():
+                        site_log = get_logger(run_id=run_id, site=site)
                         if not jobs_raw:
-                            get_logger(run_id=run_id, site=site).info("skip empty site")
+                            site_log.info("skip empty site")
                             continue
                         with Timer(f"persist {site}", logger=run_log, site=site):
                             _process_site(
@@ -602,6 +647,7 @@ def main():
                                 per_job_commit=False,
                                 logger=run_log,
                             )
+
     except Exception:
         run_log.exception("persistence phase crashed")
         raise
