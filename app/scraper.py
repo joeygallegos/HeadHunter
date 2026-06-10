@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import time
 from typing import Any, Dict, List, Optional, Iterator, Tuple
 from urllib.parse import urljoin, urlparse
@@ -54,6 +55,77 @@ def _sleep_default(*, reason: str) -> None:
 
 ITEM_DELAY_MS = _get_item_delay_ms()
 
+_BROWSER_BINARY_ENV_VARS = (
+    "BROWSER_BINARY_PATH",
+    "CHROME_BINARY_PATH",
+    "CHROMIUM_BINARY_PATH",
+)
+
+_LINUX_BROWSER_BINARY_CANDIDATES = (
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
+    "/snap/bin/chromium",
+    "/usr/bin/google-chrome",
+    "/usr/bin/google-chrome-stable",
+)
+
+_BROWSER_BINARY_NAMES = (
+    "chromium",
+    "chromium-browser",
+    "google-chrome",
+    "google-chrome-stable",
+    "chrome",
+)
+
+
+def _resolve_existing_executable(value: str) -> Optional[str]:
+    value = value.strip()
+    if not value:
+        return None
+    if os.path.exists(value):
+        return value
+    return shutil.which(value)
+
+
+def _resolve_browser_binary() -> Optional[str]:
+    for env_name in _BROWSER_BINARY_ENV_VARS:
+        value = os.getenv(env_name)
+        if not value:
+            continue
+        resolved = _resolve_existing_executable(value)
+        if resolved:
+            _dbg(f"Using browser binary from {env_name}: {resolved}")
+            return resolved
+        raise RuntimeError(
+            f"{env_name} is set but does not point to an executable browser: {value}"
+        )
+
+    for name in _BROWSER_BINARY_NAMES:
+        resolved = shutil.which(name)
+        if resolved:
+            _dbg(f"Using browser binary from PATH: {resolved}")
+            return resolved
+
+    for path in _LINUX_BROWSER_BINARY_CANDIDATES:
+        if os.path.exists(path):
+            _dbg(f"Using browser binary: {path}")
+            return path
+
+    return None
+
+
+def _resolve_chromedriver_path() -> Optional[str]:
+    chromedriver_path = os.getenv("CHROMEDRIVER_PATH")
+    if chromedriver_path:
+        resolved = _resolve_existing_executable(chromedriver_path)
+        if resolved:
+            return resolved
+        raise RuntimeError(
+            "CHROMEDRIVER_PATH is set but does not point to an executable driver: "
+            f"{chromedriver_path}"
+        )
+    return shutil.which("chromedriver")
+
 
 class StepScraper:
     """
@@ -66,6 +138,7 @@ class StepScraper:
       - 'xpath' is a CSS selector (legacy name).
       - Sleep without 'seconds' falls back to ITEM_DELAY_MS.
       - New: run_iter() yields (site, jobs) as each site finishes.
+      - New: data_extract supports optional pagination block.
     """
 
     def __init__(
@@ -86,6 +159,10 @@ class StepScraper:
     # ---------- Driver ----------
     def _make_driver(self) -> webdriver.Chrome:
         options = webdriver.ChromeOptions()
+        browser_binary = _resolve_browser_binary()
+        if browser_binary:
+            options.binary_location = browser_binary
+
         if self.headless:
             options.add_argument("--headless=new")
         else:
@@ -98,10 +175,10 @@ class StepScraper:
         options.add_experimental_option("excludeSwitches", ["enable-automation"])
         options.add_experimental_option("useAutomationExtension", False)
 
-        chromedriver_path = os.getenv("CHROMEDRIVER_PATH")
         try:
-            if chromedriver_path and os.path.exists(chromedriver_path):
-                _dbg(f"Using local ChromeDriver: {chromedriver_path}")
+            chromedriver_path = _resolve_chromedriver_path()
+            if chromedriver_path:
+                _dbg(f"Using ChromeDriver: {chromedriver_path}")
                 svc = Service(executable_path=chromedriver_path)
                 driver = webdriver.Chrome(service=svc, options=options)
             else:
@@ -110,7 +187,10 @@ class StepScraper:
         except WebDriverException as e:
             raise RuntimeError(
                 f"Chrome failed to start: {e}\n"
-                "Set CHROMEDRIVER_PATH in .env to a driver matching your Chrome."
+                "For Ubuntu/Chromium, install chromium plus the matching "
+                "chromedriver, set HEADLESS=true on a server, and set "
+                "CHROMIUM_BINARY_PATH or CHROME_BINARY_PATH plus CHROMEDRIVER_PATH "
+                "if Selenium cannot find them automatically."
             ) from e
 
         driver.implicitly_wait(3)
@@ -132,6 +212,251 @@ class StepScraper:
         if parsed.scheme in ("http", "https") and parsed.netloc:
             return abs_url
         return None
+
+    # ---------- DOM helpers ----------
+    def _safe_find_text(
+        self, driver: webdriver.Chrome, css: Optional[str]
+    ) -> Optional[str]:
+        if not css:
+            return None
+        try:
+            el = driver.find_element(By.CSS_SELECTOR, css)
+            return (el.text or "").strip()
+        except Exception:
+            return None
+
+    def _safe_find_first_outer_html(
+        self, driver: webdriver.Chrome, css: str
+    ) -> Optional[str]:
+        try:
+            els = driver.find_elements(By.CSS_SELECTOR, css)
+            if not els:
+                return None
+            return els[0].get_attribute("outerHTML")
+        except Exception:
+            return None
+
+    @staticmethod
+    def _parse_page_num(text: Optional[str]) -> Optional[int]:
+        if not text:
+            return None
+        m = re.search(r"(\d+)", text)
+        if not m:
+            return None
+        try:
+            return int(m.group(1))
+        except Exception:
+            return None
+
+    def _click_css(self, driver: webdriver.Chrome, css: str) -> bool:
+        try:
+            el = WebDriverWait(driver, self.default_wait).until(
+                EC.element_to_be_clickable((By.CSS_SELECTOR, css))
+            )
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+            try:
+                el.click()
+            except ElementClickInterceptedException:
+                driver.execute_script("arguments[0].click();", el)
+            return True
+        except Exception:
+            return False
+
+    def _is_next_disabled(
+        self,
+        driver: webdriver.Chrome,
+        next_css: str,
+        disabled_css: Optional[str],
+    ) -> bool:
+        # explicit disabled selector (if provided)
+        if disabled_css:
+            try:
+                if driver.find_elements(By.CSS_SELECTOR, disabled_css):
+                    return True
+            except Exception:
+                pass
+
+        # attribute-based detection
+        try:
+            btn = driver.find_element(By.CSS_SELECTOR, next_css)
+            if btn.get_attribute("disabled") is not None:
+                return True
+            aria_disabled = (btn.get_attribute("aria-disabled") or "").strip().lower()
+            if aria_disabled == "true":
+                return True
+        except Exception:
+            # if we cannot find the next button, treat as disabled (stop paging)
+            return True
+
+        return False
+
+    @staticmethod
+    def _split_extract_steps_for_pagination(
+        extract_steps: List[Dict[str, Any]],
+    ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+        # Paginated scraping is intentionally two-pass:
+        # 1. Run the list-page steps on every results page.
+        # 2. Run the detail-page steps after all pages have been collected.
+        #
+        # The redirect step is the boundary between those two phases. This keeps
+        # detail-page visits from resetting or confusing the current list page.
+        list_steps: List[Dict[str, Any]] = []
+        detail_steps: List[Dict[str, Any]] = []
+        redirect_step: Optional[Dict[str, Any]] = None
+        in_detail = False
+
+        for step in extract_steps:
+            action = step.get("action")
+            # "next" is the legacy per-item stop marker; steps after it are not
+            # part of the extraction recipe for this item.
+            if action == "next":
+                break
+            # First redirect marks the handoff from list data to detail data.
+            if action == "redirect" and redirect_step is None:
+                redirect_step = step
+                in_detail = True
+                continue
+            if in_detail:
+                detail_steps.append(step)
+            else:
+                list_steps.append(step)
+
+        return list_steps, detail_steps, redirect_step
+
+    def _apply_extract_step(
+        self,
+        *,
+        driver: webdriver.Chrome,
+        soup: BeautifulSoup,
+        job: Dict[str, Any],
+        step: Dict[str, Any],
+        redirected: bool,
+    ) -> None:
+        # This helper is shared by normal and paginated extraction so selector
+        # behavior stays consistent between both paths.
+        column = step.get("as_column")
+        css = step.get("xpath")  # (your schema calls it xpath, but it's CSS)
+        attr = step.get("attr_target")
+        data_type = (step.get("data_type") or "").lower()
+
+        # Allow "current_url" without a selector
+        if not column or (not css and data_type != "current_url"):
+            return
+
+        if data_type == "current_url":
+            job[column] = driver.current_url
+            return
+
+        ctx = (step.get("context") or "list").lower()
+        if ctx == "list" and not redirected:
+            # List-page values come from the captured item HTML. That avoids
+            # querying the live browser DOM after the page has moved elsewhere.
+            tag = soup.select_one(css)
+            value = (
+                tag.get(attr)
+                if (attr and tag and tag.has_attr(attr))
+                else (tag.get_text(strip=True) if tag else "")
+            )
+            job[column] = value
+            return
+
+        try:
+            tag = driver.find_element(By.CSS_SELECTOR, css)
+            value = tag.get_attribute(attr) if attr else tag.text
+        except NoSuchElementException:
+            value = ""
+        job[column] = value
+
+    @staticmethod
+    def _apply_replace_text(job: Dict[str, Any], step: Dict[str, Any]) -> None:
+        col = step.get("using_column")
+        tf = step.get("text_find", "")
+        tr = step.get("text_replace", "")
+        if col in job and isinstance(job[col], str):
+            job[col] = job[col].replace(tf, tr)
+
+    @staticmethod
+    def _apply_regex_extract(job: Dict[str, Any], step: Dict[str, Any]) -> None:
+        src_col = step.get("using_column")
+        as_col = step.get("as_column")
+        pattern = step.get("regex_pattern")
+        if src_col in job and pattern and as_col:
+            m = re.search(pattern, str(job[src_col]))
+            if m:
+                job[as_col] = m.group(1)
+
+    def _run_sleep_step(self, step: Dict[str, Any], *, prefix: str) -> None:
+        if "seconds" in step:
+            secs = float(step.get("seconds") or 0)
+            _dbg(f"{prefix} explicit sleep {secs:.3f}s")
+            time.sleep(max(0.0, secs))
+        else:
+            _sleep_default(reason=f"{prefix} sleep (default)")
+
+    def _hydrate_paginated_job_detail(
+        self,
+        driver: webdriver.Chrome,
+        job: Dict[str, Any],
+        detail_steps: List[Dict[str, Any]],
+        redirect_step: Optional[Dict[str, Any]],
+        base_url: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        if not redirect_step or not detail_steps:
+            return job
+
+        # Resolve relative detail links against the original list page URL.
+        # During paginated hydration the driver may already be sitting on the
+        # previous job's detail page, so driver.current_url is not reliable.
+        using_col = redirect_step.get("using_column")
+        wait_css = redirect_step.get("wait_css")
+        source_url = base_url or driver.current_url
+        detail_url = (
+            self._normalize_url(source_url, job.get(using_col))
+            if using_col
+            else None
+        )
+        if not detail_url:
+            return job
+
+        try:
+            # Hydration starts from the URL collected during the list pass.
+            _dbg(f"GET detail: {detail_url}")
+            driver.get(detail_url)
+            redirected = True
+            if wait_css:
+                WebDriverWait(driver, self.default_wait).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, wait_css))
+                )
+            _sleep_default(reason="post-redirect sleep (default)")
+        except WebDriverException as we:
+            print(f"[warn] redirect get() failed: {we}")
+            return job
+
+        empty_soup = BeautifulSoup("", "html.parser")
+        # Detail steps operate against the live detail page. replace_text and
+        # regex_extract can then clean or derive values from fields just read.
+        for step in detail_steps:
+            action = step.get("action")
+            if action == "sleep":
+                self._run_sleep_step(step, prefix="Inner")
+                continue
+            if action == "extract":
+                self._apply_extract_step(
+                    driver=driver,
+                    soup=empty_soup,
+                    job=job,
+                    step=step,
+                    redirected=redirected,
+                )
+                continue
+            if action == "replace_text":
+                self._apply_replace_text(job, step)
+                continue
+            if action == "regex_extract":
+                self._apply_regex_extract(job, step)
+                continue
+
+        return job
 
     # ---------- Public (bulk) ----------
     def run(self) -> Dict[str, List[Dict[str, Any]]]:
@@ -188,6 +513,12 @@ class StepScraper:
                 if action == "load_url":
                     driver.get(step["url"])
 
+                if action == "debug_print_dom_by_css":
+                    find_css = step.get("find_css")
+                    if find_css:
+                        dbg_html = self._safe_find_text(driver, find_css)
+                        _dbg(f"Debug HTML for selector '{find_css}' = {dbg_html}")
+
                 elif action == "sleep":
                     if "seconds" in step:
                         secs = float(step.get("seconds") or 0)
@@ -239,13 +570,27 @@ class StepScraper:
                         el.send_keys(step.get("text", ""))
 
                 elif action == "data_extract":
-                    jobs.extend(
-                        self._extract_from_list(
-                            driver=driver,
-                            focus_scope=step.get("focus_scope"),
-                            extract_steps=step.get("extract_steps") or [],
+                    pagination = step.get("pagination")
+                    if isinstance(pagination, dict) and pagination.get("mode"):
+                        # Paginated extraction collects every result page before
+                        # visiting detail pages, then returns one complete list
+                        # for the site's normal persistence/delta logic.
+                        jobs.extend(
+                            self._extract_from_list_paginated(
+                                driver=driver,
+                                focus_scope=step.get("focus_scope"),
+                                extract_steps=step.get("extract_steps") or [],
+                                pagination=pagination,
+                            )
                         )
-                    )
+                    else:
+                        jobs.extend(
+                            self._extract_from_list(
+                                driver=driver,
+                                focus_scope=step.get("focus_scope"),
+                                extract_steps=step.get("extract_steps") or [],
+                            )
+                        )
 
                 elif action == "json_set_payload":
                     json_payload = driver.execute_script(
@@ -271,6 +616,168 @@ class StepScraper:
             err = str(e)
 
         return jobs, err
+
+    # ---------- Pagination wrapper ----------
+    def _extract_from_list_paginated(
+        self,
+        driver: webdriver.Chrome,
+        focus_scope: Optional[str],
+        extract_steps: List[Dict[str, Any]],
+        pagination: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        """
+        Pagination config (inside data_extract step):
+          {
+            "mode": "click_next",
+            "max_pages": 10,
+            "current_page_css": "nav[aria-label='pagination'] button[aria-current='page']",
+            "next_page_css": "nav[aria-label='pagination'] button[aria-label='next']",
+            "next_disabled_css": "button[aria-label='next'][disabled], button[aria-label='next'][aria-disabled='true']",
+            "page_wait_ms": 1200,
+            "page_as_column": "__page"
+          }
+        """
+        if not focus_scope:
+            _dbg("No focus_scope provided for pagination.")
+            return []
+
+        mode = str(pagination.get("mode") or "").lower().strip()
+        _dbg(f"Pagination mode: {mode}")
+        if mode != "click_next":
+            _dbg("Unknown pagination mode, falling back to single page extraction.")
+            return self._extract_from_list(driver, focus_scope, extract_steps)
+
+        max_pages = int(pagination.get("max_pages") or 1)
+        max_pages = max(1, min(max_pages, 200))
+        _dbg(f"Max pages to paginate: {max_pages}")
+
+        current_page_css = pagination.get("current_page_css")
+        next_page_css = (
+            pagination.get("next_page_css")
+            or "nav[aria-label='pagination'] button[aria-label='next']"
+        )
+        next_disabled_css = pagination.get("next_disabled_css")
+        page_wait_ms = int(pagination.get("page_wait_ms") or 0)
+        page_as_column = pagination.get("page_as_column")
+        # Split the recipe once before looping pages. list_steps should avoid
+        # any redirect/detail work so page traversal stays stable.
+        list_steps, detail_steps, redirect_step = (
+            self._split_extract_steps_for_pagination(extract_steps)
+        )
+
+        all_jobs: List[Dict[str, Any]] = []
+        seen_page_sigs: set[str] = set()
+        detail_base_url = driver.current_url
+
+        # determine initial page number if possible
+        page_num = (
+            self._parse_page_num(self._safe_find_text(driver, current_page_css)) or 1
+        )
+        _dbg(f"Initial page number: {page_num}")
+
+        for page_idx in range(max_pages):
+            _dbg(f"Extracting page {page_num} (iteration {page_idx+1}/{max_pages})")
+            # Step 1: read only the current page's list cards/rows.
+            page_jobs = self._extract_from_list(
+                driver=driver,
+                focus_scope=focus_scope,
+                extract_steps=list_steps,
+            )
+
+            if page_as_column and page_jobs:
+                for j in page_jobs:
+                    # Keep page metadata in raw output JSON for debugging. It is
+                    # intentionally not part of Job hashing or the DB schema.
+                    j[page_as_column] = page_num
+
+            all_jobs.extend(page_jobs)
+            _dbg(f"Extracted {len(page_jobs)} jobs from page {page_num}")
+
+            # Stop immediately on an empty page; there is nothing useful to
+            # hydrate and no next-page signal can be trusted.
+            if not page_jobs:
+                _dbg("No jobs found on this page, stopping pagination.")
+                break
+
+            # Step 2: record a compact page signature before clicking next. If a
+            # site loops back to the same page, this prevents infinite scraping.
+            first_id = str(page_jobs[0].get("JobID") or "").strip()
+            page_label = self._safe_find_text(driver, current_page_css) or str(page_num)
+            sig = f"{page_label}|{first_id}|{len(page_jobs)}|{driver.current_url}"
+            _dbg(f"Page signature: {sig}")
+            if sig in seen_page_sigs:
+                _dbg("Duplicate page signature detected, stopping pagination.")
+                break
+            seen_page_sigs.add(sig)
+
+            # stop if no next / disabled next
+            if self._is_next_disabled(driver, next_page_css, next_disabled_css):
+                _dbg("Next button is disabled or not found, stopping pagination.")
+                break
+
+            # Step 3: capture markers that should change after clicking next.
+            # Workday may keep the same URL, so we also watch the active page
+            # label and first result row.
+            before_url = driver.current_url
+            before_page = (self._safe_find_text(driver, current_page_css) or "").strip()
+            before_first = self._safe_find_first_outer_html(driver, focus_scope) or ""
+            _dbg(f"Clicking next: before_url={before_url}, before_page={before_page}")
+
+            if not self._click_css(driver, next_page_css):
+                _dbg("Failed to click next button, stopping pagination.")
+                break
+
+            # Step 4: wait for evidence that the browser is showing the next
+            # result page before extracting again.
+            try:
+                WebDriverWait(driver, self.default_wait).until(
+                    lambda d: (
+                        d.current_url != before_url
+                        or (
+                            (self._safe_find_text(d, current_page_css) or "").strip()
+                            != before_page
+                            and bool(current_page_css)
+                        )
+                        or (
+                            (self._safe_find_first_outer_html(d, focus_scope) or "")
+                            != before_first
+                            and bool(before_first)
+                        )
+                    )
+                )
+                _dbg("Page advanced after clicking next.")
+            except TimeoutException:
+                _dbg(
+                    "Timeout waiting for page to advance after clicking next. Stopping pagination."
+                )
+                break
+
+            if page_wait_ms > 0:
+                _dbg(f"Sleeping for {page_wait_ms}ms after page advance.")
+                _sleep_ms(page_wait_ms, reason="pagination post-click wait")
+
+            # Step 5: prefer the site's visible page label; otherwise keep a
+            # local counter so __page remains useful when selectors are missing.
+            prev_page_num = page_num
+            page_num = self._parse_page_num(
+                self._safe_find_text(driver, current_page_css)
+            ) or (page_num + 1)
+            _dbg(f"Updated page number: {prev_page_num} -> {page_num}")
+
+        if redirect_step and detail_steps and all_jobs:
+            # Step 6: now that pagination is complete, hydrate detail-only fields
+            # from each collected JobUrl. This is what prevents detail redirects
+            # from corrupting the list-page cursor.
+            _dbg(f"Hydrating details for {len(all_jobs)} paginated jobs.")
+            for job in all_jobs:
+                self._hydrate_paginated_job_detail(
+                    driver, job, detail_steps, redirect_step, detail_base_url
+                )
+                if ITEM_DELAY_MS > 0:
+                    _sleep_ms(ITEM_DELAY_MS, reason="item delay")
+
+        _dbg(f"Pagination complete. Total jobs extracted: {len(all_jobs)}")
+        return all_jobs
 
     # ---------- List → optional detail ----------
     def _extract_from_list(
@@ -313,45 +820,17 @@ class StepScraper:
                 es_action = es.get("action")
 
                 if es_action == "sleep":
-                    if "seconds" in es:
-                        secs = float(es.get("seconds") or 0)
-                        _dbg(f"Inner explicit sleep {secs:.3f}s")
-                        time.sleep(max(0.0, secs))
-                    else:
-                        _sleep_default(reason="Inner sleep (default)")
+                    self._run_sleep_step(es, prefix="Inner")
                     continue
 
                 if es_action == "extract":
-                    ctx = (es.get("context") or "list").lower()
-                    column = es.get("as_column")
-                    css = es.get("xpath")  # (your schema calls it xpath, but it's CSS)
-                    attr = es.get("attr_target")
-                    data_type = (es.get("data_type") or "").lower()
-
-                    # Allow "current_url" without a selector
-                    if not column or (not css and data_type != "current_url"):
-                        continue
-
-                    # Special case: use the browser's current URL
-                    if data_type == "current_url":
-                        job[column] = driver.current_url
-                        continue
-
-                    if ctx == "list" and not redirected:
-                        tag = soup.select_one(css)
-                        value = (
-                            tag.get(attr)
-                            if (attr and tag and tag.has_attr(attr))
-                            else (tag.get_text(strip=True) if tag else "")
-                        )
-                        job[column] = value
-                    else:
-                        try:
-                            tag = driver.find_element(By.CSS_SELECTOR, css)
-                            value = tag.get_attribute(attr) if attr else tag.text
-                        except NoSuchElementException:
-                            value = ""
-                        job[column] = value
+                    self._apply_extract_step(
+                        driver=driver,
+                        soup=soup,
+                        job=job,
+                        step=es,
+                        redirected=redirected,
+                    )
                     continue
 
                 if es_action == "redirect" and not redirected:
@@ -419,36 +898,35 @@ class StepScraper:
                     continue
 
                 if es_action == "replace_text":
-                    col = es.get("using_column")
-                    tf = es.get("text_find", "")
-                    tr = es.get("text_replace", "")
-                    if col in job and isinstance(job[col], str):
-                        job[col] = job[col].replace(tf, tr)
+                    self._apply_replace_text(job, es)
                     continue
 
                 if es_action == "regex_extract":
-                    src_col = es.get("using_column")
-                    as_col = es.get("as_column")
-                    pattern = es.get("regex_pattern")
-                    if src_col in job and pattern and as_col:
-                        m = re.search(pattern, str(job[src_col]))
-                        if m:
-                            job[as_col] = m.group(1)
+                    self._apply_regex_extract(job, es)
                     continue
 
                 if es_action == "next":
                     break
 
             if redirected:
+                # IMPORTANT: prefer back() to preserve pagination/session state
                 try:
-                    driver.get(list_url)
+                    driver.back()
                     WebDriverWait(driver, self.default_wait).until(
                         EC.presence_of_all_elements_located(
                             (By.CSS_SELECTOR, focus_scope)
                         )
                     )
                 except Exception:
-                    pass
+                    try:
+                        driver.get(list_url)
+                        WebDriverWait(driver, self.default_wait).until(
+                            EC.presence_of_all_elements_located(
+                                (By.CSS_SELECTOR, focus_scope)
+                            )
+                        )
+                    except Exception:
+                        pass
 
             jobs.append(job)
 

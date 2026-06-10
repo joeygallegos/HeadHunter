@@ -1,0 +1,16 @@
+SQLAlchemy>=2.0
+pymysql>=1.1
+alembic>=1.13
+nltk>=3.8
+beautifulsoup4>=4.12
+selenium>=4.21
+pytest>=8.2
+flask
+gunicorn>=26.0.0
+gspread>=6.0
+google-auth>=2.0
+tzdata
+langchain-ollama
+langchain-core
+pymysql
+dotenv
