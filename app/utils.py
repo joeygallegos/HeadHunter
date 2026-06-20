@@ -1,20 +1,72 @@
 from __future__ import annotations
-import nltk, re
+
+import re
 from collections import Counter
 
+import nltk
 
-def ensure_nltk():
+
+_NLTK_RESOURCES = [
+    ("tokenizers/punkt", "punkt"),
+    ("tokenizers/punkt_tab/english", "punkt_tab"),
+]
+
+
+def _ensure_nltk_resource(resource_path: str, download_name: str, verbose: bool) -> None:
     try:
-        nltk.data.find("tokenizers/punkt")
+        nltk.data.find(resource_path)
+        if verbose:
+            print(f"NLTK resource ready: {download_name}")
+        return
     except LookupError:
-        nltk.download("punkt")
+        if verbose:
+            print(f"Downloading NLTK resource: {download_name}")
+
+    ok = nltk.download(download_name, quiet=not verbose)
+    if not ok:
+        raise RuntimeError(f"NLTK download failed for resource: {download_name}")
+
     try:
+        nltk.data.find(resource_path)
+    except LookupError as exc:
+        raise RuntimeError(
+            f"NLTK resource {download_name!r} was downloaded but still cannot be found. "
+            f"Try: python -m nltk.downloader {download_name}"
+        ) from exc
+
+    if verbose:
+        print(f"NLTK resource ready: {download_name}")
+
+
+def ensure_nltk(verbose: bool = False):
+    for resource_path, download_name in _NLTK_RESOURCES:
+        _ensure_nltk_resource(resource_path, download_name, verbose)
+    try:
+        # NLTK 3.8+ uses this language-specific tagger name.
         nltk.data.find("taggers/averaged_perceptron_tagger_eng")
+        if verbose:
+            print("NLTK resource ready: averaged_perceptron_tagger_eng")
     except LookupError:
         try:
-            nltk.download("averaged_perceptron_tagger_eng")
+            if verbose:
+                print("Downloading NLTK resource: averaged_perceptron_tagger_eng")
+            ok = nltk.download(
+                "averaged_perceptron_tagger_eng", quiet=not verbose
+            )
+            if not ok:
+                raise RuntimeError(
+                    "NLTK download failed for resource: averaged_perceptron_tagger_eng"
+                )
         except Exception:
-            nltk.download("averaged_perceptron_tagger")
+            if verbose:
+                print("Downloading NLTK resource: averaged_perceptron_tagger")
+            ok = nltk.download("averaged_perceptron_tagger", quiet=not verbose)
+            if not ok:
+                raise RuntimeError(
+                    "NLTK download failed for resource: averaged_perceptron_tagger"
+                )
+        if verbose:
+            print("NLTK resource ready: averaged_perceptron_tagger")
 
 
 def extract_keywords(job_description: str, top_n: int = 10) -> list[str]:
@@ -149,10 +201,7 @@ def remove_canned_text(jobs: list[dict]) -> list[dict]:
     descs = [j.get("JobDesc", "") for j in jobs if j.get("JobDesc")]
     if len(descs) < 2:
         return jobs
-    try:
-        nltk.data.find("tokenizers/punkt")
-    except LookupError:
-        nltk.download("punkt")
+    ensure_nltk()
     sent_lists = [nltk.sent_tokenize(d) for d in descs]
     all_sents = [s.strip() for lst in sent_lists for s in lst]
     counts = Counter(all_sents)

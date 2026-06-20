@@ -499,7 +499,7 @@ def main():
     cmd = sys.argv[1].lower()
     if cmd == "download":
         with Timer("NLTK ensure", logger=base_log):
-            ensure_nltk()
+            ensure_nltk(verbose=True)
         base_log.info("NLTK ready")
         sys.exit(0)
 

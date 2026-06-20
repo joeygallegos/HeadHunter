@@ -11,7 +11,18 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from flask import Flask, jsonify, render_template_string, request
-from sqlalchemy import func, or_, select, text as sa_text
+from sqlalchemy import (
+    Column,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    UniqueConstraint,
+    func,
+    or_,
+    select,
+    text as sa_text,
+)
 
 try:
     from zoneinfo import ZoneInfo
@@ -30,14 +41,38 @@ if app_dir not in sys.path:
     sys.path.insert(0, app_dir)
 
 # NOTE: app/models.py currently prints DATABASE_URL on import. Remove that print.
-from app.models import JobChange, SessionLocal, IntegrationRun, Job  # type: ignore
+from app.models import Base, JobChange, SessionLocal, IntegrationRun, Job, engine  # type: ignore
+
+try:
+    from app.models import JobSwipe  # type: ignore
+except ImportError:
+    # Older deployments may have dashboard.py before app/models.py is updated.
+    # Keep the dashboard importable and create the same table shape on first use.
+    class JobSwipe(Base):  # type: ignore
+        __tablename__ = "job_swipes"
+        __table_args__ = (
+            UniqueConstraint("job_pk", name="uq_job_swipe_job_pk"),
+            {
+                "extend_existing": True,
+                "mysql_charset": "utf8mb4",
+                "mysql_collate": "utf8mb4_unicode_ci",
+            },
+        )
+
+        id = Column(Integer, primary_key=True, autoincrement=True)
+        job_pk = Column(
+            Integer, ForeignKey("jobs.id", ondelete="CASCADE"), nullable=False
+        )
+        action = Column(String(16), nullable=False)
+        created_at = Column(
+            DateTime(timezone=True), server_default=func.now(), nullable=False
+        )
 
 
 # ----------------------------------------------------------------------
 # Helpers
 # ----------------------------------------------------------------------
 LOCAL_TZ = "America/Chicago"
-CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 
 
 def _now_local() -> datetime:
@@ -105,36 +140,6 @@ def _job_ai_columns(j: Job) -> Dict[str, Any]:
     }
 
 
-# ----------------------------------------------------------------------
-# Swipe page: Google Sheets-backed review queue
-# ----------------------------------------------------------------------
-def _load_sheet_config() -> Dict[str, Any]:
-    if not os.path.exists(CONFIG_PATH):
-        raise FileNotFoundError(
-            "config.json file not found. Please ensure it exists in the project root."
-        )
-    with open(CONFIG_PATH, "r", encoding="utf-8") as config_file:
-        return json.load(config_file)
-
-
-def _init_google_sheet():
-    try:
-        import gspread
-        from google.oauth2.service_account import Credentials
-    except ImportError as exc:
-        raise RuntimeError(
-            "Swipe page requires gspread and google-auth; install requirements.txt."
-        ) from exc
-
-    config = _load_sheet_config()
-    creds_path = os.path.join(BASE_DIR, config["GOOGLE_CREDENTIALS_PATH"])
-    creds = Credentials.from_service_account_file(
-        creds_path, scopes=["https://www.googleapis.com/auth/spreadsheets"]
-    )
-    client = gspread.authorize(creds)
-    return client.open_by_key(config["SHEET_ID"]).worksheet(config["SHEET_NAME"])
-
-
 def _normalize_highlight_text(s: str) -> str:
     return (
         s.replace("â€™", "'")
@@ -192,44 +197,93 @@ def highlight_as_you_will(job_title: str, job_desc: str) -> str:
     for start, stop in dedup:
         if cursor < start:
             out.append(html.escape(text[cursor:start]))
-        out.append(f"<mark class='bg-yellow-200'>{html.escape(text[start:stop])}</mark>")
+        out.append(
+            f"<mark class='bg-yellow-200'>{html.escape(text[start:stop])}</mark>"
+        )
         cursor = stop
     if cursor < len(text):
         out.append(html.escape(text[cursor:]))
     return "".join(out)
 
 
+_SWIPE_TABLE_READY = False
+
+
+def _ensure_swipe_table() -> None:
+    global _SWIPE_TABLE_READY
+    if _SWIPE_TABLE_READY:
+        return
+    # Create only the swipe table here so the dashboard can adopt the new DB-backed
+    # review queue without requiring the scraper init path to run first.
+    JobSwipe.__table__.create(bind=engine, checkfirst=True)
+    _SWIPE_TABLE_READY = True
+
+
+def _serialize_swipe_job(job: Job) -> Dict[str, Any]:
+    return {
+        "id": job.id,
+        "JobID": job.job_id or "",
+        "Site": job.site or "",
+        "JobTitle": job.title or "",
+        "JobUrl": job.url or "",
+        "JobDesc": job.desc or "",
+        "JobDescHighlighted": highlight_as_you_will(job.title or "", job.desc or ""),
+        "Keywords": job.keywords or "",
+        "JobLevel": job.level or "Unknown",
+        "JobPay": job.pay or "",
+        "DiscoveryDate": _fmt_dt(job.discovery_date) or "",
+        "AIMatchPercentage": job.ai_match_percentage,
+        "AILocationPolicyMatch": job.ai_location_policy_match or "",
+    }
+
+
 def fetch_swipe_jobs() -> List[Dict[str, Any]]:
-    sheet = _init_google_sheet()
-    jobs = sheet.get_all_records()
-    filtered_jobs = [job for job in jobs if not job.get("Swipe")]
-    for job in filtered_jobs:
-        job["JobDescHighlighted"] = highlight_as_you_will(
-            str(job.get("JobTitle", "")), str(job.get("JobDesc", ""))
+    _ensure_swipe_table()
+    with SessionLocal() as session:
+        jobs = (
+            session.execute(
+                select(Job)
+                .outerjoin(JobSwipe, JobSwipe.job_pk == Job.id)
+                .where(JobSwipe.id.is_(None))
+                .where(Job.is_active.is_(True))
+                .order_by(Job.discovery_date.desc(), Job.id.desc())
+                .limit(500)
+            )
+            .scalars()
+            .all()
         )
-    return filtered_jobs
+        return [_serialize_swipe_job(job) for job in jobs]
 
 
 def record_swipe(job: Dict[str, Any], action: str) -> bool:
-    sheet = _init_google_sheet()
-    jobs = sheet.get_all_records()
-    row_idx = None
-    for idx, row in enumerate(jobs, start=2):
-        if row.get("JobUrl") == job.get("JobUrl"):
-            row_idx = idx
-            break
+    _ensure_swipe_table()
+    job_pk = _to_int(job.get("id"))
+    with SessionLocal() as session:
+        db_job = session.get(Job, job_pk) if job_pk else None
+        if db_job is None and job.get("JobID") and job.get("Site"):
+            db_job = (
+                session.execute(
+                    select(Job)
+                    .where(Job.job_id == str(job.get("JobID")))
+                    .where(Job.site == str(job.get("Site")))
+                )
+                .scalars()
+                .first()
+            )
+        if db_job is None:
+            return False
 
-    if not row_idx:
-        return False
-
-    headers = sheet.row_values(1)
-    if "Swipe" not in headers:
-        sheet.update_cell(1, len(headers) + 1, "Swipe")
-        swipe_col = len(headers) + 1
-    else:
-        swipe_col = headers.index("Swipe") + 1
-    sheet.update_cell(row_idx, swipe_col, action)
-    return True
+        existing = (
+            session.execute(select(JobSwipe).where(JobSwipe.job_pk == db_job.id))
+            .scalars()
+            .first()
+        )
+        if existing:
+            existing.action = action
+        else:
+            session.add(JobSwipe(job_pk=db_job.id, action=action))
+        session.commit()
+        return True
 
 
 # ----------------------------------------------------------------------
@@ -335,16 +389,29 @@ def fetch_runs(days: int) -> Dict[str, List]:
 
 
 # ----------------------------------------------------------------------
-# Data access: Jobs discovered in last N hours (default 48)
+# Data access: job index rows, optionally limited to recent discoveries.
 # ----------------------------------------------------------------------
 def fetch_jobs_last_hours(
-    hours: int = 48, limit: int = 500, min_match: Optional[int] = None
+    hours: int = 48,
+    limit: int = 500,
+    min_match: Optional[int] = None,
+    location_policy: Optional[str] = None,
 ) -> Dict[str, Any]:
     all_time = hours <= 0
     hours = 0 if all_time else max(1, min(hours, 24 * 30))
     limit = max(1, min(limit, 5000))
     if min_match is not None:
         min_match = max(0, min(int(min_match), 100))
+    location_policy = (location_policy or "any").strip().lower()
+    if location_policy not in {
+        "any",
+        "remote",
+        "hybrid",
+        "onsite",
+        "unknown",
+        "non_hybrid",
+    }:
+        location_policy = "any"
 
     now = _now_local()
     cutoff = now - timedelta(hours=hours) if not all_time else None
@@ -364,6 +431,17 @@ def fetch_jobs_last_hours(
         if min_match is not None:
             stmt = stmt.where(Job.ai_match_percentage.is_not(None)).where(
                 Job.ai_match_percentage >= min_match
+            )
+        if location_policy == "non_hybrid":
+            stmt = stmt.where(
+                or_(
+                    Job.ai_location_policy_match.is_(None),
+                    func.lower(Job.ai_location_policy_match) != "hybrid",
+                )
+            )
+        elif location_policy != "any":
+            stmt = stmt.where(
+                func.lower(Job.ai_location_policy_match) == location_policy
             )
         jobs = (
             session.execute(
@@ -437,6 +515,7 @@ def fetch_jobs_last_hours(
     return {
         "hours": hours,
         "min_match": min_match,
+        "location_policy": location_policy,
         "cutoff_iso": cutoff_q.isoformat() if cutoff_q else "all",
         "returned": len(out),
         "jobs": out,
@@ -553,6 +632,30 @@ def fetch_job_lookup(query: str, limit: int = 25) -> Dict[str, Any]:
     return {"query": q, "returned": len(out), "exact": bool(exact_jobs), "jobs": out}
 
 
+def fetch_job_detail_by_id(job_pk: int) -> Dict[str, Any]:
+    job_pk = max(0, int(job_pk or 0))
+    if not job_pk:
+        return {"id": job_pk, "found": False, "job": None}
+
+    with SessionLocal() as session:
+        job = session.get(Job, job_pk)
+        if job is None:
+            return {"id": job_pk, "found": False, "job": None}
+
+        changes = (
+            session.execute(
+                select(JobChange)
+                .where(JobChange.job_id_text == job.job_id)
+                .where(JobChange.site == job.site)
+                .order_by(JobChange.created_at.desc(), JobChange.id.desc())
+                .limit(100)
+            )
+            .scalars()
+            .all()
+        )
+        return {"id": job_pk, "found": True, "job": _serialize_job_detail(job, changes)}
+
+
 # ----------------------------------------------------------------------
 # Flask app + HTML
 # ----------------------------------------------------------------------
@@ -583,7 +686,7 @@ INDEX_HTML = r"""<!doctype html>
           <button @click="view='jobs'"
                   :class="view==='jobs' ? 'bg-indigo-600 text-white' : 'bg-white text-slate-700'"
                   class="px-3 py-2 rounded-lg border border-slate-200 text-sm">
-            Jobs discovered (last 48h)
+            Job index
           </button>
           <button @click="view='lookup'"
                   :class="view==='lookup' ? 'bg-indigo-600 text-white' : 'bg-white text-slate-700'"
@@ -628,7 +731,27 @@ INDEX_HTML = r"""<!doctype html>
             </div>
           </section>
 
+          <template x-if="view==='runs'">
           <section class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4">
+            <h2 class="text-sm font-semibold text-slate-800 mb-2">Run list</h2>
+            <div class="mt-3 overflow-x-auto">
+              <table class="min-w-full text-sm">
+                <thead class="text-left text-slate-600 border-b">
+                  <tr>
+                    <th class="py-2 pr-4">ID</th>
+                  </tr>
+                </thead>
+                <tbody x-show="runsLoaded" x-for="row in runs" :key="row.id">
+                  <tr>
+                    <td class="py-2 pr-4">{{ row.id }}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </section></template>
+
+          <section class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4">
+            
             <h2 class="text-sm font-semibold text-slate-800 mb-2">Daily counts</h2>
             <div class="h-80">
               <canvas id="runsChart"></canvas>
@@ -649,7 +772,7 @@ INDEX_HTML = r"""<!doctype html>
         </div>
       </template>
 
-      <!-- ---------------- JOBS VIEW ---------------- -->
+          <!-- ---------------- JOB INDEX VIEW ---------------- -->
       <template x-if="view==='jobs'">
         <div class="space-y-4">
 
@@ -681,6 +804,17 @@ INDEX_HTML = r"""<!doctype html>
                 90%+
               </button>
 
+              <label class="ml-3 text-sm font-medium text-slate-700">Location:</label>
+              <select x-model="locationPolicy"
+                      class="px-3 py-2 rounded-lg border border-slate-300 bg-white text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
+                <option value="any">Any</option>
+                <option value="non_hybrid">Exclude hybrid</option>
+                <option value="remote">Remote only</option>
+                <option value="hybrid">Hybrid only</option>
+                <option value="onsite">Onsite only</option>
+                <option value="unknown">Unknown only</option>
+              </select>
+
               <button @click="loadJobs()"
                       class="ml-2 inline-flex items-center px-3 py-2 rounded-lg bg-indigo-600 text-white text-sm hover:bg-indigo-700 active:bg-indigo-800">
                 Refresh
@@ -698,11 +832,12 @@ INDEX_HTML = r"""<!doctype html>
           <section class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4">
             <div class="flex items-center justify-between">
               <h2 class="text-sm font-semibold text-slate-800">
-                Jobs <span x-text="hours > 0 ? `discovered in last ${hours} hours` : 'from all time'"></span>
+                Job index <span x-text="hours > 0 ? `(last ${hours} hours)` : '(all time)'"></span>
               </h2>
               <div class="text-xs text-slate-500" x-show="jobsLoaded">
                 returned=<span x-text="jobsMeta.returned"></span>,
                 min_match=<span x-text="jobsMeta.min_match ?? '-'"></span>,
+                location=<span x-text="jobsMeta.location_policy ?? 'any'"></span>,
                 parse_failures=<span x-text="jobsMeta.parse_failures"></span>,
                 cutoff=<span x-text="jobsMeta.cutoff_iso"></span>
               </div>
@@ -712,6 +847,7 @@ INDEX_HTML = r"""<!doctype html>
               <table class="min-w-full text-sm">
                 <thead class="text-left text-slate-600 border-b">
                   <tr>
+                    <th class="py-2 pr-4">ID</th>
                     <th class="py-2 pr-4">Site</th>
                     <th class="py-2 pr-4">Title</th>
                     <th class="py-2 pr-4">Level</th>
@@ -723,6 +859,12 @@ INDEX_HTML = r"""<!doctype html>
                 <tbody>
                   <template x-for="row in filteredJobs()" :key="row.id">
                     <tr class="border-b align-top">
+                      <td class="py-3 pr-4">
+                        <button type="button"
+                                class="text-indigo-700 hover:underline"
+                                @click="openJobDetail(row.id)"
+                                x-text="`ID ${row.id}`"></button>
+                      </td>
                       <td class="py-3 pr-4 font-medium text-slate-800" x-text="row.site"></td>
 
                       <td class="py-3 pr-4">
@@ -756,6 +898,8 @@ INDEX_HTML = r"""<!doctype html>
                               <span x-text="matchValue(row) ?? '-'"></span>
                               <span class="ml-2 font-semibold">experience_match</span>:
                               <span x-text="row.ai_row?.experience_match ?? row.ai?.experience_match ?? '-'"></span>
+                              <span class="ml-2 font-semibold">location</span>:
+                              <span x-text="locationValue(row) ?? '-'"></span>
                             </div>
                             <div class="text-xs text-slate-600 line-clamp-3" x-text="row.ai_row?.fit_summary ?? row.ai?.fit_summary ?? ''"></div>
                             <button class="text-xs text-indigo-700 hover:underline"
@@ -830,6 +974,7 @@ INDEX_HTML = r"""<!doctype html>
                           class="w-full text-left rounded-lg border px-3 py-2 text-sm"
                           :class="selectedJobId === job.id ? 'border-indigo-400 bg-indigo-50' : 'border-slate-200 bg-white hover:bg-slate-50'">
                     <div class="font-medium text-slate-900" x-text="job.job_id"></div>
+                    <div class="text-xs text-slate-500" x-text="`ID ${job.id}`"></div>
                     <div class="text-xs text-slate-500 truncate" x-text="job.site"></div>
                     <div class="text-xs text-slate-700 mt-1 line-clamp-2" x-text="job.title || '(no title)'"></div>
                   </button>
@@ -850,6 +995,7 @@ INDEX_HTML = r"""<!doctype html>
                     <h2 class="mt-1 text-xl font-semibold text-slate-900" x-text="selectedJob().title || '(no title)'"></h2>
                     <div class="mt-1 text-sm text-slate-600">
                       <span class="font-medium" x-text="selectedJob().job_id"></span>
+                      <span class="ml-2 text-slate-500" x-text="`ID ${selectedJob().id}`"></span>
                       <span class="ml-2" :class="selectedJob().is_active ? 'text-green-700' : 'text-red-700'"
                             x-text="selectedJob().is_active ? 'Active' : 'Inactive'"></span>
                     </div>
@@ -996,8 +1142,9 @@ INDEX_HTML = r"""<!doctype html>
           hours: 48,
           jobsLimit: 500,
           minAiMatch: 80,
+          locationPolicy: 'any',
           jobs: [],
-          jobsMeta: { returned: 0, parse_failures: 0, cutoff_iso: '', min_match: null },
+          jobsMeta: { returned: 0, parse_failures: 0, cutoff_iso: '', min_match: null, location_policy: 'any' },
           q: '',
 
           // Lookup state
@@ -1130,11 +1277,15 @@ INDEX_HTML = r"""<!doctype html>
             if (this.minAiMatch !== null && this.minAiMatch !== '' && !Number.isNaN(Number(this.minAiMatch))) {
               params.set('min_match', String(this.minAiMatch));
             }
+            if (this.locationPolicy) {
+              params.set('location_policy', this.locationPolicy);
+            }
             const res = await fetch(`/api/jobs?${params.toString()}`);
             const data = await res.json();
             this.jobsMeta = {
               returned: data.returned || 0,
               min_match: data.min_match ?? null,
+              location_policy: data.location_policy || 'any',
               parse_failures: data.parse_failures || 0,
               cutoff_iso: data.cutoff_iso || ''
             };
@@ -1151,10 +1302,26 @@ INDEX_HTML = r"""<!doctype html>
             return Number.isFinite(n) ? n : null;
           },
 
+          locationValue(row) {
+            const fromColumn = row?.ai_row?.location_policy_match;
+            const fromJson = row?.ai?.location_policy_match;
+            const value = (fromColumn ?? fromJson ?? '').toString().toLowerCase().trim();
+            return value || null;
+          },
+
+          locationMatches(row) {
+            const filter = (this.locationPolicy || 'any').toLowerCase();
+            if (filter === 'any') return true;
+            const value = this.locationValue(row);
+            if (filter === 'non_hybrid') return value !== 'hybrid';
+            return value === filter;
+          },
+
           filteredJobs() {
             const q = (this.q || '').toLowerCase().trim();
             const minMatch = Number(this.minAiMatch);
             return (this.jobs || []).filter(r => {
+              if (!this.locationMatches(r)) return false;
               if (Number.isFinite(minMatch)) {
                 const match = this.matchValue(r);
                 if (match === null || match < minMatch) return false;
@@ -1178,6 +1345,25 @@ INDEX_HTML = r"""<!doctype html>
             const data = await res.json();
             this.lookupResults = data.jobs || [];
             this.selectedJobId = this.lookupResults.length ? this.lookupResults[0].id : null;
+            this.lookupLoaded = true;
+            this.lookupLoading = false;
+          },
+
+          async openJobDetail(id) {
+            const jobId = Number(id);
+            if (!Number.isFinite(jobId) || jobId <= 0) return;
+
+            this.view = 'lookup';
+            this.lookupQ = `ID ${jobId}`;
+            this.lookupLoading = true;
+            this.lookupLoaded = false;
+            this.lookupResults = [];
+            this.selectedJobId = null;
+
+            const res = await fetch(`/api/job-detail?id=${encodeURIComponent(jobId)}`);
+            const data = await res.json();
+            this.lookupResults = data.job ? [data.job] : [];
+            this.selectedJobId = data.job ? data.job.id : null;
             this.lookupLoaded = true;
             this.lookupLoading = false;
           },
@@ -1386,7 +1572,7 @@ def swipe_api():
         return jsonify(error="action must be like or dislike"), 400
     try:
         if not record_swipe(job, action):
-            return jsonify(error="job not found in sheet"), 404
+            return jsonify(error="job not found in database"), 404
         return jsonify(success=True)
     except Exception as exc:
         return jsonify(error=str(exc)), 500
@@ -1419,7 +1605,15 @@ def api_jobs():
             min_match = int(float(min_match_raw))
         except Exception:
             min_match = None
-    return jsonify(fetch_jobs_last_hours(hours=hours, limit=limit, min_match=min_match))
+    location_policy = request.args.get("location_policy", "any")
+    return jsonify(
+        fetch_jobs_last_hours(
+            hours=hours,
+            limit=limit,
+            min_match=min_match,
+            location_policy=location_policy,
+        )
+    )
 
 
 @app.route("/api/job-lookup")
@@ -1430,6 +1624,15 @@ def api_job_lookup():
     except Exception:
         limit = 25
     return jsonify(fetch_job_lookup(q, limit=limit))
+
+
+@app.route("/api/job-detail")
+def api_job_detail():
+    try:
+        job_pk = int(request.args.get("id", "0"))
+    except Exception:
+        job_pk = 0
+    return jsonify(fetch_job_detail_by_id(job_pk))
 
 
 # ----------------------------------------------------------------------

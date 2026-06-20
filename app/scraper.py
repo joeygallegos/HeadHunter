@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shutil
+import tempfile
 import time
 from typing import Any, Dict, List, Optional, Iterator, Tuple
 from urllib.parse import urljoin, urlparse
@@ -158,20 +159,56 @@ class StepScraper:
 
     # ---------- Driver ----------
     def _make_driver(self) -> webdriver.Chrome:
+        try:
+            return self._make_driver_once(headless=self.headless)
+        except WebDriverException as first_error:
+            if self.headless:
+                raise self._driver_start_error(first_error) from first_error
+
+            _dbg("Chrome failed to start in visible mode; retrying headless")
+            try:
+                return self._make_driver_once(headless=True)
+            except WebDriverException as fallback_error:
+                raise self._driver_start_error(
+                    fallback_error,
+                    prefix=(
+                        "Chrome failed to start in visible mode and the "
+                        "headless fallback also failed"
+                    ),
+                    first_error=first_error,
+                ) from fallback_error
+
+    def _make_driver_once(self, *, headless: bool) -> webdriver.Chrome:
         options = webdriver.ChromeOptions()
         browser_binary = _resolve_browser_binary()
         if browser_binary:
             options.binary_location = browser_binary
+        chrome_user_data_dir: Optional[str] = None
 
-        if self.headless:
+        if headless:
             options.add_argument("--headless=new")
         else:
             options.add_experimental_option("detach", True)
 
+        chrome_user_data_dir = os.getenv("CHROME_USER_DATA_DIR")
+        if chrome_user_data_dir:
+            options.add_argument(f"--user-data-dir={chrome_user_data_dir}")
+        elif headless and os.name != "nt":
+            chrome_user_data_dir = tempfile.mkdtemp(prefix="jobscrape-chrome-")
+            options.add_argument(f"--user-data-dir={chrome_user_data_dir}")
+
         options.add_argument("--disable-gpu")
         options.add_argument("--no-sandbox")
+        options.add_argument("--disable-setuid-sandbox")
         options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--disable-extensions")
+        options.add_argument("--disable-background-networking")
+        options.add_argument("--no-first-run")
+        options.add_argument("--no-default-browser-check")
         options.add_argument("--window-size=1400,900")
+        if headless and os.name != "nt":
+            remote_debugging_port = os.getenv("CHROME_REMOTE_DEBUGGING_PORT", "9222")
+            options.add_argument(f"--remote-debugging-port={remote_debugging_port}")
         options.add_experimental_option("excludeSwitches", ["enable-automation"])
         options.add_experimental_option("useAutomationExtension", False)
 
@@ -184,17 +221,45 @@ class StepScraper:
             else:
                 _dbg("Using Selenium Manager for ChromeDriver")
                 driver = webdriver.Chrome(options=options)
+            if chrome_user_data_dir and not os.getenv("CHROME_USER_DATA_DIR"):
+                setattr(driver, "_jobscrape_chrome_user_data_dir", chrome_user_data_dir)
         except WebDriverException as e:
-            raise RuntimeError(
-                f"Chrome failed to start: {e}\n"
-                "For Ubuntu/Chromium, install chromium plus the matching "
-                "chromedriver, set HEADLESS=true on a server, and set "
-                "CHROMIUM_BINARY_PATH or CHROME_BINARY_PATH plus CHROMEDRIVER_PATH "
-                "if Selenium cannot find them automatically."
-            ) from e
+            if chrome_user_data_dir and not os.getenv("CHROME_USER_DATA_DIR"):
+                shutil.rmtree(chrome_user_data_dir, ignore_errors=True)
+            raise
 
         driver.implicitly_wait(3)
         return driver
+
+    @staticmethod
+    def _driver_start_error(
+        error: WebDriverException,
+        *,
+        prefix: str = "Chrome failed to start",
+        first_error: Optional[WebDriverException] = None,
+    ) -> RuntimeError:
+        details = [f"{prefix}: {error}"]
+        if first_error is not None:
+            details.append(f"Original visible-mode error: {first_error}")
+        details.append(
+            "For Ubuntu/Chromium, install chromium plus the matching "
+            "chromedriver, set HEADLESS=true on a server, and set "
+            "CHROMIUM_BINARY_PATH or CHROME_BINARY_PATH plus CHROMEDRIVER_PATH "
+            "if Selenium cannot find them automatically."
+        )
+        return RuntimeError("\n".join(details))
+
+    @staticmethod
+    def _quit_driver(driver: webdriver.Chrome) -> None:
+        chrome_user_data_dir = getattr(driver, "_jobscrape_chrome_user_data_dir", None)
+        try:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+        finally:
+            if chrome_user_data_dir:
+                shutil.rmtree(chrome_user_data_dir, ignore_errors=True)
 
     # ---------- URL utils ----------
     @staticmethod
@@ -472,10 +537,7 @@ class StepScraper:
                 jobs, _ = self._run_site(driver, site, steps)
                 site_to_jobs[site] = jobs
         finally:
-            try:
-                driver.quit()
-            except Exception:
-                pass
+            self._quit_driver(driver)
 
         return site_to_jobs
 
@@ -491,10 +553,7 @@ class StepScraper:
                 jobs, err = self._run_site(driver, site, steps)
                 yield site, jobs  # allow caller to persist immediately
         finally:
-            try:
-                driver.quit()
-            except Exception:
-                pass
+            self._quit_driver(driver)
 
     # ---------- Site runner ----------
     def _run_site(
@@ -682,6 +741,7 @@ class StepScraper:
                 driver=driver,
                 focus_scope=focus_scope,
                 extract_steps=list_steps,
+                include_item_delay=False,
             )
 
             if page_as_column and page_jobs:
@@ -785,6 +845,8 @@ class StepScraper:
         driver: webdriver.Chrome,
         focus_scope: Optional[str],
         extract_steps: List[Dict[str, Any]],
+        *,
+        include_item_delay: bool = True,
     ) -> List[Dict[str, Any]]:
         if not focus_scope:
             return []
@@ -930,7 +992,7 @@ class StepScraper:
 
             jobs.append(job)
 
-            if ITEM_DELAY_MS > 0:
+            if include_item_delay and ITEM_DELAY_MS > 0:
                 _sleep_ms(ITEM_DELAY_MS, reason="item delay")
 
         return jobs

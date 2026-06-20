@@ -50,7 +50,7 @@ Recommended `.env` values for a headless OrangePi server:
 ```env
 HEADLESS=true
 CHROMIUM_BINARY_PATH=/usr/bin/chromium-browser
-CHROMEDRIVER_PATH=/usr/bin/chromedriver
+CHROMEDRIVER_PATH=/usr/lib/chromium-browser/chromedriver
 ```
 
 If Chromium is installed through Snap, use:
@@ -61,6 +61,20 @@ CHROMIUM_BINARY_PATH=/snap/bin/chromium
 
 The app also checks `BROWSER_BINARY_PATH`, `CHROME_BINARY_PATH`, `CHROMIUM_BINARY_PATH`, then common `PATH` names like `chromium`, `chromium-browser`, and `google-chrome`. If `chromedriver` is on `PATH`, `CHROMEDRIVER_PATH` can be omitted.
 
+If `HEADLESS=false` and Chrome cannot open a visible browser window, the scraper retries once in headless mode so a scheduled run is not missed. Servers should still set `HEADLESS=true` directly.
+
+If cron logs `DevToolsActivePort file doesn't exist`, first confirm the server `.env` has `HEADLESS=true`, then test Chromium outside Selenium:
+
+```bash
+/usr/bin/chromium-browser --headless=new --no-sandbox --disable-dev-shm-usage --remote-debugging-port=9222 --user-data-dir=/tmp/jobscrape-chrome-test about:blank
+```
+
+If that starts without immediately crashing, stop it with `Ctrl+C` and clean up the temporary profile:
+
+```bash
+rm -rf /tmp/jobscrape-chrome-test
+```
+
 To run manually on the server:
 
 ```bash
@@ -68,6 +82,8 @@ source .venv/bin/activate
 python run.py download
 python run.py steps
 ```
+
+`python run.py download` installs the NLTK tokenizer and tagger data used by preprocessing. Run it after dependency installs or venv rebuilds; current NLTK versions need both `punkt` and `punkt_tab` for sentence tokenization.
 
 The files under `scripts/run-scheduled.ps1`, `scripts/install-scheduled-task.ps1`, and `scheduler/` are Windows Task Scheduler support. For Ubuntu, schedule `/path/to/JobScrape/.venv/bin/python /path/to/JobScrape/run.py steps` with cron or a systemd timer.
 
@@ -120,7 +136,20 @@ sudo systemctl restart jobs-dashboard.service
 
 The dashboard will listen on port `5000`. From another machine on the LAN, open `http://<orange-pi-ip>:5000/`. If you only want it available on the OrangePi itself, change the Gunicorn bind address to `127.0.0.1:5000`.
 
-The same service also hosts the Google Sheets-backed swipe review page at `http://<orange-pi-ip>:5000/swipe`; it uses `SHEET_ID`, `SHEET_NAME`, and `GOOGLE_CREDENTIALS_PATH` from `config.json` and requires `gspread` plus `google-auth` from `requirements.txt`.
+The main dashboard includes a `Job index` page for searching and filtering stored jobs by recency, AI match score, location policy, and text. The `Job lookup` page is for drilling into a specific job by natural job ID or keyword; its details view shows both the natural job reference (`jobs.job_id`) and the database primary key (`jobs.id`) so rows can be cross-referenced in SQL and logs.
+
+The same service also hosts the DB-backed swipe review page at `http://<orange-pi-ip>:5000/swipe`. Job Swipe reads active jobs from the configured SQLAlchemy database and records reviews in the `job_swipes` table. The dashboard creates that table on first use if it is missing, so it does not need Google Sheets credentials.
+
+### Job Swipe
+
+Job Swipe uses the same database connection as the scraper and dashboard. It queues active jobs that do not yet have a row in `job_swipes`, sorted newest first. Clicking `Like` or `Dislike` inserts or updates one `job_swipes` row for that job and removes it from future queue loads.
+
+Important details:
+
+- `job_swipes.job_pk` points at `jobs.id` and is unique, so each job has one current review action.
+- The review action is stored as `like` or `dislike`.
+- The swipe page no longer reads `SHEET_ID`, `SHEET_NAME`, or `GOOGLE_CREDENTIALS_PATH`.
+- If you deploy with an existing database user, it must have permission to create the missing `job_swipes` table the first time `/swipe` or `/api/swipe/jobs` is opened.
 
 ### Cron scraper run
 
@@ -186,6 +215,8 @@ DB_COMMIT_MODE=per_site   # all_at_end | per_site | per_job
 | `CHROME_BINARY_PATH` | Explicit Google Chrome executable path for Selenium. |
 | `CHROMIUM_BINARY_PATH` | Explicit Chromium executable path for Selenium, such as `/usr/bin/chromium-browser`. |
 | `CHROMEDRIVER_PATH` | Explicit ChromeDriver executable path for Selenium. |
+| `CHROME_USER_DATA_DIR` | Optional persistent Chrome profile directory; when unset, Linux headless runs use a temporary profile. |
+| `CHROME_REMOTE_DEBUGGING_PORT` | Remote debugging port used by Linux headless Chromium, defaulting to `9222`. |
 | `DEBUG_STEPS` | Prints verbose scraper step diagnostics when set to `true`. |
 | `ITEM_DELAY_MS` | Delay in milliseconds between item-level scraper actions. |
 | `LOG_LEVEL` | Application log level for console and file logging, such as `INFO` or `DEBUG`. |
@@ -193,6 +224,7 @@ DB_COMMIT_MODE=per_site   # all_at_end | per_site | per_job
 | `DASH_HOST` | Host address for `dashboard.py`, defaulting to `127.0.0.1`. |
 | `DASH_PORT` | Port for `dashboard.py`, defaulting to `5000`. |
 | `RESUME_PATH` | Resume text file used by `analyze_jobs_ollama.py`, defaulting to `resume.txt`. |
+| `AI_SYSTEM_PROMPT_TEMPLATE_PATH` | Optional path to the editable system prompt template used by `analyze_jobs_ollama.py`. |
 | `OLLAMA_MODEL` | Ollama model name used for AI job analysis. |
 | `OLLAMA_BASE_URL` | Base URL for the Ollama API, defaulting to `http://localhost:11434`. |
 | `OLLAMA_NUM_CTX` | Context window size sent to Ollama. |
@@ -206,6 +238,9 @@ DB_COMMIT_MODE=per_site   # all_at_end | per_site | per_job
 | `AI_ANALYSIS_LOG` | Log file path for AI analysis output, defaulting to `ai_analysis.log`. |
 | `AI_FIT_SUMMARY_MAX_CHARS` | Maximum character length for the AI fit summary. |
 | `AI_MAX_ATTEMPTS` | Maximum retry attempts for one AI analysis request. |
+| `AI_SECOND_PASS_REVIEW` | Enables a private second-pass review for borderline valid AI match results when set to `true`. |
+| `AI_REVIEW_MIN_MATCH` | Lower inclusive `match_percentage` bound for second-pass review, defaulting to `60`. |
+| `AI_REVIEW_MAX_MATCH` | Upper inclusive `match_percentage` bound for second-pass review, defaulting to `89`. |
 | `MAX_RESUME_TOKENS` | Approximate token budget for resume text in the AI prompt. |
 | `MAX_JOB_DESC_TOKENS` | Approximate token budget for job description text in the AI prompt. |
 | `AI_REQUEST_TIMEOUT_SEC` | Timeout in seconds for each Ollama request. |
@@ -216,13 +251,18 @@ DB_COMMIT_MODE=per_site   # all_at_end | per_site | per_job
 | `AI_KEYWORD_LIST_LIMIT` | Maximum number of overlap and missing keyword items requested from AI output. |
 | `JOBS_SQLITE_PATH` | SQLite database path used by the SQLite AI-column migration script. |
 
+To re-run AI analysis on the newest already-stored jobs, pass `--redo` with a count:
+
+```powershell
+python .\analyze_jobs_ollama.py --redo 50
+```
+
+`--redo` selects the newest jobs by `discovery_date DESC, id DESC`, ignores `ONLY_EMPTY`, overwrites existing AI fields, and still creates the normal AI `job_changes` audit row. `SITE_FILTER` still applies when set.
+
 ### `config.json`
 
 | Key | Controls |
 |-----|----------|
-| `SHEET_ID` | Google Sheets spreadsheet ID for integrations that read or write sheet data. |
-| `SHEET_NAME` | Google Sheets tab name used by sheet integrations. |
-| `GOOGLE_CREDENTIALS_PATH` | Path to the Google service account credentials JSON file. |
 | `AI_JOBS_FILE` | JSON job export file used as AI-analysis input by legacy flows. |
 | `AI_TOKEN_THRESHOLD` | Token threshold used by legacy AI-analysis config. |
 | `DB_URL` | Optional database URL fallback read by `app/config.py` when the environment does not set `DB_URL`. |
@@ -264,6 +304,8 @@ At a high level, paginated `data_extract` works in two passes:
 3. The normal save/delta code then receives one complete list of jobs for the site. No database schema change is required; `__page` is persisted only in the raw output JSON for debugging.
 
 This two-pass behavior matters for Workday boards because visiting a job detail page during pagination can reset or confuse the browser's current result page. Collecting all list rows first keeps page traversal stable.
+
+Delay behavior is intentionally different between the two passes. The list-page pass does not apply `ITEM_DELAY_MS` to every row because it is only reading already-loaded cards. The detail hydration pass does apply `ITEM_DELAY_MS` after each collected `JobUrl`, and `page_wait_ms` remains the one wait applied after each next-page click.
 
 ### Configuring a Workday board
 Add a `pagination` block to the `data_extract` step for boards that expose a DOM next button:

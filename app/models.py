@@ -106,6 +106,26 @@ class Job(Base):
     changes = relationship(
         "JobChange", back_populates="job", cascade="all, delete-orphan"
     )
+    swipe = relationship(
+        "JobSwipe", back_populates="job", uselist=False, cascade="all, delete-orphan"
+    )
+
+
+class JobSwipe(Base):
+    __tablename__ = "job_swipes"
+    __table_args__ = (
+        UniqueConstraint("job_pk", name="uq_job_swipe_job_pk"),
+        {"mysql_charset": "utf8mb4", "mysql_collate": "utf8mb4_unicode_ci"},
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    job_pk = Column(Integer, ForeignKey("jobs.id", ondelete="CASCADE"), nullable=False)
+    action = Column(String(16), nullable=False)
+    created_at = Column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    job = relationship("Job", back_populates="swipe")
 
 
 class JobChange(Base):
