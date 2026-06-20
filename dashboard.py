@@ -5,6 +5,8 @@ import json
 import os
 import html
 import re
+import difflib
+import shutil
 import sys
 from collections import defaultdict, OrderedDict
 from datetime import datetime, timedelta
@@ -42,6 +44,13 @@ if app_dir not in sys.path:
 
 # NOTE: app/models.py currently prints DATABASE_URL on import. Remove that print.
 from app.models import Base, JobChange, SessionLocal, IntegrationRun, Job, engine  # type: ignore
+from discover_job_boards import (  # type: ignore
+    DEFAULT_STEPS_PATH,
+    DEFAULT_SUGGESTIONS_PATH,
+    merge_steps_suggestions,
+    read_json_file,
+    write_json,
+)
 
 try:
     from app.models import JobSwipe  # type: ignore
@@ -284,6 +293,133 @@ def record_swipe(job: Dict[str, Any], action: str) -> bool:
             session.add(JobSwipe(job_pk=db_job.id, action=action))
         session.commit()
         return True
+
+
+# ----------------------------------------------------------------------
+# Discovery suggestion review
+# ----------------------------------------------------------------------
+def fetch_discovery_suggestions() -> Dict[str, Any]:
+    doc = read_json_file(DEFAULT_SUGGESTIONS_PATH, {"suggestions": []})
+    if not isinstance(doc, dict):
+        doc = {"suggestions": []}
+    suggestions = doc.get("suggestions")
+    if not isinstance(suggestions, list):
+        suggestions = []
+    doc["suggestions"] = [
+        item for item in suggestions if isinstance(item, dict)
+    ]
+    doc["returned"] = len(doc["suggestions"])
+    return doc
+
+
+def update_discovery_suggestion_state(ids: List[str], state: str) -> Dict[str, Any]:
+    if state not in {"pending", "approved", "rejected", "applied"}:
+        raise ValueError("invalid discovery suggestion state")
+    selected = {str(item) for item in ids if str(item).strip()}
+    doc = fetch_discovery_suggestions()
+    changed = []
+    for suggestion in doc["suggestions"]:
+        sid = str(suggestion.get("id") or "")
+        if sid in selected:
+            suggestion["state"] = state
+            suggestion["updated_at"] = datetime.now().isoformat(timespec="seconds")
+            changed.append(sid)
+    write_json(DEFAULT_SUGGESTIONS_PATH, doc)
+    return {"changed": changed, "state": state}
+
+
+# ----------------------------------------------------------------------
+# steps.json editor
+# ----------------------------------------------------------------------
+def _format_steps_json(data: Dict[str, Any]) -> str:
+    return json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+
+
+def _steps_modified_at(path: str) -> str:
+    if not os.path.exists(path):
+        return ""
+    return datetime.fromtimestamp(os.path.getmtime(path)).isoformat(timespec="seconds")
+
+
+def _parse_steps_editor_content(content: Any) -> tuple[Dict[str, Any], str]:
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError("steps.json content is required")
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"Invalid JSON at line {exc.lineno}, column {exc.colno}: {exc.msg}"
+        ) from exc
+    if not isinstance(data, dict):
+        raise ValueError("steps.json must contain a top-level JSON object")
+    return data, _format_steps_json(data)
+
+
+def _load_steps_editor_state() -> Dict[str, Any]:
+    data = read_json_file(DEFAULT_STEPS_PATH, {})
+    if not isinstance(data, dict):
+        raise ValueError("steps.json must contain a top-level JSON object")
+    content = _format_steps_json(data)
+    return {
+        "path": DEFAULT_STEPS_PATH,
+        "content": content,
+        "site_count": len(data),
+        "modified_at": _steps_modified_at(DEFAULT_STEPS_PATH),
+    }
+
+
+def _steps_unified_diff(current_content: str, edited_content: str) -> str:
+    lines = difflib.unified_diff(
+        current_content.splitlines(),
+        edited_content.splitlines(),
+        fromfile="steps.json (current)",
+        tofile="steps.json (edited)",
+        lineterm="",
+    )
+    diff = "\n".join(lines)
+    return f"{diff}\n" if diff else ""
+
+
+def preview_steps_editor_content(content: Any) -> Dict[str, Any]:
+    data, formatted = _parse_steps_editor_content(content)
+    current = _load_steps_editor_state()["content"]
+    diff = _steps_unified_diff(current, formatted)
+    return {
+        "content": formatted,
+        "diff": diff,
+        "has_changes": bool(diff),
+        "site_count": len(data),
+        "message": "Changes ready to review." if diff else "No changes.",
+    }
+
+
+def save_steps_editor_content(content: Any) -> Dict[str, Any]:
+    data, formatted = _parse_steps_editor_content(content)
+    current = _load_steps_editor_state()["content"]
+    if formatted == current:
+        return {
+            "saved": False,
+            "backup_path": "",
+            "path": DEFAULT_STEPS_PATH,
+            "site_count": len(data),
+            "modified_at": _steps_modified_at(DEFAULT_STEPS_PATH),
+            "message": "No changes to save.",
+        }
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_path = f"{DEFAULT_STEPS_PATH}.{ts}.bak"
+    if os.path.exists(DEFAULT_STEPS_PATH):
+        shutil.copy2(DEFAULT_STEPS_PATH, backup_path)
+    write_json(DEFAULT_STEPS_PATH, data)
+    return {
+        "saved": True,
+        "backup_path": backup_path,
+        "path": DEFAULT_STEPS_PATH,
+        "site_count": len(data),
+        "modified_at": _steps_modified_at(DEFAULT_STEPS_PATH),
+        "content": formatted,
+        "message": "Saved steps.json.",
+    }
 
 
 # ----------------------------------------------------------------------
@@ -693,6 +829,15 @@ INDEX_HTML = r"""<!doctype html>
                   class="px-3 py-2 rounded-lg border border-slate-200 text-sm">
             Job lookup
           </button>
+          <button @click="view='discovery'; loadDiscovery()"
+                  :class="view==='discovery' ? 'bg-indigo-600 text-white' : 'bg-white text-slate-700'"
+                  class="px-3 py-2 rounded-lg border border-slate-200 text-sm">
+            Discovery
+          </button>
+          <a href="/steps"
+             class="px-3 py-2 rounded-lg border border-slate-200 text-sm bg-white text-slate-700">
+            Steps editor
+          </a>
           <a href="/swipe"
              class="px-3 py-2 rounded-lg border border-slate-200 text-sm bg-white text-slate-700">
             Swipe
@@ -743,7 +888,7 @@ INDEX_HTML = r"""<!doctype html>
                 </thead>
                 <tbody x-show="runsLoaded" x-for="row in runs" :key="row.id">
                   <tr>
-                    <td class="py-2 pr-4">{{ row.id }}</td>
+                    <td class="py-2 pr-4" x-text="row.id"></td>
                   </tr>
                 </tbody>
               </table>
@@ -1112,6 +1257,99 @@ INDEX_HTML = r"""<!doctype html>
         </div>
       </template>
 
+      <!-- ---------------- DISCOVERY REVIEW VIEW ---------------- -->
+      <template x-if="view==='discovery'">
+        <div class="space-y-4">
+          <section class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4">
+            <div class="flex flex-col md:flex-row md:items-center gap-3 md:justify-between">
+              <div>
+                <h2 class="text-sm font-semibold text-slate-800">Discovery suggestions</h2>
+                <p class="text-xs text-slate-500 mt-1">
+                  Review Ollama-guided career page suggestions before adding them to steps.json.
+                </p>
+              </div>
+              <div class="flex flex-wrap items-center gap-2">
+                <button @click="loadDiscovery()"
+                        class="px-3 py-2 rounded-lg border border-slate-300 bg-white text-sm text-slate-700 hover:bg-slate-50">
+                  Refresh
+                </button>
+                <button @click="applyDiscoverySelected()"
+                        :disabled="selectedDiscoveryIds.length === 0 || discoverySaving"
+                        class="px-3 py-2 rounded-lg bg-indigo-600 text-white text-sm disabled:opacity-40">
+                  Apply selected
+                </button>
+                <button @click="rejectDiscoverySelected()"
+                        :disabled="selectedDiscoveryIds.length === 0 || discoverySaving"
+                        class="px-3 py-2 rounded-lg border border-slate-300 bg-white text-sm text-slate-700 disabled:opacity-40">
+                  Reject selected
+                </button>
+              </div>
+            </div>
+            <div class="mt-3 text-sm text-slate-600" x-show="discoveryMessage" x-text="discoveryMessage"></div>
+            <div class="mt-3 text-sm text-slate-500" x-show="discoveryLoading">Loading suggestions...</div>
+          </section>
+
+          <section class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4">
+            <div class="overflow-x-auto">
+              <table class="min-w-full text-sm">
+                <thead class="text-left text-slate-600 border-b">
+                  <tr>
+                    <th class="py-2 pr-4">Use</th>
+                    <th class="py-2 pr-4">Site</th>
+                    <th class="py-2 pr-4">Platform</th>
+                    <th class="py-2 pr-4">Confidence</th>
+                    <th class="py-2 pr-4">Evidence</th>
+                    <th class="py-2 pr-4">Steps</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <template x-for="item in discoverySuggestions" :key="item.id">
+                    <tr class="border-b align-top">
+                      <td class="py-3 pr-4">
+                        <input type="checkbox"
+                               :disabled="!['pending','approved'].includes(item.state || 'pending')"
+                               :checked="isDiscoverySelected(item.id)"
+                               @change="toggleDiscovery(item.id)" />
+                        <div class="mt-1 text-xs text-slate-500" x-text="item.state || 'pending'"></div>
+                      </td>
+                      <td class="py-3 pr-4">
+                        <div class="font-medium text-slate-900" x-text="item.site_key || '-'"></div>
+                        <a class="text-xs text-indigo-700 hover:underline break-all"
+                           :href="item.url || '#'" target="_blank" rel="noreferrer"
+                           x-text="item.url || '-'"></a>
+                        <div class="mt-1 text-xs text-amber-700" x-show="item.manual_review">Manual selector review</div>
+                      </td>
+                      <td class="py-3 pr-4" x-text="item.platform || 'unknown'"></td>
+                      <td class="py-3 pr-4" x-text="Math.round(Number(item.confidence || 0) * 100) + '%'"></td>
+                      <td class="py-3 pr-4 max-w-md">
+                        <div class="text-slate-800" x-text="item.reason || '-'"></div>
+                        <div class="mt-1 text-xs text-slate-500" x-show="item.remote_evidence">
+                          Remote: <span x-text="item.remote_evidence"></span>
+                        </div>
+                        <div class="mt-1 text-xs text-slate-500" x-show="item.location_evidence">
+                          Location: <span x-text="item.location_evidence"></span>
+                        </div>
+                        <div class="mt-1 text-xs text-slate-500" x-show="item.notes" x-text="item.notes"></div>
+                      </td>
+                      <td class="py-3 pr-4">
+                        <details>
+                          <summary class="cursor-pointer text-indigo-700">View steps</summary>
+                          <pre class="mt-2 text-xs bg-slate-50 border border-slate-200 rounded-lg p-2 overflow-auto max-h-80 w-[32rem]"
+                               x-text="JSON.stringify(item.steps || [], null, 2)"></pre>
+                        </details>
+                      </td>
+                    </tr>
+                  </template>
+                </tbody>
+              </table>
+              <div class="text-sm text-slate-500 py-3" x-show="discoveryLoaded && discoverySuggestions.length === 0">
+                No discovery suggestions found. Run python discover_job_boards.py first.
+              </div>
+            </div>
+          </section>
+        </div>
+      </template>
+
     </div>
 
     <script>
@@ -1153,6 +1391,14 @@ INDEX_HTML = r"""<!doctype html>
           lookupLoading: false,
           lookupResults: [],
           selectedJobId: null,
+
+          // Discovery state
+          discoveryLoaded: false,
+          discoveryLoading: false,
+          discoverySaving: false,
+          discoverySuggestions: [],
+          selectedDiscoveryIds: [],
+          discoveryMessage: '',
 
           sum(arr) { return (arr || []).reduce((a,b)=>a+(b||0), 0); },
 
@@ -1372,9 +1618,290 @@ INDEX_HTML = r"""<!doctype html>
             return (this.lookupResults || []).find(j => j.id === this.selectedJobId) || null;
           },
 
+          // ---------------- DISCOVERY ----------------
+          async loadDiscovery() {
+            this.discoveryLoading = true;
+            this.discoveryMessage = '';
+            const res = await fetch('/api/discovery/suggestions');
+            const data = await res.json();
+            this.discoverySuggestions = data.suggestions || [];
+            this.selectedDiscoveryIds = this.selectedDiscoveryIds.filter(id =>
+              this.discoverySuggestions.some(item => item.id === id && ['pending','approved'].includes(item.state || 'pending'))
+            );
+            this.discoveryLoaded = true;
+            this.discoveryLoading = false;
+          },
+
+          isDiscoverySelected(id) {
+            return this.selectedDiscoveryIds.includes(id);
+          },
+
+          toggleDiscovery(id) {
+            if (this.isDiscoverySelected(id)) {
+              this.selectedDiscoveryIds = this.selectedDiscoveryIds.filter(x => x !== id);
+            } else {
+              this.selectedDiscoveryIds = [...this.selectedDiscoveryIds, id];
+            }
+          },
+
+          async applyDiscoverySelected() {
+            if (!this.selectedDiscoveryIds.length || this.discoverySaving) return;
+            this.discoverySaving = true;
+            this.discoveryMessage = '';
+            try {
+              const res = await fetch('/api/discovery/apply', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ids: this.selectedDiscoveryIds})
+              });
+              const data = await res.json();
+              if (!res.ok) throw new Error(data.error || 'Apply failed');
+              this.discoveryMessage = `Applied ${data.applied.length} suggestion(s); skipped ${data.skipped.length}.`;
+              this.selectedDiscoveryIds = [];
+              await this.loadDiscovery();
+            } catch (err) {
+              this.discoveryMessage = err?.message || 'Apply failed.';
+            } finally {
+              this.discoverySaving = false;
+            }
+          },
+
+          async rejectDiscoverySelected() {
+            if (!this.selectedDiscoveryIds.length || this.discoverySaving) return;
+            this.discoverySaving = true;
+            this.discoveryMessage = '';
+            try {
+              const res = await fetch('/api/discovery/reject', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ids: this.selectedDiscoveryIds})
+              });
+              const data = await res.json();
+              if (!res.ok) throw new Error(data.error || 'Reject failed');
+              this.discoveryMessage = `Rejected ${data.changed.length} suggestion(s).`;
+              this.selectedDiscoveryIds = [];
+              await this.loadDiscovery();
+            } catch (err) {
+              this.discoveryMessage = err?.message || 'Reject failed.';
+            } finally {
+              this.discoverySaving = false;
+            }
+          },
+
           init() {
             this.loadRuns();
             this.loadJobs();
+          }
+        }
+      }
+    </script>
+  </body>
+</html>
+"""
+
+STEPS_HTML = r"""<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Steps JSON Editor</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+  </head>
+  <body class="bg-slate-50 text-slate-900 min-h-screen">
+    <main class="max-w-7xl mx-auto p-4 space-y-4" x-data="stepsEditor()" x-init="load()">
+      <header class="flex flex-col md:flex-row md:items-start md:justify-between gap-3">
+        <div>
+          <h1 class="text-2xl font-bold tracking-tight">Steps JSON Editor</h1>
+          <p class="text-sm text-slate-500 mt-1">
+            <span x-text="path || 'steps.json'"></span>
+            <span x-show="siteCount !== null"> · sites=<span x-text="siteCount"></span></span>
+            <span x-show="modifiedAt"> · modified=<span x-text="modifiedAt"></span></span>
+          </p>
+        </div>
+        <div class="flex flex-wrap items-center gap-2">
+          <a href="/"
+             class="px-3 py-2 rounded-lg border border-slate-200 bg-white text-sm text-slate-700 hover:bg-slate-50">
+            Dashboard
+          </a>
+          <button type="button" @click="reload()"
+                  class="px-3 py-2 rounded-lg border border-slate-300 bg-white text-sm text-slate-700 hover:bg-slate-50">
+            Reload
+          </button>
+          <button type="button" @click="formatValidate()" :disabled="loading || saving"
+                  class="px-3 py-2 rounded-lg border border-slate-300 bg-white text-sm text-slate-700 hover:bg-slate-50 disabled:opacity-40">
+            Format / Validate
+          </button>
+          <button type="button" @click="preview()" :disabled="loading || saving"
+                  class="px-3 py-2 rounded-lg bg-indigo-600 text-white text-sm hover:bg-indigo-700 disabled:opacity-40">
+            Preview changes
+          </button>
+          <button type="button" @click="save()" :disabled="!canSave() || saving"
+                  class="px-3 py-2 rounded-lg bg-emerald-600 text-white text-sm hover:bg-emerald-700 disabled:opacity-40">
+            Save changes
+          </button>
+        </div>
+      </header>
+
+      <section class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4" x-show="message || error || saving || loading">
+        <div class="text-sm text-slate-600" x-show="loading">Loading steps.json...</div>
+        <div class="text-sm text-slate-600" x-show="saving">Saving steps.json...</div>
+        <div class="text-sm text-emerald-700" x-show="message" x-text="message"></div>
+        <div class="text-sm text-red-700" x-show="error" x-text="error"></div>
+      </section>
+
+      <section class="grid grid-cols-1 xl:grid-cols-2 gap-4">
+        <div class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4 space-y-3">
+          <div class="flex items-center justify-between gap-3">
+            <h2 class="text-sm font-semibold text-slate-800">Raw JSON</h2>
+            <span class="text-xs" :class="isDirty() ? 'text-amber-700' : 'text-slate-500'"
+                  x-text="isDirty() ? 'Unsaved edits' : 'Loaded'"></span>
+          </div>
+          <textarea x-model="content" spellcheck="false"
+                    @input="previewContent=''; diff=''; hasChanges=false"
+                    class="w-full h-[42rem] font-mono text-xs leading-5 rounded-lg border border-slate-300 bg-slate-950 text-slate-50 p-3 focus:outline-none focus:ring-2 focus:ring-indigo-500"></textarea>
+        </div>
+
+        <div class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4 space-y-3">
+          <div class="flex items-center justify-between gap-3">
+            <h2 class="text-sm font-semibold text-slate-800">Change preview</h2>
+            <span class="text-xs text-slate-500" x-text="hasChanges ? 'Diff ready' : 'No diff previewed'"></span>
+          </div>
+          <pre class="h-[42rem] overflow-auto rounded-lg border border-slate-200 bg-slate-950 text-slate-50 p-3 text-xs leading-5"
+               x-text="diff || 'Preview changes to see a unified diff before saving.'"></pre>
+        </div>
+      </section>
+    </main>
+
+    <script>
+      function stepsEditor() {
+        return {
+          loading: false,
+          saving: false,
+          path: '',
+          modifiedAt: '',
+          siteCount: null,
+          originalContent: '',
+          content: '',
+          previewContent: '',
+          diff: '',
+          hasChanges: false,
+          message: '',
+          error: '',
+
+          isDirty() {
+            return this.content !== this.originalContent;
+          },
+
+          canSave() {
+            return this.hasChanges && this.previewContent && this.content === this.previewContent;
+          },
+
+          async load() {
+            this.loading = true;
+            this.message = '';
+            this.error = '';
+            try {
+              const res = await fetch('/api/steps');
+              const data = await res.json();
+              if (!res.ok) throw new Error(data.error || 'Could not load steps.json');
+              this.path = data.path || '';
+              this.modifiedAt = data.modified_at || '';
+              this.siteCount = data.site_count ?? null;
+              this.originalContent = data.content || '';
+              this.content = this.originalContent;
+              this.previewContent = '';
+              this.diff = '';
+              this.hasChanges = false;
+              this.message = 'Loaded steps.json.';
+            } catch (err) {
+              this.error = err?.message || 'Could not load steps.json';
+            } finally {
+              this.loading = false;
+            }
+          },
+
+          async reload() {
+            if (this.isDirty() && !window.confirm('Discard unsaved edits and reload steps.json?')) return;
+            await this.load();
+          },
+
+          async requestPreview() {
+            const res = await fetch('/api/steps/preview', {
+              method: 'POST',
+              headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify({content: this.content})
+            });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.error || 'Preview failed');
+            return data;
+          },
+
+          async formatValidate() {
+            this.message = '';
+            this.error = '';
+            try {
+              const data = await this.requestPreview();
+              this.content = data.content || '';
+              this.previewContent = '';
+              this.diff = '';
+              this.hasChanges = false;
+              this.siteCount = data.site_count ?? this.siteCount;
+              this.message = data.has_changes ? 'JSON is valid and formatted.' : 'JSON is valid. No changes.';
+            } catch (err) {
+              this.error = err?.message || 'Validation failed';
+            }
+          },
+
+          async preview() {
+            this.message = '';
+            this.error = '';
+            try {
+              const data = await this.requestPreview();
+              this.content = data.content || '';
+              this.previewContent = this.content;
+              this.diff = data.diff || '';
+              this.hasChanges = Boolean(data.has_changes);
+              this.siteCount = data.site_count ?? this.siteCount;
+              this.message = data.message || (this.hasChanges ? 'Changes ready to review.' : 'No changes.');
+            } catch (err) {
+              this.previewContent = '';
+              this.diff = '';
+              this.hasChanges = false;
+              this.error = err?.message || 'Preview failed';
+            }
+          },
+
+          async save() {
+            if (!this.canSave() || this.saving) return;
+            if (!window.confirm('Save these reviewed changes to steps.json?')) return;
+            this.saving = true;
+            this.message = '';
+            this.error = '';
+            try {
+              const res = await fetch('/api/steps/save', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({content: this.previewContent})
+              });
+              const data = await res.json();
+              if (!res.ok) throw new Error(data.error || 'Save failed');
+              this.path = data.path || this.path;
+              this.modifiedAt = data.modified_at || this.modifiedAt;
+              this.siteCount = data.site_count ?? this.siteCount;
+              this.content = data.content || this.previewContent;
+              this.originalContent = this.content;
+              this.previewContent = '';
+              this.diff = '';
+              this.hasChanges = false;
+              this.message = data.saved
+                ? `Saved steps.json. Backup: ${data.backup_path || 'none'}`
+                : (data.message || 'No changes to save.');
+            } catch (err) {
+              this.error = err?.message || 'Save failed';
+            } finally {
+              this.saving = false;
+            }
           }
         }
       }
@@ -1555,6 +2082,11 @@ def swipe_page():
     return render_template_string(SWIPE_HTML)
 
 
+@app.route("/steps")
+def steps_page():
+    return render_template_string(STEPS_HTML)
+
+
 @app.route("/api/swipe/jobs")
 def swipe_jobs_api():
     try:
@@ -1574,6 +2106,36 @@ def swipe_api():
         if not record_swipe(job, action):
             return jsonify(error="job not found in database"), 404
         return jsonify(success=True)
+    except Exception as exc:
+        return jsonify(error=str(exc)), 500
+
+
+@app.route("/api/steps")
+def api_steps():
+    try:
+        return jsonify(_load_steps_editor_state())
+    except Exception as exc:
+        return jsonify(error=str(exc)), 500
+
+
+@app.route("/api/steps/preview", methods=["POST"])
+def api_steps_preview():
+    data = request.get_json(silent=True) or {}
+    try:
+        return jsonify(preview_steps_editor_content(data.get("content")))
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
+    except Exception as exc:
+        return jsonify(error=str(exc)), 500
+
+
+@app.route("/api/steps/save", methods=["POST"])
+def api_steps_save():
+    data = request.get_json(silent=True) or {}
+    try:
+        return jsonify(save_steps_editor_content(data.get("content")))
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
     except Exception as exc:
         return jsonify(error=str(exc)), 500
 
@@ -1633,6 +2195,43 @@ def api_job_detail():
     except Exception:
         job_pk = 0
     return jsonify(fetch_job_detail_by_id(job_pk))
+
+
+@app.route("/api/discovery/suggestions")
+def api_discovery_suggestions():
+    try:
+        return jsonify(fetch_discovery_suggestions())
+    except Exception as exc:
+        return jsonify(error=str(exc), suggestions=[]), 500
+
+
+@app.route("/api/discovery/apply", methods=["POST"])
+def api_discovery_apply():
+    data = request.get_json(silent=True) or {}
+    ids = data.get("ids") or []
+    if not isinstance(ids, list) or not ids:
+        return jsonify(error="ids must be a non-empty list"), 400
+    try:
+        result = merge_steps_suggestions(
+            steps_path=DEFAULT_STEPS_PATH,
+            suggestions_path=DEFAULT_SUGGESTIONS_PATH,
+            selected_ids=[str(item) for item in ids],
+        )
+        return jsonify(result)
+    except Exception as exc:
+        return jsonify(error=str(exc)), 500
+
+
+@app.route("/api/discovery/reject", methods=["POST"])
+def api_discovery_reject():
+    data = request.get_json(silent=True) or {}
+    ids = data.get("ids") or []
+    if not isinstance(ids, list) or not ids:
+        return jsonify(error="ids must be a non-empty list"), 400
+    try:
+        return jsonify(update_discovery_suggestion_state([str(item) for item in ids], "rejected"))
+    except Exception as exc:
+        return jsonify(error=str(exc)), 500
 
 
 # ----------------------------------------------------------------------

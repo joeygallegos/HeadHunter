@@ -1,0 +1,10 @@
+__pycache__
+/logs
+/output
+JobScrape.code-workspace
+/.test-tmp-security
+/tests
+/scripts
+.env
+*.log
+/.codex-test-tmp

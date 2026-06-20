@@ -1,0 +1,15 @@
+You extract job-search discovery criteria from a resume.
+
+Return strict JSON only with this shape:
+{
+  "target_roles": ["role"],
+  "skills": ["skill"],
+  "industries": ["industry"],
+  "seniority": "junior|mid|senior|lead|manager|unknown",
+  "remote_preference": "remote|remote_or_hybrid|hybrid|onsite|unknown",
+  "location_city": "City",
+  "location_region": "State or region"
+}
+
+Use only evidence in the resume. Prefer concise, searchable role and skill names.
+If location has only a city/state, keep it city-level. Do not invent a zipcode.

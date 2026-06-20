@@ -1,0 +1,20 @@
+[project]
+name = "jobs-pipeline"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+  "SQLAlchemy>=2.0",
+  "pymysql>=1.1",
+  "alembic>=1.13",
+  "nltk>=3.8",
+  "beautifulsoup4>=4.12",
+  "selenium>=4.21",
+  "flask",
+  "gunicorn>=22.0",
+  "pytest>=8.2"
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-q"

@@ -18,6 +18,37 @@ python run.py steps
 python run.py test
 ```
 
+## Ollama-Guided Job Board Discovery
+
+`discover_job_boards.py` helps find new company career pages and job boards to add to `steps.json`. Python does the page fetching and link extraction; Ollama reads the resume, evaluates page/link batches, and decides which pages are worth inspecting or suggesting.
+
+V1 is intentionally seeded and city-level:
+
+- It starts from `config/job_discovery_seeds.json`, or falls back to `config/job_discovery_seeds.example.json`.
+- It reads `resume.txt` to infer target roles, skills, seniority, remote preference, and city/state location.
+- It does not use a search API, scrape search-engine results, geocode a zipcode, or perform radius filtering.
+- It writes review files under `output/` and does not change `steps.json` directly.
+
+Run discovery:
+
+```powershell
+python .\discover_job_boards.py
+```
+
+Useful options:
+
+```powershell
+python .\discover_job_boards.py --resume resume.txt --seeds config/job_discovery_seeds.json --max-pages 25 --max-depth 2
+python .\discover_job_boards.py --dry-run
+```
+
+Outputs:
+
+- `output/job_board_discovery.json` contains the crawl evidence and generated suggestions.
+- `output/steps_suggestions.json` contains pending dashboard review items.
+
+Open the dashboard and use the `Discovery` tab to review suggestions. Applying selected suggestions creates a timestamped `steps.json` backup, skips duplicate site keys or duplicate load URLs, and marks applied suggestions as `applied`. Unknown/custom sites are marked for manual selector review; known ATS pages such as Workday, Greenhouse, and Lever get stronger starter templates.
+
 ## Ubuntu / OrangePi 5 Deployment
 
 The scraper uses Selenium with Chrome-compatible browsers. On Ubuntu servers, Chromium is supported; set the scraper to headless mode and point Selenium at Chromium/ChromeDriver if auto-discovery cannot find them.
@@ -140,6 +171,17 @@ The main dashboard includes a `Job index` page for searching and filtering store
 
 The same service also hosts the DB-backed swipe review page at `http://<orange-pi-ip>:5000/swipe`. Job Swipe reads active jobs from the configured SQLAlchemy database and records reviews in the `job_swipes` table. The dashboard creates that table on first use if it is missing, so it does not need Google Sheets credentials.
 
+### Steps editor
+
+The dashboard also hosts a raw JSON editor for `steps.json` at `http://<orange-pi-ip>:5000/steps`. Use it when you need to adjust scraper steps or add a new site without opening the file directly.
+
+Important details:
+
+- The editor validates JSON and requires a unified diff preview before saving.
+- The file must remain a top-level JSON object keyed by site name.
+- Saving writes pretty-printed JSON and creates a timestamped `.bak` file next to `steps.json`.
+- If the preview has no changes, saving is skipped and no backup is created.
+
 ### Job Swipe
 
 Job Swipe uses the same database connection as the scraper and dashboard. It queues active jobs that do not yet have a row in `job_swipes`, sorted newest first. Clicking `Like` or `Dislike` inserts or updates one `job_swipes` row for that job and removes it from future queue loads.
@@ -231,6 +273,10 @@ DB_COMMIT_MODE=per_site   # all_at_end | per_site | per_job
 | `OLLAMA_NUM_PREDICT` | Maximum generated tokens requested from Ollama. |
 | `OLLAMA_KEEP_ALIVE` | How long Ollama should keep the model loaded after requests. |
 | `OLLAMA_THINK` | Enables model thinking output handling when set to `true`. |
+| `JOB_DISCOVERY_NUM_PREDICT` | Maximum generated tokens requested from Ollama during job-board discovery. |
+| `JOB_DISCOVERY_TIMEOUT_SEC` | Timeout in seconds for each discovery Ollama request. |
+| `JOB_DISCOVERY_FETCH_TIMEOUT_SEC` | Timeout in seconds for each discovery page fetch. |
+| `JOB_DISCOVERY_USER_AGENT` | User agent sent by discovery page fetches. |
 | `ONLY_EMPTY` | Limits AI analysis to jobs without existing AI analysis when set to `true`. |
 | `SITE_FILTER` | Restricts AI analysis to a single site name when set. |
 | `LIMIT` | Caps the number of jobs processed by AI analysis when greater than `0`. |
