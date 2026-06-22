@@ -133,7 +133,8 @@ class StepScraper:
     Actions supported:
       load_url, sleep, scroll_to, click_button, select_checkbox, type_text,
       data_extract (extract/redirect/sleep/replace_text/regex_extract/next),
-      json_set_payload, json_replace_text, json_data_extract.
+      json_set_payload, json_replace_text, json_data_extract,
+      json_html_data_extract.
 
     Notes:
       - 'xpath' is a CSS selector (legacy name).
@@ -671,6 +672,16 @@ class StepScraper:
                     if json_payload is not None:
                         jobs.extend(self._extract_from_json(json_payload, step))
 
+                elif action == "json_html_data_extract":
+                    if json_payload is not None:
+                        jobs.extend(
+                            self._extract_from_json_html(
+                                driver=driver,
+                                json_payload=json_payload,
+                                step=step,
+                            )
+                        )
+
         except Exception as e:
             err = str(e)
 
@@ -1024,3 +1035,131 @@ class StepScraper:
                 job[column] = cur if cur is not None else ""
             out.append(job)
         return out
+
+    @staticmethod
+    def _json_path_get(data: Any, path: Optional[str]) -> Any:
+        if not path:
+            return data
+        cur = data
+        for part in re.split(r"[>.]", path):
+            if isinstance(cur, dict):
+                cur = cur.get(part)
+            elif isinstance(cur, list) and part.isdigit():
+                cur = cur[int(part)]
+            else:
+                return None
+            if cur is None:
+                return None
+        return cur
+
+    @staticmethod
+    def _element_value(
+        element: BeautifulSoup,
+        css: Optional[str],
+        attr: Optional[str],
+    ) -> str:
+        tag = element.select_one(css) if css else element
+        if not tag:
+            return ""
+        if attr:
+            return str(tag.get(attr, "") or "").strip()
+        return tag.get_text(" ", strip=True)
+
+    def _extract_from_json_html(
+        self,
+        *,
+        driver: webdriver.Chrome,
+        json_payload: str,
+        step: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        data = json.loads(json_payload)
+        html = self._json_path_get(data, step.get("html_key"))
+        if html is None:
+            html = self._json_path_get(data, step.get("focus_html_key"))
+        if not isinstance(html, str) or not html.strip():
+            return []
+
+        focus_scope = step.get("focus_scope")
+        if not focus_scope:
+            return []
+
+        base_url = step.get("base_url") or driver.current_url
+        extract_steps = step.get("extract_steps") or []
+        soup = BeautifulSoup(html, "html.parser")
+        elements = soup.select(focus_scope)
+        jobs: List[Dict[str, Any]] = []
+
+        for element in elements:
+            job: Dict[str, Any] = {}
+            redirected = False
+
+            for es in extract_steps:
+                action = es.get("action")
+                if action == "extract":
+                    column = es.get("as_column")
+                    if not column:
+                        continue
+                    value = self._element_value(
+                        element,
+                        es.get("xpath") or es.get("selector"),
+                        es.get("attr_target"),
+                    )
+                    if (es.get("data_type") or "").lower() == "url":
+                        value = self._normalize_url(base_url, value) or value
+                    job[column] = value
+                    continue
+
+                if action == "redirect" and not redirected:
+                    using_col = es.get("using_column")
+                    detail_url = (
+                        self._normalize_url(base_url, job.get(using_col))
+                        if using_col
+                        else None
+                    )
+                    if not detail_url:
+                        continue
+                    try:
+                        _dbg(f"GET detail: {detail_url}")
+                        driver.get(detail_url)
+                        redirected = True
+                        wait_css = es.get("wait_css")
+                        if wait_css:
+                            WebDriverWait(driver, self.default_wait).until(
+                                EC.presence_of_element_located((By.CSS_SELECTOR, wait_css))
+                            )
+                        _sleep_default(reason="post-redirect sleep (default)")
+                    except WebDriverException as we:
+                        print(f"[warn] redirect get() failed: {we}")
+                        redirected = False
+                    continue
+
+                if action == "extract_detail" and redirected:
+                    column = es.get("as_column")
+                    css = es.get("xpath") or es.get("selector")
+                    if not column or not css:
+                        continue
+                    try:
+                        tag = driver.find_element(By.CSS_SELECTOR, css)
+                        attr = es.get("attr_target")
+                        job[column] = tag.get_attribute(attr) if attr else tag.text
+                    except NoSuchElementException:
+                        job[column] = ""
+                    continue
+
+                if action == "replace_text":
+                    self._apply_replace_text(job, es)
+                    continue
+
+                if action == "regex_extract":
+                    self._apply_regex_extract(job, es)
+                    continue
+
+                if action == "next":
+                    break
+
+            jobs.append(job)
+
+            if ITEM_DELAY_MS > 0:
+                _sleep_ms(ITEM_DELAY_MS, reason="item delay")
+
+        return jobs

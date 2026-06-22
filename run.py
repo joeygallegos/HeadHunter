@@ -189,6 +189,56 @@ def _norm_text(x: str | None) -> str:
     return (x or "").replace("\u202f", " ").replace("\u00a0", " ").strip()
 
 
+def _missing_extraction_fields(jobs_raw: List[Dict[str, Any]]) -> Dict[str, List[int]]:
+    required_fields = ["JobID", "JobTitle", "JobUrl", "JobDesc"]
+    missing: Dict[str, List[int]] = {field: [] for field in required_fields}
+    for idx, job in enumerate(jobs_raw, 1):
+        for field in required_fields:
+            if not _norm_text(str(job.get(field, ""))):
+                missing[field].append(idx)
+    return missing
+
+
+def _log_test_extraction_summary(
+    logger: logging.LoggerAdapter,
+    site: str,
+    jobs_raw: List[Dict[str, Any]],
+) -> None:
+    missing = _missing_extraction_fields(jobs_raw)
+    logger.info("test extraction site=%s jobs_found=%d", site, len(jobs_raw))
+    print(f"[test] {site}: jobs_found={len(jobs_raw)}")
+    for field, row_numbers in missing.items():
+        logger.info(
+            "test extraction site=%s missing_%s=%d rows=%s",
+            site,
+            field,
+            len(row_numbers),
+            row_numbers,
+        )
+        print(f"[test] {site}: missing_{field}={len(row_numbers)}")
+        if row_numbers:
+            print(f"[test] {site}: missing_{field}_rows={row_numbers}")
+
+
+def _print_test_extracted_values(site: str, jobs_raw: List[Dict[str, Any]]) -> None:
+    if not jobs_raw:
+        return
+
+    preferred = ["JobID", "JobTitle", "JobUrl", "JobPay", "JobDesc"]
+    discovered = sorted({key for job in jobs_raw for key in job.keys()})
+    keys = [key for key in preferred if key in discovered]
+    keys.extend(key for key in discovered if key not in keys)
+
+    for idx, job in enumerate(jobs_raw, 1):
+        print(f"[test] {site}: row={idx}")
+        for key in keys:
+            value = job.get(key, "")
+            text = _norm_text(str(value))
+            if key == "JobDesc" and len(text) > 500:
+                text = f"{text[:500]}... [len={len(_norm_text(str(value)))}]"
+            print(f"[test] {site}: row={idx} {key}={text}")
+
+
 def _job_hash(
     title: str, url: str, desc: str, keywords: str, level: str, pay: str
 ) -> str:
@@ -521,6 +571,19 @@ def main():
             base_log.info("reprocessed %d jobs", len(rows))
         sys.exit(0)
 
+    if cmd == "test":
+        steps_path = os.path.join(BASE_DIR, "test.json")
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        test_log = get_logger(run_id="test")
+        test_log.info("test extraction only | steps_path=%s", steps_path)
+        scraper = StepScraper(steps_path)
+        with Timer("scraper.test", logger=test_log):
+            for site, jobs_raw in scraper.run_iter():
+                save_site_json(OUTPUT_DIR, site, jobs_raw)
+                _log_test_extraction_summary(test_log, site, jobs_raw)
+                _print_test_extracted_values(site, jobs_raw)
+        return
+
     commit_mode = os.getenv("DB_COMMIT_MODE", "all_at_end").lower()
     if commit_mode not in {"all_at_end", "per_site", "per_job"}:
         base_log.warning(
@@ -530,8 +593,7 @@ def main():
 
     with Timer("init_db", logger=base_log):
         init_db()
-    test_mode = cmd == "test"
-    steps_path = os.path.join(BASE_DIR, "test.json" if test_mode else "steps.json")
+    steps_path = os.path.join(BASE_DIR, "steps.json")
 
     with Timer("ensure_nltk", logger=base_log):
         ensure_nltk()
@@ -539,9 +601,7 @@ def main():
 
     # Open run row
     with SessionLocal.begin() as s:
-        run = IntegrationRun(
-            user=getpass.getuser(), mode=("test" if test_mode else "steps")
-        )
+        run = IntegrationRun(user=getpass.getuser(), mode="steps")
         s.add(run)
         s.flush()
         run_id = run.id
