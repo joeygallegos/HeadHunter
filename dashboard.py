@@ -45,9 +45,11 @@ if app_dir not in sys.path:
 # NOTE: app/models.py currently prints DATABASE_URL on import. Remove that print.
 from app.models import Base, JobChange, SessionLocal, IntegrationRun, Job, engine  # type: ignore
 from discover_job_boards import (  # type: ignore
+    DEFAULT_EVENTS_PATH,
     DEFAULT_STEPS_PATH,
     DEFAULT_SUGGESTIONS_PATH,
     merge_steps_suggestions,
+    read_event_log,
     read_json_file,
     write_json,
 )
@@ -97,6 +99,18 @@ def _to_int(x: Any) -> int:
         return int(x)
     except Exception:
         return 0
+
+
+def _run_status(started_at: Optional[datetime], finished_at: Optional[datetime]) -> str:
+    if finished_at:
+        return "Finished"
+    if not started_at:
+        return "Running"
+
+    age = _now_local().replace(tzinfo=None) - started_at.replace(tzinfo=None)
+    if age > timedelta(hours=24):
+        return "Incomplete"
+    return "Running"
 
 
 def _rolling_mean(values: List[float], window: int) -> List[float]:
@@ -328,6 +342,15 @@ def update_discovery_suggestion_state(ids: List[str], state: str) -> Dict[str, A
     return {"changed": changed, "state": state}
 
 
+def fetch_discovery_events(limit: int = 200) -> Dict[str, Any]:
+    events = read_event_log(DEFAULT_EVENTS_PATH, limit=limit)
+    return {
+        "path": DEFAULT_EVENTS_PATH,
+        "returned": len(events),
+        "events": events,
+    }
+
+
 # ----------------------------------------------------------------------
 # steps.json editor
 # ----------------------------------------------------------------------
@@ -508,6 +531,31 @@ def fetch_runs(days: int) -> Dict[str, List]:
     def to_pct(xs: List[float]) -> List[float]:
         return [round(x * 100.0, 2) for x in xs]
 
+    recent_runs: List[Dict[str, Any]] = []
+    for r in sorted(
+        runs,
+        key=lambda run: (run.started_at is not None, run.started_at or datetime.min),
+        reverse=True,
+    ):
+        started_at = getattr(r, "started_at", None)
+        finished_at = getattr(r, "finished_at", None)
+        recent_runs.append(
+            {
+                "id": r.id,
+                "started_at": started_at.isoformat(sep=" ") if started_at else "",
+                "finished_at": finished_at.isoformat(sep=" ") if finished_at else "",
+                "user": getattr(r, "user", "") or "",
+                "mode": getattr(r, "mode", "") or "",
+                "total_seen": _to_int(getattr(r, "total_seen", 0)),
+                "inserted": _to_int(getattr(r, "inserted_count", 0)),
+                "updated": _to_int(getattr(r, "updated_count", 0)),
+                "missing": _to_int(getattr(r, "missing_count", 0)),
+                "unchanged": _to_int(getattr(r, "unchanged_count", 0)),
+                "error": _to_int(getattr(r, "error_count", 0)),
+                "status": _run_status(started_at, finished_at),
+            }
+        )
+
     return {
         "labels": labels,
         "inserted": inserted,
@@ -521,6 +569,7 @@ def fetch_runs(days: int) -> Dict[str, List]:
         "net_rate_pct": to_pct(net_rate),
         "change_rate_ma7_pct": to_pct(change_rate_ma7),
         "net_rate_ma7_pct": to_pct(net_rate_ma7),
+        "recent_runs": recent_runs,
     }
 
 
@@ -876,24 +925,62 @@ INDEX_HTML = r"""<!doctype html>
             </div>
           </section>
 
-          <template x-if="view==='runs'">
           <section class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4">
-            <h2 class="text-sm font-semibold text-slate-800 mb-2">Run list</h2>
+            <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+              <h2 class="text-sm font-semibold text-slate-800">Runs</h2>
+              <label class="inline-flex items-center gap-2 text-sm text-slate-700">
+                <input type="checkbox" x-model="hideTestRuns" class="rounded border-slate-300" />
+                Hide test items
+              </label>
+            </div>
             <div class="mt-3 overflow-x-auto">
               <table class="min-w-full text-sm">
                 <thead class="text-left text-slate-600 border-b">
                   <tr>
                     <th class="py-2 pr-4">ID</th>
+                    <th class="py-2 pr-4">Started</th>
+                    <th class="py-2 pr-4">Finished</th>
+                    <th class="py-2 pr-4">Status</th>
+                    <th class="py-2 pr-4">Mode</th>
+                    <th class="py-2 pr-4">User</th>
+                    <th class="py-2 pr-4 text-right">New</th>
+                    <th class="py-2 pr-4 text-right">Updated</th>
+                    <th class="py-2 pr-4 text-right">Missing</th>
+                    <th class="py-2 pr-4 text-right">Unchanged</th>
+                    <th class="py-2 pr-4 text-right">Errors</th>
+                    <th class="py-2 pr-4 text-right">Total Seen</th>
                   </tr>
                 </thead>
-                <tbody x-show="runsLoaded" x-for="row in runs" :key="row.id">
-                  <tr>
-                    <td class="py-2 pr-4" x-text="row.id"></td>
+                <tbody x-show="runsLoaded" class="divide-y divide-slate-100">
+                  <template x-for="row in visibleRuns()" :key="row.id">
+                    <tr class="text-slate-700">
+                      <td class="py-2 pr-4 font-medium text-slate-900" x-text="row.id"></td>
+                      <td class="py-2 pr-4 whitespace-nowrap" x-text="formatRunTime(row.started_at)"></td>
+                      <td class="py-2 pr-4 whitespace-nowrap" x-text="formatRunTime(row.finished_at)"></td>
+                      <td class="py-2 pr-4" x-text="row.status || '-'"></td>
+                      <td class="py-2 pr-4" x-text="row.mode || '-'"></td>
+                      <td class="py-2 pr-4" x-text="row.user || '-'"></td>
+                      <td class="py-2 pr-4 text-right" x-text="row.inserted"></td>
+                      <td class="py-2 pr-4 text-right" x-text="row.updated"></td>
+                      <td class="py-2 pr-4 text-right" x-text="row.missing"></td>
+                      <td class="py-2 pr-4 text-right" x-text="row.unchanged"></td>
+                      <td class="py-2 pr-4 text-right" x-text="row.error"></td>
+                      <td class="py-2 pr-4 text-right" x-text="row.total_seen"></td>
+                    </tr>
+                  </template>
+                  <tr x-show="filteredRuns().length === 0">
+                    <td colspan="12" class="py-3 text-slate-500">No runs found for the selected day range.</td>
                   </tr>
                 </tbody>
               </table>
             </div>
-          </section></template>
+            <div class="mt-3 flex justify-end" x-show="canLoadMoreRuns()">
+              <button @click="loadMoreRuns()"
+                      class="px-3 py-2 rounded-lg border border-slate-300 bg-white text-sm text-slate-700 hover:bg-slate-50">
+                Load more
+              </button>
+            </div>
+          </section>
 
           <section class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4">
             
@@ -1290,6 +1377,59 @@ INDEX_HTML = r"""<!doctype html>
           </section>
 
           <section class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4">
+            <div class="flex flex-col md:flex-row md:items-center gap-3 md:justify-between">
+              <div>
+                <h2 class="text-sm font-semibold text-slate-800">Journey log</h2>
+                <p class="text-xs text-slate-500 mt-1">
+                  Live events from discover_job_boards.py while Python fetches pages and Ollama chooses next steps.
+                </p>
+              </div>
+              <div class="flex flex-wrap items-center gap-3 text-sm">
+                <label class="inline-flex items-center gap-2 text-slate-700">
+                  <input type="checkbox" x-model="discoveryAutoRefresh" />
+                  Auto refresh
+                </label>
+                <button @click="loadDiscoveryEvents()"
+                        class="px-3 py-2 rounded-lg border border-slate-300 bg-white text-sm text-slate-700 hover:bg-slate-50">
+                  Refresh log
+                </button>
+              </div>
+            </div>
+
+            <div class="mt-3 text-xs text-slate-500">
+              events=<span x-text="discoveryEvents.length"></span>
+              <span class="ml-2" x-show="discoveryEventsLoaded">last refreshed=<span x-text="discoveryEventsLoadedAt || '-'"></span></span>
+            </div>
+
+            <div class="mt-3 space-y-2 max-h-96 overflow-auto">
+              <template x-for="event in recentDiscoveryEvents()" :key="`${event.timestamp || ''}-${event.type || ''}-${event.url || event.message || ''}`">
+                <div class="rounded-lg border border-slate-200 bg-slate-50 p-3">
+                  <div class="flex flex-col md:flex-row md:items-start md:justify-between gap-2">
+                    <div>
+                      <div class="flex flex-wrap items-center gap-2">
+                        <span class="inline-flex rounded bg-indigo-100 px-2 py-0.5 text-xs font-medium text-indigo-700"
+                              x-text="event.type || 'event'"></span>
+                        <span class="text-xs text-slate-500" x-text="event.timestamp || '-'"></span>
+                      </div>
+                      <div class="mt-1 text-sm text-slate-900" x-text="event.message || '-'"></div>
+                      <a class="mt-1 block text-xs text-indigo-700 hover:underline break-all"
+                         x-show="event.url"
+                         :href="event.url || '#'" target="_blank" rel="noreferrer"
+                         x-text="event.url || ''"></a>
+                    </div>
+                    <pre class="text-xs bg-white border border-slate-200 rounded p-2 overflow-auto max-h-32 md:w-96"
+                         x-show="eventDetails(event)"
+                         x-text="eventDetails(event)"></pre>
+                  </div>
+                </div>
+              </template>
+              <div class="text-sm text-slate-500 py-3" x-show="discoveryEventsLoaded && discoveryEvents.length === 0">
+                No journey events found. Run python discover_job_boards.py with event logging enabled.
+              </div>
+            </div>
+          </section>
+
+          <section class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4">
             <div class="overflow-x-auto">
               <table class="min-w-full text-sm">
                 <thead class="text-left text-slate-600 border-b">
@@ -1368,6 +1508,9 @@ INDEX_HTML = r"""<!doctype html>
           error: [],
           total_seen: [],
           net_change: [],
+          recentRuns: [],
+          runsVisibleLimit: 10,
+          hideTestRuns: true,
           change_rate_pct: [],
           net_rate_pct: [],
           change_rate_ma7_pct: [],
@@ -1399,6 +1542,11 @@ INDEX_HTML = r"""<!doctype html>
           discoverySuggestions: [],
           selectedDiscoveryIds: [],
           discoveryMessage: '',
+          discoveryEvents: [],
+          discoveryEventsLoaded: false,
+          discoveryEventsLoadedAt: '',
+          discoveryAutoRefresh: true,
+          discoveryPoller: null,
 
           sum(arr) { return (arr || []).reduce((a,b)=>a+(b||0), 0); },
 
@@ -1416,6 +1564,8 @@ INDEX_HTML = r"""<!doctype html>
             this.error = data.error || [];
             this.total_seen = data.total_seen || [];
             this.net_change = data.net_change || [];
+            this.recentRuns = data.recent_runs || [];
+            this.runsVisibleLimit = 10;
             this.change_rate_pct = data.change_rate_pct || [];
             this.net_rate_pct = data.net_rate_pct || [];
             this.change_rate_ma7_pct = data.change_rate_ma7_pct || [];
@@ -1424,6 +1574,37 @@ INDEX_HTML = r"""<!doctype html>
             this.renderCountsChart();
             this.renderRatesChart();
             this.runsLoaded = true;
+          },
+
+          filteredRuns() {
+            const rows = this.recentRuns || [];
+            if (!this.hideTestRuns) return rows;
+            return rows.filter(row => String(row.mode || '').toLowerCase() !== 'test');
+          },
+
+          visibleRuns() {
+            return this.filteredRuns().slice(0, this.runsVisibleLimit);
+          },
+
+          canLoadMoreRuns() {
+            return this.filteredRuns().length > this.runsVisibleLimit;
+          },
+
+          loadMoreRuns() {
+            this.runsVisibleLimit += 10;
+          },
+
+          formatRunTime(value) {
+            if (!value) return '-';
+            const parsed = new Date(String(value).replace(' ', 'T'));
+            if (Number.isNaN(parsed.getTime())) return value;
+            return parsed.toLocaleString([], {
+              month: 'short',
+              day: 'numeric',
+              year: 'numeric',
+              hour: 'numeric',
+              minute: '2-digit'
+            });
           },
 
           renderCountsChart() {
@@ -1622,14 +1803,40 @@ INDEX_HTML = r"""<!doctype html>
           async loadDiscovery() {
             this.discoveryLoading = true;
             this.discoveryMessage = '';
-            const res = await fetch('/api/discovery/suggestions');
-            const data = await res.json();
+            const [suggestionsRes] = await Promise.all([
+              fetch('/api/discovery/suggestions'),
+              this.loadDiscoveryEvents()
+            ]);
+            const data = await suggestionsRes.json();
             this.discoverySuggestions = data.suggestions || [];
             this.selectedDiscoveryIds = this.selectedDiscoveryIds.filter(id =>
               this.discoverySuggestions.some(item => item.id === id && ['pending','approved'].includes(item.state || 'pending'))
             );
             this.discoveryLoaded = true;
             this.discoveryLoading = false;
+          },
+
+          async loadDiscoveryEvents() {
+            const res = await fetch('/api/discovery/events?limit=200');
+            const data = await res.json();
+            this.discoveryEvents = data.events || [];
+            this.discoveryEventsLoaded = true;
+            this.discoveryEventsLoadedAt = new Date().toLocaleTimeString();
+          },
+
+          recentDiscoveryEvents() {
+            return [...(this.discoveryEvents || [])].reverse();
+          },
+
+          eventDetails(event) {
+            const skip = new Set(['timestamp', 'type', 'message', 'url']);
+            const details = {};
+            for (const [key, value] of Object.entries(event || {})) {
+              if (!skip.has(key) && value !== null && value !== undefined && value !== '') {
+                details[key] = value;
+              }
+            }
+            return Object.keys(details).length ? JSON.stringify(details, null, 2) : '';
           },
 
           isDiscoverySelected(id) {
@@ -1691,6 +1898,11 @@ INDEX_HTML = r"""<!doctype html>
           init() {
             this.loadRuns();
             this.loadJobs();
+            this.discoveryPoller = setInterval(() => {
+              if (this.view === 'discovery' && this.discoveryAutoRefresh) {
+                this.loadDiscoveryEvents();
+              }
+            }, 3000);
           }
         }
       }
@@ -2203,6 +2415,18 @@ def api_discovery_suggestions():
         return jsonify(fetch_discovery_suggestions())
     except Exception as exc:
         return jsonify(error=str(exc), suggestions=[]), 500
+
+
+@app.route("/api/discovery/events")
+def api_discovery_events():
+    try:
+        limit = int(request.args.get("limit", "200"))
+    except Exception:
+        limit = 200
+    try:
+        return jsonify(fetch_discovery_events(limit=limit))
+    except Exception as exc:
+        return jsonify(error=str(exc), events=[]), 500
 
 
 @app.route("/api/discovery/apply", methods=["POST"])
