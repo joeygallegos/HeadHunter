@@ -42,6 +42,10 @@ app_dir = os.path.join(BASE_DIR, "app")
 if app_dir not in sys.path:
     sys.path.insert(0, app_dir)
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 # NOTE: app/models.py currently prints DATABASE_URL on import. Remove that print.
 from app.models import Base, JobChange, SessionLocal, IntegrationRun, Job, engine  # type: ignore
 from discover_job_boards import (  # type: ignore
