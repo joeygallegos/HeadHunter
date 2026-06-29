@@ -1,12 +1,18 @@
-Your goal is to enhance test.json for a new job source.
+Your goal is to clear and create a test.json for a new job source.
 
 Website:
-https://www.langchain.com/careers
 
 Tasks:
 
 1. Investigate how job listings are loaded.
 
+   * Start by reviewing the current scraper capabilities and examples in test.json / steps.json so you know which actions already exist.
+   * For JavaScript-heavy sites, run browser network capture early with Selenium or Playwright performance logs:
+     * Load the careers page.
+     * Wait for hydration.
+     * Scroll or click "open positions" if needed.
+     * Collect request URLs containing terms like api, jobs, careers, postings, greenhouse, lever, ashby, workday, or graphql.
+   * Try the discovered network endpoints directly before inspecting minified bundles or writing selectors.
    * Use browser developer tools, Selenium, Playwright, CURL, network inspection, XHR/fetch requests, GraphQL, embedded JSON, or any other method necessary.
    * Do not assume the jobs are rendered in the initial HTML.
    * Identify the actual source of truth for the job data.
@@ -14,12 +20,17 @@ Tasks:
 2. Determine the most reliable extraction strategy.
 
    * Prefer direct API/XHR/JSON endpoints over browser scraping.
+   * Prefer `json_set_payload` + `json_data_extract` when the source of truth is a JSON response.
+   * Use `json_html_data_extract` when the API returns HTML fragments inside JSON.
    * Only use HTML extraction if no structured data source exists.
+   * Inspect static HTML and Next.js embedded data only as quick triage; avoid spending time on minified bundles unless network capture fails.
 
 3. Review the existing test.json patterns and follow the same conventions.
 
    * Reuse existing actions when possible.
    * Do not invent new action types unless absolutely required.
+   * Test your JSON by running scraper test with UTF-8 console output `env:PYTHONIOENCODING='utf-8'; python run.py test`
+
 
 4. Generate the exact JSON steps needed to extract:
 
@@ -36,10 +47,75 @@ Output requirements:
 * Return ONLY the new JSON block to add to test.json.
 * The output must be valid JSON.
 * Do not return explanations unless a blocker prevents implementation.
+* Wrap the JSON code block
 
 Schema reference:
 
-[paste the relevant schema and a few working examples here]
+{
+    "delta": [
+        {
+            "action": "load_url",
+            "url": "https://delta.avature.net/en_US/careers/SearchJobs/?2884=75200&2884_format=3665&listFilterMode=1"
+        },
+        {
+            "action": "data_extract",
+            "focus_scope": "ul.list--jobs > li.list__item",
+            "extract_steps": [
+                {
+                    "action": "extract",
+                    "as_column": "JobTitle",
+                    "xpath": ".list__item__text__title a",
+                    "attr_target": null
+                },
+                {
+                    "action": "extract",
+                    "data_type": "url",
+                    "as_column": "JobUrl",
+                    "xpath": ".list__item__text__title a",
+                    "attr_target": "href"
+                },
+                {
+                    "action": "extract",
+                    "as_column": "Location",
+                    "xpath": ".list__item__text__subtitle span:nth-of-type(1)",
+                    "attr_target": null
+                },
+                {
+                    "action": "extract",
+                    "as_column": "JobID",
+                    "xpath": ".list__item__text__subtitle span:nth-of-type(2)",
+                    "attr_target": null
+                },
+                {
+                    "action": "regex_extract",
+                    "using_column": "JobID",
+                    "as_column": "JobID",
+                    "regex_pattern": "Ref #([0-9]+)"
+                },
+                {
+                    "action": "redirect",
+                    "using_column": "JobUrl",
+                    "wait_css": ".article__content--rich-text[itemprop='description']"
+                },
+                {
+                    "action": "extract",
+                    "as_column": "JobDesc",
+                    "xpath": ".article__content--rich-text[itemprop='description']",
+                    "attr_target": null
+                },
+                {
+                    "action": "extract",
+                    "data_type": "current_url",
+                    "as_column": "JobUrl"
+                },
+                {
+                    "action": "next"
+                }
+            ]
+        }
+    ]
+}
+
 
 Success criteria:
 

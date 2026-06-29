@@ -2044,9 +2044,9 @@ STEPS_HTML = r"""<!doctype html>
   </head>
   <body class="bg-slate-50 text-slate-900 min-h-screen">
     <main class="max-w-7xl mx-auto p-4 space-y-4" x-data="stepsEditor()" x-init="load()">
-      <header class="flex flex-col md:flex-row md:items-start md:justify-between gap-3">
+      <header class="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-3">
         <div>
-          <h1 class="text-2xl font-bold tracking-tight">Steps JSON Editor</h1>
+          <h1 class="text-2xl font-bold tracking-tight">Steps Builder</h1>
           <p class="text-sm text-slate-500 mt-1">
             <span x-text="path || 'steps.json'"></span>
             <span x-show="siteCount !== null"> · sites=<span x-text="siteCount"></span></span>
@@ -2066,10 +2066,6 @@ STEPS_HTML = r"""<!doctype html>
                   class="px-3 py-2 rounded-lg border border-slate-300 bg-white text-sm text-slate-700 hover:bg-slate-50 disabled:opacity-40">
             Format / Validate
           </button>
-          <button type="button" @click="preview()" :disabled="loading || saving"
-                  class="px-3 py-2 rounded-lg bg-indigo-600 text-white text-sm hover:bg-indigo-700 disabled:opacity-40">
-            Preview changes
-          </button>
           <button type="button" @click="save()" :disabled="!canSave() || saving"
                   class="px-3 py-2 rounded-lg bg-emerald-600 text-white text-sm hover:bg-emerald-700 disabled:opacity-40">
             Save changes
@@ -2084,26 +2080,313 @@ STEPS_HTML = r"""<!doctype html>
         <div class="text-sm text-red-700" x-show="error" x-text="error"></div>
       </section>
 
-      <section class="grid grid-cols-1 xl:grid-cols-2 gap-4">
-        <div class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4 space-y-3">
-          <div class="flex items-center justify-between gap-3">
-            <h2 class="text-sm font-semibold text-slate-800">Raw JSON</h2>
-            <span class="text-xs" :class="isDirty() ? 'text-amber-700' : 'text-slate-500'"
-                  x-text="isDirty() ? 'Unsaved edits' : 'Loaded'"></span>
+      <section class="grid grid-cols-1 lg:grid-cols-[18rem_minmax(0,1fr)] gap-4">
+        <aside class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4 space-y-4">
+          <div>
+            <label class="text-xs font-medium text-slate-500" for="site-search">Sites</label>
+            <input id="site-search" x-model="siteSearch" type="search" placeholder="Search sites"
+                   class="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
           </div>
-          <textarea x-model="content" spellcheck="false"
-                    @input="previewContent=''; diff=''; hasChanges=false"
-                    class="w-full h-[42rem] font-mono text-xs leading-5 rounded-lg border border-slate-300 bg-slate-950 text-slate-50 p-3 focus:outline-none focus:ring-2 focus:ring-indigo-500"></textarea>
-        </div>
 
-        <div class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4 space-y-3">
-          <div class="flex items-center justify-between gap-3">
-            <h2 class="text-sm font-semibold text-slate-800">Change preview</h2>
-            <span class="text-xs text-slate-500" x-text="hasChanges ? 'Diff ready' : 'No diff previewed'"></span>
+          <div class="max-h-[24rem] overflow-auto rounded-lg border border-slate-200">
+            <template x-for="site in filteredSites()" :key="site">
+              <button type="button" @click="selectSite(site)"
+                      class="w-full text-left px-3 py-2 text-sm border-b border-slate-100 last:border-b-0 hover:bg-slate-50"
+                      :class="selectedSite === site ? 'bg-indigo-50 text-indigo-800 font-medium' : 'text-slate-700'">
+                <span class="block truncate" x-text="site"></span>
+                <span class="text-xs text-slate-500" x-text="`${siteStepCount(site)} block(s)`"></span>
+              </button>
+            </template>
+            <div class="px-3 py-4 text-sm text-slate-500" x-show="filteredSites().length === 0">
+              No sites match.
+            </div>
           </div>
-          <pre class="h-[42rem] overflow-auto rounded-lg border border-slate-200 bg-slate-950 text-slate-50 p-3 text-xs leading-5"
-               x-text="diff || 'Preview changes to see a unified diff before saving.'"></pre>
-        </div>
+
+          <div class="rounded-lg border border-slate-200 p-3 space-y-2">
+            <div class="text-sm font-semibold text-slate-800">Add blank site</div>
+            <input x-model="newSiteKey" type="text" placeholder="site_key"
+                   class="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+            <button type="button" @click="createBlankSite()"
+                    class="w-full px-3 py-2 rounded-lg bg-slate-900 text-white text-sm hover:bg-slate-800">
+              Create site
+            </button>
+          </div>
+
+          <div class="text-xs text-slate-500 space-y-1">
+            <div :class="isDirty() ? 'text-amber-700' : 'text-slate-500'"
+                 x-text="isDirty() ? 'Unsaved edits' : 'Loaded'"></div>
+            <div x-text="diffStatusText()"></div>
+          </div>
+        </aside>
+
+        <section class="space-y-4">
+          <nav class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-2 flex flex-wrap gap-2">
+            <button type="button" @click="setMode('builder')"
+                    class="px-3 py-2 rounded-lg text-sm"
+                    :class="mode === 'builder' ? 'bg-slate-900 text-white' : 'text-slate-700 hover:bg-slate-100'">
+              Builder
+            </button>
+            <button type="button" @click="setMode('raw')"
+                    class="px-3 py-2 rounded-lg text-sm"
+                    :class="mode === 'raw' ? 'bg-slate-900 text-white' : 'text-slate-700 hover:bg-slate-100'">
+              Raw JSON
+            </button>
+            <button type="button" @click="setMode('diff')"
+                    class="px-3 py-2 rounded-lg text-sm"
+                    :class="mode === 'diff' ? 'bg-slate-900 text-white' : 'text-slate-700 hover:bg-slate-100'">
+              Diff Preview
+            </button>
+          </nav>
+
+          <div class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4 space-y-4" x-show="mode === 'builder'"
+               @input.debounce.250ms="builderChanged()" @change="builderChanged()">
+            <div class="flex flex-col xl:flex-row xl:items-start xl:justify-between gap-3">
+              <div>
+                <h2 class="text-lg font-semibold text-slate-900" x-text="selectedSite || 'No site selected'"></h2>
+                <p class="text-sm text-slate-500">
+                  Visual editing is add-only for this pass. Use Raw JSON for full-file edits.
+                </p>
+              </div>
+              <div class="flex flex-wrap items-center gap-2" x-show="selectedSite">
+                <select x-model="newTopAction"
+                        class="rounded-lg border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
+                  <template x-for="action in topActions" :key="action">
+                    <option :value="action" x-text="action"></option>
+                  </template>
+                </select>
+                <button type="button" @click="addTopBlock()"
+                        class="px-3 py-2 rounded-lg bg-indigo-600 text-white text-sm hover:bg-indigo-700">
+                  Add block
+                </button>
+              </div>
+            </div>
+
+            <div class="rounded-lg border border-dashed border-slate-300 p-8 text-center text-sm text-slate-500"
+                 x-show="!selectedSite">
+              Select a site or create a blank site to start adding blocks.
+            </div>
+
+            <div class="space-y-3" x-show="selectedSite">
+              <template x-for="(step, stepIndex) in selectedSteps()" :key="step._uid || stepIndex">
+                <article class="rounded-lg border border-slate-200 bg-slate-50 p-4 space-y-4">
+                  <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-2">
+                    <div class="flex items-center gap-2">
+                      <span class="px-2 py-1 rounded bg-slate-900 text-white text-xs font-semibold" x-text="step.action || 'step'"></span>
+                      <span class="text-xs text-slate-500" x-text="`Block ${stepIndex + 1}`"></span>
+                    </div>
+                    <button type="button" @click="removeTopBlock(stepIndex)"
+                            class="px-2 py-1 rounded border border-red-200 bg-white text-xs text-red-700 hover:bg-red-50">
+                      Remove
+                    </button>
+                  </div>
+
+                  <div class="grid grid-cols-1 md:grid-cols-2 gap-3" x-show="step.action === 'load_url'">
+                    <label class="text-sm">
+                      <span class="font-medium text-slate-700">url</span>
+                      <input x-model="step.url" type="text"
+                             class="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" />
+                    </label>
+                  </div>
+
+                  <div class="grid grid-cols-1 md:grid-cols-2 gap-3" x-show="step.action === 'data_extract' || step.action === 'json_data_extract' || step.action === 'json_html_data_extract'">
+                    <label class="text-sm">
+                      <span class="font-medium text-slate-700">focus_scope</span>
+                      <input x-model="step.focus_scope" type="text"
+                             class="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" />
+                    </label>
+                    <label class="text-sm" x-show="step.action === 'json_html_data_extract'">
+                      <span class="font-medium text-slate-700">html_key</span>
+                      <input x-model="step.html_key" type="text"
+                             class="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" />
+                    </label>
+                    <label class="text-sm" x-show="step.action === 'json_html_data_extract'">
+                      <span class="font-medium text-slate-700">base_url</span>
+                      <input x-model="step.base_url" type="text"
+                             class="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" />
+                    </label>
+                  </div>
+
+                  <div class="grid grid-cols-1 md:grid-cols-2 gap-3" x-show="step.action === 'json_replace_text'">
+                    <label class="text-sm">
+                      <span class="font-medium text-slate-700">text_find</span>
+                      <input x-model="step.text_find" type="text"
+                             class="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" />
+                    </label>
+                    <label class="text-sm">
+                      <span class="font-medium text-slate-700">text_replace</span>
+                      <input x-model="step.text_replace" type="text"
+                             class="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" />
+                    </label>
+                  </div>
+
+                  <div class="grid grid-cols-1 md:grid-cols-2 gap-3" x-show="step.action === 'sleep'">
+                    <label class="text-sm">
+                      <span class="font-medium text-slate-700">seconds</span>
+                      <input x-model.number="step.seconds" type="number" min="0" step="0.25"
+                             class="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" />
+                    </label>
+                  </div>
+
+                  <div class="space-y-3" x-show="supportsExtractSteps(step)">
+                    <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-2">
+                      <h3 class="text-sm font-semibold text-slate-800">Nested extract steps</h3>
+                      <div class="flex flex-wrap items-center gap-2">
+                        <select x-model="step._newNestedAction"
+                                class="rounded-lg border border-slate-300 px-3 py-2 text-sm">
+                          <template x-for="action in nestedActions" :key="action">
+                            <option :value="action" x-text="action"></option>
+                          </template>
+                        </select>
+                        <button type="button" @click="addNestedBlock(step)"
+                                class="px-3 py-2 rounded-lg border border-slate-300 bg-white text-sm hover:bg-slate-50">
+                          Add nested
+                        </button>
+                      </div>
+                    </div>
+
+                    <template x-for="(nested, nestedIndex) in step.extract_steps" :key="nested._uid || nestedIndex">
+                      <div class="rounded-lg border border-slate-200 bg-white p-3 space-y-3">
+                        <div class="flex items-center justify-between gap-2">
+                          <span class="px-2 py-1 rounded bg-slate-100 text-xs font-semibold text-slate-700" x-text="nested.action || 'nested'"></span>
+                          <button type="button" @click="step.extract_steps.splice(nestedIndex, 1); builderChanged()"
+                                  class="px-2 py-1 rounded border border-red-200 text-xs text-red-700 hover:bg-red-50">
+                            Remove
+                          </button>
+                        </div>
+
+                        <div class="grid grid-cols-1 md:grid-cols-3 gap-3" x-show="nested.action === 'extract' || nested.action === 'extract_detail'">
+                          <label class="text-sm">
+                            <span class="font-medium text-slate-700">as_column</span>
+                            <input x-model="nested.as_column" type="text" class="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" />
+                          </label>
+                          <label class="text-sm">
+                            <span class="font-medium text-slate-700">xpath / selector</span>
+                            <input x-model="nested.xpath" type="text" class="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" />
+                          </label>
+                          <label class="text-sm">
+                            <span class="font-medium text-slate-700">key</span>
+                            <input x-model="nested.key" type="text" class="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" />
+                          </label>
+                          <label class="text-sm">
+                            <span class="font-medium text-slate-700">attr_target</span>
+                            <input x-model="nested.attr_target" type="text" class="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" />
+                          </label>
+                          <label class="text-sm">
+                            <span class="font-medium text-slate-700">data_type</span>
+                            <input x-model="nested.data_type" type="text" class="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" />
+                          </label>
+                        </div>
+
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-3" x-show="nested.action === 'redirect'">
+                          <label class="text-sm">
+                            <span class="font-medium text-slate-700">using_column</span>
+                            <input x-model="nested.using_column" type="text" class="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" />
+                          </label>
+                          <label class="text-sm">
+                            <span class="font-medium text-slate-700">wait_css</span>
+                            <input x-model="nested.wait_css" type="text" class="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" />
+                          </label>
+                        </div>
+
+                        <div class="grid grid-cols-1 md:grid-cols-3 gap-3" x-show="nested.action === 'regex_extract'">
+                          <label class="text-sm">
+                            <span class="font-medium text-slate-700">using_column</span>
+                            <input x-model="nested.using_column" type="text" class="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" />
+                          </label>
+                          <label class="text-sm">
+                            <span class="font-medium text-slate-700">as_column</span>
+                            <input x-model="nested.as_column" type="text" class="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" />
+                          </label>
+                          <label class="text-sm">
+                            <span class="font-medium text-slate-700">regex_pattern</span>
+                            <input x-model="nested.regex_pattern" type="text" class="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" />
+                          </label>
+                        </div>
+
+                        <div class="grid grid-cols-1 md:grid-cols-3 gap-3" x-show="nested.action === 'replace_text'">
+                          <label class="text-sm">
+                            <span class="font-medium text-slate-700">using_column</span>
+                            <input x-model="nested.using_column" type="text" class="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" />
+                          </label>
+                          <label class="text-sm">
+                            <span class="font-medium text-slate-700">text_find</span>
+                            <input x-model="nested.text_find" type="text" class="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" />
+                          </label>
+                          <label class="text-sm">
+                            <span class="font-medium text-slate-700">text_replace</span>
+                            <input x-model="nested.text_replace" type="text" class="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" />
+                          </label>
+                        </div>
+
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-3" x-show="nested.action === 'sleep'">
+                          <label class="text-sm">
+                            <span class="font-medium text-slate-700">seconds</span>
+                            <input x-model.number="nested.seconds" type="number" min="0" step="0.25" class="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" />
+                          </label>
+                        </div>
+
+                        <details>
+                          <summary class="cursor-pointer text-xs font-medium text-slate-500">Custom fields JSON</summary>
+                          <textarea x-model="nested._custom" @input="builderChanged()" spellcheck="false"
+                                    class="mt-2 w-full h-24 rounded-lg border border-slate-300 bg-slate-950 text-slate-50 font-mono text-xs p-2"></textarea>
+                        </details>
+                      </div>
+                    </template>
+                  </div>
+
+                  <details>
+                    <summary class="cursor-pointer text-xs font-medium text-slate-500">Custom fields JSON</summary>
+                    <textarea x-model="step._custom" @input="builderChanged()" spellcheck="false"
+                              class="mt-2 w-full h-24 rounded-lg border border-slate-300 bg-slate-950 text-slate-50 font-mono text-xs p-2"></textarea>
+                  </details>
+                </article>
+              </template>
+
+              <div class="rounded-lg border border-dashed border-slate-300 p-8 text-center text-sm text-slate-500"
+                   x-show="selectedSite && selectedSteps().length === 0">
+                This site has no blocks yet. Add one from the action menu.
+              </div>
+            </div>
+          </div>
+
+          <div class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4 space-y-3" x-show="mode === 'raw'">
+            <div class="flex items-center justify-between gap-3">
+              <h2 class="text-sm font-semibold text-slate-800">Raw JSON</h2>
+              <span class="text-xs" :class="isDirty() ? 'text-amber-700' : 'text-slate-500'"
+                    x-text="isDirty() ? 'Unsaved edits' : 'Loaded'"></span>
+            </div>
+            <textarea x-model="content" spellcheck="false"
+                      @input="rawChanged()"
+                      class="w-full h-[42rem] font-mono text-xs leading-5 rounded-lg border border-slate-300 bg-slate-950 text-slate-50 p-3 focus:outline-none focus:ring-2 focus:ring-indigo-500"></textarea>
+          </div>
+
+          <div class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4 space-y-3" x-show="mode === 'diff'">
+            <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+              <div>
+                <h2 class="text-sm font-semibold text-slate-800">Diff Preview</h2>
+                <p class="text-xs text-slate-500" x-text="diffStatusText()"></p>
+              </div>
+            </div>
+
+            <div class="overflow-auto rounded-lg border border-slate-200 bg-white text-xs font-mono">
+              <template x-if="previewLoading">
+                <div class="p-4 text-sm text-slate-500 font-sans">Rendering diff...</div>
+              </template>
+              <template x-if="!previewLoading && !diff">
+                <div class="p-4 text-sm text-slate-500 font-sans" x-text="isDirty() ? 'No visual diff yet.' : 'No changes from the saved file.'"></div>
+              </template>
+              <template x-for="(line, idx) in parsedDiff()" :key="idx">
+                <div class="grid grid-cols-[3rem_1fr] min-w-max border-b border-slate-100 last:border-b-0"
+                     :class="diffLineClass(line)">
+                  <div class="px-2 py-1 text-right select-none border-r border-slate-200"
+                       :class="line.type === 'add' ? 'text-green-700' : (line.type === 'remove' ? 'text-red-700' : 'text-slate-400')"
+                       x-text="line.marker"></div>
+                  <pre class="px-3 py-1 whitespace-pre-wrap break-all" x-text="line.text"></pre>
+                </div>
+              </template>
+            </div>
+          </div>
+        </section>
       </section>
     </main>
 
@@ -2112,6 +2395,7 @@ STEPS_HTML = r"""<!doctype html>
         return {
           loading: false,
           saving: false,
+          mode: 'builder',
           path: '',
           modifiedAt: '',
           siteCount: null,
@@ -2120,15 +2404,285 @@ STEPS_HTML = r"""<!doctype html>
           previewContent: '',
           diff: '',
           hasChanges: false,
+          previewLoading: false,
+          previewTimer: null,
           message: '',
           error: '',
+          stepsData: {},
+          selectedSite: '',
+          siteSearch: '',
+          newSiteKey: '',
+          newTopAction: 'load_url',
+          topActions: ['load_url', 'data_extract', 'json_set_payload', 'json_replace_text', 'json_data_extract', 'json_html_data_extract', 'sleep'],
+          nestedActions: ['extract', 'extract_detail', 'redirect', 'regex_extract', 'replace_text', 'sleep', 'next'],
 
           isDirty() {
             return this.content !== this.originalContent;
           },
 
           canSave() {
-            return this.hasChanges && this.previewContent && this.content === this.previewContent;
+            return this.isDirty() && !this.previewLoading;
+          },
+
+          diffStatusText() {
+            if (this.previewLoading) return 'Updating diff...';
+            if (this.hasChanges && this.previewContent === this.content) return 'Live diff is current.';
+            if (this.isDirty()) return 'Diff updates automatically when you open this tab.';
+            return 'No changes from the saved file.';
+          },
+
+          siteNames() {
+            return Object.keys(this.stepsData || {}).sort((a, b) => a.localeCompare(b));
+          },
+
+          filteredSites() {
+            const q = (this.siteSearch || '').toLowerCase().trim();
+            return this.siteNames().filter(site => !q || site.toLowerCase().includes(q));
+          },
+
+          selectedSteps() {
+            const steps = this.stepsData?.[this.selectedSite];
+            return Array.isArray(steps) ? steps : [];
+          },
+
+          siteStepCount(site) {
+            const steps = this.stepsData?.[site];
+            return Array.isArray(steps) ? steps.length : 0;
+          },
+
+          selectSite(site) {
+            this.selectedSite = site;
+            this.setMode('builder');
+          },
+
+          setMode(mode) {
+            this.mode = mode;
+            if (mode === 'diff') {
+              this.ensureLivePreview();
+            }
+          },
+
+          resetPreviewState() {
+            this.previewContent = '';
+            this.diff = '';
+            this.hasChanges = false;
+          },
+
+          parseContentIntoState() {
+            const parsed = JSON.parse(this.content || '{}');
+            this.stepsData = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+            const names = this.siteNames();
+            if (!names.includes(this.selectedSite)) {
+              this.selectedSite = names[0] || '';
+            }
+          },
+
+          serializeStepsData() {
+            const clean = {};
+            for (const site of Object.keys(this.stepsData || {})) {
+              const steps = Array.isArray(this.stepsData[site]) ? this.stepsData[site] : [];
+              clean[site] = steps.map(step => this.cleanBlock(step));
+            }
+            return `${JSON.stringify(clean, null, 2)}\n`;
+          },
+
+          cleanBlock(block) {
+            if (!block?._uid) {
+              return this.cloneExistingBlock(block);
+            }
+            const clean = {};
+            for (const [key, value] of Object.entries(block || {})) {
+              if (key.startsWith('_')) continue;
+              if (value === '' || value === undefined) continue;
+              if (key === 'extract_steps') continue;
+              clean[key] = value;
+            }
+
+            const custom = this.parseCustomFields(block?._custom);
+            Object.assign(clean, custom);
+
+            if (this.supportsExtractSteps(block)) {
+              clean.extract_steps = (block.extract_steps || []).map(nested => this.cleanBlock(nested));
+            }
+            if (block?.action) clean.action = block.action;
+            return clean;
+          },
+
+          cloneExistingBlock(block) {
+            if (Array.isArray(block)) {
+              return block.map(item => this.cloneExistingBlock(item));
+            }
+            if (block && typeof block === 'object') {
+              const clean = {};
+              for (const [key, value] of Object.entries(block)) {
+                if (key.startsWith('_')) continue;
+                clean[key] = this.cloneExistingBlock(value);
+              }
+              return clean;
+            }
+            return block;
+          },
+
+          parseCustomFields(raw) {
+            const text = String(raw || '').trim();
+            if (!text) return {};
+            const parsed = JSON.parse(text);
+            if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+              throw new Error('Custom fields JSON must be an object.');
+            }
+            return parsed;
+          },
+
+          builderChanged() {
+            this.message = '';
+            this.error = '';
+            try {
+              this.content = this.serializeStepsData();
+              this.siteCount = this.siteNames().length;
+              this.resetPreviewState();
+              this.scheduleLivePreview();
+            } catch (err) {
+              this.error = err?.message || 'Could not serialize builder state.';
+            }
+          },
+
+          rawChanged() {
+            this.resetPreviewState();
+            this.message = '';
+            this.error = '';
+            try {
+              this.parseContentIntoState();
+              this.siteCount = this.siteNames().length;
+            } catch (_) {
+              // Raw JSON may be temporarily invalid while the user is typing.
+            }
+            this.scheduleLivePreview();
+          },
+
+          createBlankSite() {
+            const key = (this.newSiteKey || '').trim();
+            if (!key) {
+              this.error = 'Site key is required.';
+              return;
+            }
+            if (Object.prototype.hasOwnProperty.call(this.stepsData, key)) {
+              this.error = `Site "${key}" already exists.`;
+              return;
+            }
+            this.stepsData[key] = [];
+            this.selectedSite = key;
+            this.newSiteKey = '';
+            this.builderChanged();
+            this.message = `Created blank site "${key}".`;
+          },
+
+          supportsExtractSteps(step) {
+            return ['data_extract', 'json_data_extract', 'json_html_data_extract'].includes(step?.action);
+          },
+
+          newBlock(action) {
+            const block = { action, _uid: `${Date.now()}-${Math.random()}`, _custom: '' };
+            if (action === 'load_url') block.url = '';
+            if (action === 'data_extract') {
+              block.focus_scope = '';
+              block.extract_steps = [];
+              block._newNestedAction = 'extract';
+            }
+            if (action === 'json_replace_text') {
+              block.text_find = '';
+              block.text_replace = '';
+            }
+            if (action === 'json_data_extract') {
+              block.focus_scope = '';
+              block.extract_steps = [];
+              block._newNestedAction = 'extract';
+            }
+            if (action === 'json_html_data_extract') {
+              block.html_key = '';
+              block.base_url = '';
+              block.focus_scope = '';
+              block.extract_steps = [];
+              block._newNestedAction = 'extract';
+            }
+            if (action === 'sleep') block.seconds = 1;
+            return block;
+          },
+
+          newNestedBlock(action) {
+            const block = { action, _uid: `${Date.now()}-${Math.random()}`, _custom: '' };
+            if (action === 'extract' || action === 'extract_detail') {
+              block.as_column = '';
+              block.xpath = '';
+              block.key = '';
+              block.attr_target = '';
+              block.data_type = '';
+            }
+            if (action === 'redirect') {
+              block.using_column = 'JobUrl';
+              block.wait_css = '';
+            }
+            if (action === 'regex_extract') {
+              block.using_column = '';
+              block.as_column = '';
+              block.regex_pattern = '';
+            }
+            if (action === 'replace_text') {
+              block.using_column = '';
+              block.text_find = '';
+              block.text_replace = '';
+            }
+            if (action === 'sleep') block.seconds = 1;
+            return block;
+          },
+
+          addTopBlock() {
+            if (!this.selectedSite) return;
+            if (!Array.isArray(this.stepsData[this.selectedSite])) {
+              this.stepsData[this.selectedSite] = [];
+            }
+            this.stepsData[this.selectedSite].push(this.newBlock(this.newTopAction));
+            this.builderChanged();
+          },
+
+          removeTopBlock(index) {
+            this.selectedSteps().splice(index, 1);
+            this.builderChanged();
+          },
+
+          addNestedBlock(step) {
+            if (!Array.isArray(step.extract_steps)) step.extract_steps = [];
+            step.extract_steps.push(this.newNestedBlock(step._newNestedAction || 'extract'));
+            this.builderChanged();
+          },
+
+          parsedDiff() {
+            if (!this.diff) return [];
+            return this.diff.split('\n').filter((line, idx, arr) => idx < arr.length - 1 || line).map(line => {
+              if (line.startsWith('---') || line.startsWith('+++')) {
+                return { type: 'file', marker: '', text: line };
+              }
+              if (line.startsWith('@@')) {
+                return { type: 'hunk', marker: '', text: line };
+              }
+              if (line.startsWith('+')) {
+                return { type: 'add', marker: '+', text: line.slice(1) };
+              }
+              if (line.startsWith('-')) {
+                return { type: 'remove', marker: '-', text: line.slice(1) };
+              }
+              return { type: 'context', marker: ' ', text: line.startsWith(' ') ? line.slice(1) : line };
+            });
+          },
+
+          diffLineClass(line) {
+            const classes = {
+              file: 'bg-slate-100 text-slate-700 font-semibold',
+              hunk: 'bg-indigo-50 text-indigo-700',
+              add: 'bg-green-50 text-green-950',
+              remove: 'bg-red-50 text-red-950',
+              context: 'bg-white text-slate-800'
+            };
+            return classes[line.type] || classes.context;
           },
 
           async load() {
@@ -2144,9 +2698,8 @@ STEPS_HTML = r"""<!doctype html>
               this.siteCount = data.site_count ?? null;
               this.originalContent = data.content || '';
               this.content = this.originalContent;
-              this.previewContent = '';
-              this.diff = '';
-              this.hasChanges = false;
+              this.resetPreviewState();
+              this.parseContentIntoState();
               this.message = 'Loaded steps.json.';
             } catch (err) {
               this.error = err?.message || 'Could not load steps.json';
@@ -2171,16 +2724,48 @@ STEPS_HTML = r"""<!doctype html>
             return data;
           },
 
+          scheduleLivePreview() {
+            if (this.mode !== 'diff') return;
+            window.clearTimeout(this.previewTimer);
+            this.previewTimer = window.setTimeout(() => this.ensureLivePreview(), 300);
+          },
+
+          async ensureLivePreview() {
+            if (!this.isDirty()) {
+              this.previewContent = this.content;
+              this.diff = '';
+              this.hasChanges = false;
+              return;
+            }
+            if (this.previewLoading) return;
+            this.previewLoading = true;
+            this.message = '';
+            this.error = '';
+            try {
+              const data = await this.requestPreview();
+              this.content = data.content || '';
+              this.previewContent = this.content;
+              this.diff = data.diff || '';
+              this.hasChanges = Boolean(data.has_changes);
+              this.siteCount = data.site_count ?? this.siteCount;
+              this.parseContentIntoState();
+            } catch (err) {
+              this.resetPreviewState();
+              this.error = err?.message || 'Preview failed';
+            } finally {
+              this.previewLoading = false;
+            }
+          },
+
           async formatValidate() {
             this.message = '';
             this.error = '';
             try {
               const data = await this.requestPreview();
               this.content = data.content || '';
-              this.previewContent = '';
-              this.diff = '';
-              this.hasChanges = false;
+              this.resetPreviewState();
               this.siteCount = data.site_count ?? this.siteCount;
+              this.parseContentIntoState();
               this.message = data.has_changes ? 'JSON is valid and formatted.' : 'JSON is valid. No changes.';
             } catch (err) {
               this.error = err?.message || 'Validation failed';
@@ -2197,22 +2782,26 @@ STEPS_HTML = r"""<!doctype html>
               this.diff = data.diff || '';
               this.hasChanges = Boolean(data.has_changes);
               this.siteCount = data.site_count ?? this.siteCount;
+              this.parseContentIntoState();
+              this.mode = 'diff';
               this.message = data.message || (this.hasChanges ? 'Changes ready to review.' : 'No changes.');
             } catch (err) {
-              this.previewContent = '';
-              this.diff = '';
-              this.hasChanges = false;
+              this.resetPreviewState();
               this.error = err?.message || 'Preview failed';
             }
           },
 
           async save() {
-            if (!this.canSave() || this.saving) return;
-            if (!window.confirm('Save these reviewed changes to steps.json?')) return;
             this.saving = true;
             this.message = '';
             this.error = '';
             try {
+              if (!this.canSave()) return;
+              if (this.previewContent !== this.content || !this.hasChanges) {
+                await this.ensureLivePreview();
+              }
+              if (!this.hasChanges || this.previewContent !== this.content) return;
+              if (!window.confirm('Save these changes to steps.json?')) return;
               const res = await fetch('/api/steps/save', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
@@ -2225,9 +2814,8 @@ STEPS_HTML = r"""<!doctype html>
               this.siteCount = data.site_count ?? this.siteCount;
               this.content = data.content || this.previewContent;
               this.originalContent = this.content;
-              this.previewContent = '';
-              this.diff = '';
-              this.hasChanges = false;
+              this.resetPreviewState();
+              this.parseContentIntoState();
               this.message = data.saved
                 ? `Saved steps.json. Backup: ${data.backup_path || 'none'}`
                 : (data.message || 'No changes to save.');
