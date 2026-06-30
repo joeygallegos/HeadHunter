@@ -170,7 +170,8 @@ def get_job_level(job_title: str) -> str:
 
 def scan_for_pay_range(text: str) -> list[str]:
     currency = r"(\$|€|£|USD|EUR|GBP)?"
-    num = r"([\d,]+(?:\.\d+)?)"
+    pay_num = r"\d[\d,]*(?:\.\d+)?"
+    num = rf"({pay_num})"
     range_patterns = [rf"{currency}\s*{num}\s*(?:-|–|to)\s*{currency}\s*{num}"]
     single_patterns = [
         rf"{currency}\s*{num}\s*(?:per year|per annum|year|annum|annual)\b",
@@ -184,7 +185,7 @@ def scan_for_pay_range(text: str) -> list[str]:
         if hits:
 
             def max_end(s: str) -> float:
-                nums = re.findall(r"[\d,]+(?:\.\d+)?", s)
+                nums = re.findall(pay_num, s)
                 return float(nums[-1].replace(",", "")) if nums else 0.0
 
             return [sorted(hits, key=max_end, reverse=True)[0]]

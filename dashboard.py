@@ -486,6 +486,217 @@ def _steps_modified_at(path: str) -> str:
     return datetime.fromtimestamp(os.path.getmtime(path)).isoformat(timespec="seconds")
 
 
+TOP_LEVEL_STEP_ACTIONS = {
+    "load_url",
+    "debug_print_dom_by_css",
+    "sleep",
+    "scroll_to",
+    "click_button",
+    "select_checkbox",
+    "type_text",
+    "data_extract",
+    "json_set_payload",
+    "json_replace_text",
+    "json_data_extract",
+    "json_html_data_extract",
+}
+DOM_EXTRACT_ACTIONS = {"extract", "redirect", "sleep", "replace_text", "regex_extract", "next"}
+JSON_EXTRACT_ACTIONS = {"extract", "next"}
+JSON_HTML_EXTRACT_ACTIONS = {
+    "extract",
+    "redirect",
+    "extract_detail",
+    "replace_text",
+    "regex_extract",
+    "next",
+}
+
+
+def _is_nonempty_str(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _has_selector(step: Dict[str, Any]) -> bool:
+    return _is_nonempty_str(step.get("xpath")) or _is_nonempty_str(step.get("selector"))
+
+
+def _require_nonempty_str(
+    errors: List[str], step: Dict[str, Any], path: str, field: str
+) -> None:
+    if not _is_nonempty_str(step.get(field)):
+        errors.append(f"{path}.{field} is required")
+
+
+def _require_str_field(
+    errors: List[str], step: Dict[str, Any], path: str, field: str
+) -> None:
+    if field not in step or not isinstance(step.get(field), str):
+        errors.append(f"{path}.{field} must be a string")
+
+
+def _validate_pagination(errors: List[str], pagination: Any, path: str) -> None:
+    if not isinstance(pagination, dict):
+        errors.append(f"{path}.pagination must be an object")
+        return
+    mode = pagination.get("mode")
+    if mode != "click_next":
+        errors.append(f'{path}.pagination.mode must be "click_next"')
+    if "max_pages" in pagination and not isinstance(pagination.get("max_pages"), int):
+        errors.append(f"{path}.pagination.max_pages must be an integer")
+    if "page_wait_ms" in pagination and not isinstance(
+        pagination.get("page_wait_ms"), (int, float)
+    ):
+        errors.append(f"{path}.pagination.page_wait_ms must be a number")
+    for field in (
+        "current_page_css",
+        "next_page_css",
+        "next_disabled_css",
+        "page_as_column",
+    ):
+        if field in pagination and not isinstance(pagination.get(field), str):
+            errors.append(f"{path}.pagination.{field} must be a string")
+
+
+def _validate_extract_step(
+    errors: List[str],
+    step: Any,
+    path: str,
+    *,
+    context: str,
+) -> None:
+    if not isinstance(step, dict):
+        errors.append(f"{path} must be an object")
+        return
+
+    action = step.get("action")
+    allowed = {
+        "dom": DOM_EXTRACT_ACTIONS,
+        "json": JSON_EXTRACT_ACTIONS,
+        "json_html": JSON_HTML_EXTRACT_ACTIONS,
+    }[context]
+    if not _is_nonempty_str(action):
+        errors.append(f"{path}.action is required")
+        return
+    if action not in allowed:
+        errors.append(f'{path}.action "{action}" is not supported for {context} extraction')
+        return
+
+    if action == "extract":
+        _require_nonempty_str(errors, step, path, "as_column")
+        if context == "json":
+            _require_nonempty_str(errors, step, path, "key")
+        elif (step.get("data_type") or "").lower() != "current_url" and not _has_selector(step):
+            errors.append(f"{path}.xpath or {path}.selector is required")
+    elif action == "extract_detail":
+        _require_nonempty_str(errors, step, path, "as_column")
+        if not _has_selector(step):
+            errors.append(f"{path}.xpath or {path}.selector is required")
+    elif action == "redirect":
+        if context == "dom":
+            if not _is_nonempty_str(step.get("using_column")) and not _is_nonempty_str(
+                step.get("link_css")
+            ):
+                errors.append(f"{path}.using_column or {path}.link_css is required")
+        else:
+            _require_nonempty_str(errors, step, path, "using_column")
+    elif action == "replace_text":
+        _require_nonempty_str(errors, step, path, "using_column")
+        _require_str_field(errors, step, path, "text_find")
+        _require_str_field(errors, step, path, "text_replace")
+    elif action == "regex_extract":
+        _require_nonempty_str(errors, step, path, "using_column")
+        _require_nonempty_str(errors, step, path, "as_column")
+        _require_nonempty_str(errors, step, path, "regex_pattern")
+    elif action == "sleep" and "seconds" in step and not isinstance(
+        step.get("seconds"), (int, float)
+    ):
+        errors.append(f"{path}.seconds must be a number")
+
+
+def _validate_extract_steps(
+    errors: List[str],
+    step: Dict[str, Any],
+    path: str,
+    *,
+    context: str,
+) -> None:
+    extract_steps = step.get("extract_steps")
+    if not isinstance(extract_steps, list) or not extract_steps:
+        errors.append(f"{path}.extract_steps must be a non-empty array")
+        return
+    for idx, extract_step in enumerate(extract_steps):
+        _validate_extract_step(
+            errors,
+            extract_step,
+            f"{path}.extract_steps[{idx}]",
+            context=context,
+        )
+
+
+def _validate_top_level_step(errors: List[str], step: Any, path: str) -> None:
+    if not isinstance(step, dict):
+        errors.append(f"{path} must be an object")
+        return
+
+    action = step.get("action")
+    if not _is_nonempty_str(action):
+        errors.append(f"{path}.action is required")
+        return
+    if action not in TOP_LEVEL_STEP_ACTIONS:
+        errors.append(f'{path}.action "{action}" is not supported by StepScraper')
+        return
+
+    if action == "load_url":
+        _require_nonempty_str(errors, step, path, "url")
+    elif action == "debug_print_dom_by_css":
+        _require_nonempty_str(errors, step, path, "find_css")
+    elif action in {"scroll_to", "click_button"}:
+        if not _has_selector(step):
+            errors.append(f"{path}.xpath or {path}.selector is required")
+    elif action in {"select_checkbox", "type_text"}:
+        _require_nonempty_str(errors, step, path, "selector")
+    elif action == "sleep" and "seconds" in step and not isinstance(
+        step.get("seconds"), (int, float)
+    ):
+        errors.append(f"{path}.seconds must be a number")
+    elif action == "data_extract":
+        _require_nonempty_str(errors, step, path, "focus_scope")
+        _validate_extract_steps(errors, step, path, context="dom")
+        if "pagination" in step:
+            _validate_pagination(errors, step["pagination"], path)
+    elif action == "json_replace_text":
+        _require_str_field(errors, step, path, "text_find")
+        _require_str_field(errors, step, path, "text_replace")
+    elif action == "json_data_extract":
+        _require_nonempty_str(errors, step, path, "focus_scope")
+        _validate_extract_steps(errors, step, path, context="json")
+    elif action == "json_html_data_extract":
+        if not _is_nonempty_str(step.get("html_key")) and not _is_nonempty_str(
+            step.get("focus_html_key")
+        ):
+            errors.append(f"{path}.html_key or {path}.focus_html_key is required")
+        _require_nonempty_str(errors, step, path, "focus_scope")
+        _validate_extract_steps(errors, step, path, context="json_html")
+
+
+def _validate_steps_editor_schema(data: Dict[str, Any]) -> None:
+    errors: List[str] = []
+    for site, steps in data.items():
+        if not isinstance(site, str) or not site.strip():
+            errors.append("site keys must be non-empty strings")
+            continue
+        if not isinstance(steps, list):
+            errors.append(f"{site} must be an array of step objects")
+            continue
+        for idx, step in enumerate(steps):
+            _validate_top_level_step(errors, step, f"{site}[{idx}]")
+
+    if errors:
+        preview = "; ".join(errors[:8])
+        suffix = f"; and {len(errors) - 8} more" if len(errors) > 8 else ""
+        raise ValueError(f"steps.json schema validation failed: {preview}{suffix}")
+
+
 def _parse_steps_editor_content(content: Any) -> tuple[Dict[str, Any], str]:
     if not isinstance(content, str) or not content.strip():
         raise ValueError("steps.json content is required")
@@ -497,6 +708,7 @@ def _parse_steps_editor_content(content: Any) -> tuple[Dict[str, Any], str]:
         ) from exc
     if not isinstance(data, dict):
         raise ValueError("steps.json must contain a top-level JSON object")
+    _validate_steps_editor_schema(data)
     return data, _format_steps_json(data)
 
 

@@ -358,6 +358,11 @@ def _process_site(
                 if on_integrity:
                     on_integrity()
                 return False
+            except Exception:
+                s.rollback()
+                counters["error_count"] += 1
+                row_log.exception("row operation failed")
+                return False
 
         if use_savepoints:
             try:
@@ -369,6 +374,10 @@ def _process_site(
                 row_log.exception("integrity error (savepoint)")
                 if on_integrity:
                     on_integrity()
+                return False
+            except Exception:
+                counters["error_count"] += 1
+                row_log.exception("row operation failed (savepoint)")
                 return False
 
         # No savepoints: must rollback on IntegrityError or session becomes unusable
@@ -382,12 +391,26 @@ def _process_site(
             if on_integrity:
                 on_integrity()
             return False
+        except Exception:
+            s.rollback()
+            counters["error_count"] += 1
+            row_log.exception("row operation failed (no sp)")
+            return False
 
     for jd in jobs_raw:
         job_id_text = _norm_text(str(jd.get("JobID", ""))) or "-"
         row_log = get_logger(run_id=run_id, site=site, job_id=job_id_text)
 
-        job_obj = _normalize_job(site, run_id, jd)
+        try:
+            job_obj = _normalize_job(site, run_id, jd)
+        except Exception:
+            counters["error_count"] += 1
+            raw_cid = _canon_job_id(job_id_text)
+            if raw_cid and raw_cid != "-":
+                missing_cids.discard(raw_cid)
+            row_log.exception("skip row: normalization failed")
+            continue
+
         if not job_obj:
             counters["error_count"] += 1
             row_log.warning("skip row: missing JobID")
@@ -631,17 +654,25 @@ def main():
                     if not jobs_raw:
                         site_log.info("skip empty site")
                         continue
-                    with Timer(f"persist {site}", logger=run_log, site=site):
-                        _process_site(
-                            s,
-                            site,
-                            jobs_raw,
-                            run_id,
-                            counters,
-                            use_savepoints=False,
-                            per_job_commit=True,
-                            logger=run_log,
+                    try:
+                        with Timer(f"persist {site}", logger=run_log, site=site):
+                            _process_site(
+                                s,
+                                site,
+                                jobs_raw,
+                                run_id,
+                                counters,
+                                use_savepoints=False,
+                                per_job_commit=True,
+                                logger=run_log,
+                            )
+                    except Exception:
+                        s.rollback()
+                        counters["error_count"] += 1
+                        site_log.exception(
+                            "site persistence failed in per_job mode; continuing"
                         )
+                        continue
                     site_log.info(
                         "site persisted (per_job) | totals so far new=%d upd=%d miss=%d same=%d err=%d",
                         counters["inserted_count"],
