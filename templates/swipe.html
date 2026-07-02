@@ -1,0 +1,157 @@
+<!-- Extracted from dashboard.py so the swipe UI can change without touching API routes. -->
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Job Swipe</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+  </head>
+  <body class="bg-slate-50 text-slate-900 min-h-screen">
+    <main class="max-w-5xl mx-auto p-4 space-y-4" x-data="jobSwiper()" x-init="fetchJobs()">
+      <header class="flex items-center justify-between gap-3">
+        <div>
+          <h1 class="text-2xl font-bold tracking-tight">Job Swipe</h1>
+          <p class="text-sm text-slate-500">
+            <span x-text="idx < jobs.length ? `${idx + 1} of ${jobs.length}` : `${jobs.length} reviewed`"></span>
+          </p>
+        </div>
+        <a href="/" class="px-3 py-2 rounded-lg border border-slate-200 bg-white text-sm text-slate-700 hover:bg-slate-50">
+          Dashboard
+        </a>
+      </header>
+
+      <section class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-6" x-show="loading">
+        <div class="text-sm text-slate-500">Loading jobs...</div>
+      </section>
+
+      <section class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-6" x-show="error">
+        <div class="text-sm text-red-700" x-text="error"></div>
+      </section>
+
+      <template x-if="!loading && !error && jobs.length > 0 && idx < jobs.length">
+        <article class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-6 space-y-4">
+          <div class="flex flex-col md:flex-row md:items-start md:justify-between gap-3">
+            <div>
+              <h2 class="text-2xl font-semibold text-slate-950" x-text="currentJob().JobTitle || 'No title'"></h2>
+              <div class="mt-2 flex flex-wrap items-center gap-2 text-sm">
+                <span class="font-medium">Level:</span>
+                <span x-text="currentJob().JobLevel || 'Unknown'"
+                      :class="`text-white px-2 py-0.5 rounded ${levelClass()}`"></span>
+                <span class="font-medium ml-2">Pay:</span>
+                <span x-text="currentJob().JobPay || '-'"></span>
+                <span class="font-medium ml-2">Discovered:</span>
+                <span x-text="currentJob().DiscoveryDate || '-'"></span>
+              </div>
+              <div class="mt-1 text-xs text-slate-500">
+                ID: <span x-text="currentJob().JobID || '-'"></span>
+              </div>
+            </div>
+            <a :href="currentJob().JobUrl || '#'"
+               x-show="currentJob().JobUrl"
+               class="inline-flex items-center justify-center px-3 py-2 rounded-lg bg-slate-900 text-white text-sm hover:bg-slate-800"
+               target="_blank" rel="noreferrer">
+              Open posting
+            </a>
+          </div>
+
+          <div class="prose prose-sm max-w-none text-slate-800">
+            <p class="whitespace-pre-wrap leading-6" x-html="currentJob().JobDescHighlighted || 'No description'"></p>
+          </div>
+
+          <div class="rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm">
+            <span class="font-medium text-slate-700">Keywords:</span>
+            <span class="text-slate-700" x-text="currentJob().Keywords || '-'"></span>
+          </div>
+
+          <div class="flex flex-col sm:flex-row justify-center gap-3 pt-2">
+            <button class="bg-red-600 hover:bg-red-700 text-white px-6 py-3 rounded-lg text-base font-semibold"
+                    :disabled="saving"
+                    @click="swipe('dislike')">
+              Dislike
+            </button>
+            <button class="bg-emerald-600 hover:bg-emerald-700 text-white px-6 py-3 rounded-lg text-base font-semibold"
+                    :disabled="saving"
+                    @click="swipe('like')">
+              Like
+            </button>
+          </div>
+        </article>
+      </template>
+
+      <section class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-8 text-center"
+               x-show="!loading && !error && (jobs.length === 0 || idx >= jobs.length)">
+        <h2 class="text-2xl font-semibold">No more jobs</h2>
+        <button class="mt-4 px-3 py-2 rounded-lg bg-indigo-600 text-white text-sm hover:bg-indigo-700"
+                @click="fetchJobs()">
+          Refresh
+        </button>
+      </section>
+    </main>
+
+    <script>
+      function jobSwiper() {
+        return {
+          jobs: [],
+          idx: 0,
+          loading: false,
+          saving: false,
+          error: '',
+
+          async fetchJobs() {
+            this.loading = true;
+            this.error = '';
+            try {
+              const res = await fetch('/api/swipe/jobs');
+              if (!res.ok) throw new Error(await res.text());
+              this.jobs = await res.json();
+              this.idx = 0;
+            } catch (err) {
+              this.error = err?.message || 'Failed to load swipe jobs.';
+            } finally {
+              this.loading = false;
+            }
+          },
+
+          currentJob() {
+            return this.jobs[this.idx] || {};
+          },
+
+          levelClass() {
+            const lvl = (this.currentJob().JobLevel || '').toLowerCase();
+            const map = {
+              architect: 'bg-red-600',
+              senior: 'bg-orange-500',
+              leader: 'bg-slate-500',
+              junior: 'bg-blue-500',
+              unknown: 'bg-slate-400',
+            };
+            return map[lvl] || 'bg-slate-400';
+          },
+
+          async swipe(action) {
+            if (this.saving) return;
+            const job = this.currentJob();
+            this.saving = true;
+            this.error = '';
+            try {
+              const res = await fetch('/api/swipe', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({job, action})
+              });
+              if (!res.ok) throw new Error(await res.text());
+              this.idx++;
+              window.scrollTo({top: 0, behavior: 'smooth'});
+            } catch (err) {
+              this.error = err?.message || 'Failed to save swipe.';
+            } finally {
+              this.saving = false;
+            }
+          }
+        }
+      }
+    </script>
+  </body>
+</html>

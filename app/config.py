@@ -1,5 +1,8 @@
 from __future__ import annotations
-import json, os
+import json
+import os
+
+from .db import resolve_db_url
 
 
 class Config:
@@ -14,11 +17,8 @@ class Config:
         os.makedirs(self.output_dir, exist_ok=True)
         data_dir = os.path.join(script_dir, "data")
         os.makedirs(data_dir, exist_ok=True)
-        self.db_url = (
-            os.environ.get("DB_URL")
-            or self.cfg.get("DB_URL")
-            or f"sqlite:///{os.path.join(data_dir, 'jobs.db')}"
-        )
+        # Use the shared DB resolver so Config matches app.models and dashboard.
+        self.db_url = resolve_db_url(script_dir)
         self.steps_path = os.path.join(script_dir, "steps.json")
         self.test_steps_path = os.path.join(script_dir, "test.json")
 

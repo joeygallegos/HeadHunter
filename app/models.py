@@ -1,10 +1,7 @@
 from __future__ import annotations
 from datetime import datetime, timezone
-import os
-from urllib.parse import quote_plus
 from dotenv import load_dotenv
 from sqlalchemy import (
-    create_engine,
     Column,
     Integer,
     DateTime,
@@ -14,16 +11,17 @@ from sqlalchemy import (
     UniqueConstraint,
     Boolean,
     func,
-    Enum,
     inspect as sa_inspect,
     text,
 )
 from sqlalchemy.dialects.mysql import LONGTEXT
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import relationship, sessionmaker
+from sqlalchemy.orm import relationship
+
+# Base, engine, and session setup live in app.db so every entry point resolves DB
+# configuration the same way.
+from .db import Base, make_engine, make_session_factory, resolve_db_url
 
 load_dotenv()
-Base = declarative_base()
 
 # ---------- ORM MODELS (utf8mb4 safe defaults for MySQL) ----------
 
@@ -159,45 +157,10 @@ class JobChange(Base):
 
 
 # ---------- DB URL resolution (env-first, enforced utf8mb4 for MySQL) ----------
-def _resolve_db_url() -> str:
-    direct = os.getenv("DB_URL")
-    if direct:
-        if direct.startswith("mysql+pymysql://") and "charset=" not in direct:
-            sep = "&" if "?" in direct else "?"
-            direct = f"{direct}{sep}charset=utf8mb4"
-        return direct
-
-    username = os.getenv("DB_USER", "")
-    password = quote_plus(os.getenv("DB_PASS", ""))
-    host = os.getenv("DB_HOST", "")
-    port = os.getenv("DB_PORT", "3306")
-    database = os.getenv("DB_NAME", "")
-    if username and host and database:
-        return f"mysql+pymysql://{username}:{password}@{host}:{port}/{database}?charset=utf8mb4"
-    os.makedirs("data", exist_ok=True)
-    return "sqlite:///data/jobs.db"
-
-
-DATABASE_URL = _resolve_db_url()
-
-_connect_args = {}
-if DATABASE_URL.startswith("mysql+pymysql://"):
-    _connect_args["charset"] = "utf8mb4"
-    _connect_args["use_unicode"] = True
-elif DATABASE_URL.startswith("sqlite"):
-    _connect_args["check_same_thread"] = False
-
-engine = create_engine(
-    DATABASE_URL,
-    echo=False,
-    pool_pre_ping=True,
-    pool_size=10 if not DATABASE_URL.startswith("sqlite") else None,
-    max_overflow=5 if not DATABASE_URL.startswith("sqlite") else None,
-    pool_timeout=30 if not DATABASE_URL.startswith("sqlite") else None,
-    pool_recycle=1800 if not DATABASE_URL.startswith("sqlite") else None,
-    connect_args=_connect_args,
-)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+# Keep these public names stable for scripts that import app.models directly.
+DATABASE_URL = resolve_db_url()
+engine = make_engine(DATABASE_URL)
+SessionLocal = make_session_factory(engine)
 
 
 def ensure_job_reference_fields_column(bind=None) -> None:

@@ -1,0 +1,1078 @@
+<!-- Extracted from dashboard.py so backend route logic and page markup stay separate. -->
+<!doctype html>
+<html lang="en" x-data="dashboard()">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Jobs Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  </head>
+
+  <body class="bg-slate-50 text-slate-900">
+    <div class="max-w-7xl mx-auto p-4 space-y-6">
+      <header class="space-y-2">
+        <h1 class="text-2xl font-bold tracking-tight">Impact Dashboard</h1>
+
+        <div class="flex flex-wrap gap-2">
+          <button @click="view='runs'"
+                  :class="view==='runs' ? 'bg-indigo-600 text-white' : 'bg-white text-slate-700'"
+                  class="px-3 py-2 rounded-lg border border-slate-200 text-sm">
+            Integration Runs
+          </button>
+          <button @click="view='jobs'"
+                  :class="view==='jobs' ? 'bg-indigo-600 text-white' : 'bg-white text-slate-700'"
+                  class="px-3 py-2 rounded-lg border border-slate-200 text-sm">
+            Job index
+          </button>
+          <button @click="view='lookup'"
+                  :class="view==='lookup' ? 'bg-indigo-600 text-white' : 'bg-white text-slate-700'"
+                  class="px-3 py-2 rounded-lg border border-slate-200 text-sm">
+            Job lookup
+          </button>
+          <button @click="view='discovery'; loadDiscovery()"
+                  :class="view==='discovery' ? 'bg-indigo-600 text-white' : 'bg-white text-slate-700'"
+                  class="px-3 py-2 rounded-lg border border-slate-200 text-sm">
+            Discovery
+          </button>
+          <a href="/steps"
+             class="px-3 py-2 rounded-lg border border-slate-200 text-sm bg-white text-slate-700">
+            Steps editor
+          </a>
+          <a href="/swipe"
+             class="px-3 py-2 rounded-lg border border-slate-200 text-sm bg-white text-slate-700">
+            Swipe
+          </a>
+        </div>
+      </header>
+
+      <!-- ---------------- RUNS VIEW ---------------- -->
+      <template x-if="view==='runs'">
+        <div class="space-y-6">
+
+          <section class="flex flex-col md:flex-row md:items-center gap-3">
+            <div class="flex items-center gap-2">
+              <label for="days" class="text-sm font-medium text-slate-700">Days:</label>
+              <select id="days" x-model.number="days"
+                      class="px-3 py-2 rounded-lg border border-slate-300 bg-white text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
+                <option value="7">7</option>
+                <option value="14">14</option>
+                <option value="30" selected>30</option>
+                <option value="60">60</option>
+                <option value="90">90</option>
+              </select>
+              <button @click="loadRuns()"
+                      class="ml-2 inline-flex items-center px-3 py-2 rounded-lg bg-indigo-600 text-white text-sm hover:bg-indigo-700 active:bg-indigo-800">
+                Refresh
+              </button>
+            </div>
+            <div class="text-sm text-slate-600" x-show="runsLoaded">
+              <span class="font-semibold text-slate-800">Summary:</span>
+              <span class="ml-2">New: <span class="font-semibold" x-text="sum(inserted)"></span></span>
+              <span class="ml-2">Updated: <span class="font-semibold" x-text="sum(updated)"></span></span>
+              <span class="ml-2">Missing: <span class="font-semibold" x-text="sum(missing)"></span></span>
+              <span class="ml-2">Errors: <span class="font-semibold" x-text="sum(error)"></span></span>
+              <span class="ml-2">Total Seen: <span class="font-semibold" x-text="sum(total_seen)"></span></span>
+              <span class="ml-2">Net Δ: <span class="font-semibold" x-text="sum(net_change)"></span></span>
+            </div>
+          </section>
+
+          <section class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4">
+            <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+              <h2 class="text-sm font-semibold text-slate-800">Runs</h2>
+              <label class="inline-flex items-center gap-2 text-sm text-slate-700">
+                <input type="checkbox" x-model="hideTestRuns" class="rounded border-slate-300" />
+                Hide test items
+              </label>
+            </div>
+            <div class="mt-3 overflow-x-auto">
+              <table class="min-w-full text-sm">
+                <thead class="text-left text-slate-600 border-b">
+                  <tr>
+                    <th class="py-2 pr-4">ID</th>
+                    <th class="py-2 pr-4">Started</th>
+                    <th class="py-2 pr-4">Finished</th>
+                    <th class="py-2 pr-4">Status</th>
+                    <th class="py-2 pr-4">Mode</th>
+                    <th class="py-2 pr-4">User</th>
+                    <th class="py-2 pr-4 text-right">New</th>
+                    <th class="py-2 pr-4 text-right">Updated</th>
+                    <th class="py-2 pr-4 text-right">Missing</th>
+                    <th class="py-2 pr-4 text-right">Unchanged</th>
+                    <th class="py-2 pr-4 text-right">Errors</th>
+                    <th class="py-2 pr-4 text-right">Total Seen</th>
+                  </tr>
+                </thead>
+                <tbody x-show="runsLoaded" class="divide-y divide-slate-100">
+                  <template x-for="row in visibleRuns()" :key="row.id">
+                    <tr class="text-slate-700">
+                      <td class="py-2 pr-4 font-medium text-slate-900" x-text="row.id"></td>
+                      <td class="py-2 pr-4 whitespace-nowrap" x-text="formatRunTime(row.started_at)"></td>
+                      <td class="py-2 pr-4 whitespace-nowrap" x-text="formatRunTime(row.finished_at)"></td>
+                      <td class="py-2 pr-4" x-text="row.status || '-'"></td>
+                      <td class="py-2 pr-4" x-text="row.mode || '-'"></td>
+                      <td class="py-2 pr-4" x-text="row.user || '-'"></td>
+                      <td class="py-2 pr-4 text-right" x-text="row.inserted"></td>
+                      <td class="py-2 pr-4 text-right" x-text="row.updated"></td>
+                      <td class="py-2 pr-4 text-right" x-text="row.missing"></td>
+                      <td class="py-2 pr-4 text-right" x-text="row.unchanged"></td>
+                      <td class="py-2 pr-4 text-right" x-text="row.error"></td>
+                      <td class="py-2 pr-4 text-right" x-text="row.total_seen"></td>
+                    </tr>
+                  </template>
+                  <tr x-show="filteredRuns().length === 0">
+                    <td colspan="12" class="py-3 text-slate-500">No runs found for the selected day range.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <div class="mt-3 flex justify-end" x-show="canLoadMoreRuns()">
+              <button @click="loadMoreRuns()"
+                      class="px-3 py-2 rounded-lg border border-slate-300 bg-white text-sm text-slate-700 hover:bg-slate-50">
+                Load more
+              </button>
+            </div>
+          </section>
+
+          <section class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4">
+            
+            <h2 class="text-sm font-semibold text-slate-800 mb-2">Daily counts</h2>
+            <div class="h-80">
+              <canvas id="runsChart"></canvas>
+            </div>
+          </section>
+
+          <section class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4">
+            <h2 class="text-sm font-semibold text-slate-800 mb-2">Change rate (%) and net rate (%)</h2>
+            <div class="h-64">
+              <canvas id="runsRateChart"></canvas>
+            </div>
+            <p class="mt-2 text-xs text-slate-500">
+              Change % = (Inserted + Updated + Missing) / Total Seen · 100. Net % = (Inserted − Missing) / Total Seen · 100.
+              Dashed lines show 7-day rolling averages.
+            </p>
+          </section>
+
+        </div>
+      </template>
+
+          <!-- ---------------- JOB INDEX VIEW ---------------- -->
+      <template x-if="view==='jobs'">
+        <div class="space-y-4">
+
+          <section class="flex flex-col lg:flex-row lg:items-center gap-3">
+            <div class="flex items-center gap-2">
+              <label class="text-sm font-medium text-slate-700">Hours:</label>
+              <select x-model="hours"
+                      class="px-3 py-2 rounded-lg border border-slate-300 bg-white text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
+                <option value="all">All</option>
+                <option value="24">24</option>
+                <option value="48">48</option>
+                <option value="72">72</option>
+                <option value="168">168</option>
+              </select>
+
+              <label class="ml-3 text-sm font-medium text-slate-700">Limit:</label>
+              <input type="number" x-model.number="jobsLimit" min="1" max="5000"
+                     class="w-28 px-3 py-2 rounded-lg border border-slate-300 bg-white text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
+
+              <label class="ml-3 text-sm font-medium text-slate-700">Min match:</label>
+              <input type="number" x-model.number="minAiMatch" min="0" max="100" step="1"
+                     class="w-24 px-3 py-2 rounded-lg border border-slate-300 bg-white text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
+              <button @click="minAiMatch=80; loadJobs()"
+                      class="px-3 py-2 rounded-lg border border-slate-300 bg-white text-sm text-slate-700 hover:bg-slate-50">
+                80%+
+              </button>
+              <button @click="minAiMatch=90; loadJobs()"
+                      class="px-3 py-2 rounded-lg border border-slate-300 bg-white text-sm text-slate-700 hover:bg-slate-50">
+                90%+
+              </button>
+
+              <label class="ml-3 text-sm font-medium text-slate-700">Location:</label>
+              <select x-model="locationPolicy"
+                      class="px-3 py-2 rounded-lg border border-slate-300 bg-white text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
+                <option value="any">Any</option>
+                <option value="non_hybrid">Exclude hybrid</option>
+                <option value="remote">Remote only</option>
+                <option value="hybrid">Hybrid only</option>
+                <option value="onsite">Onsite only</option>
+                <option value="unknown">Unknown only</option>
+              </select>
+
+              <button @click="loadJobs()"
+                      class="ml-2 inline-flex items-center px-3 py-2 rounded-lg bg-indigo-600 text-white text-sm hover:bg-indigo-700 active:bg-indigo-800">
+                Refresh
+              </button>
+            </div>
+
+            <div class="flex-1"></div>
+
+            <div class="flex items-center gap-2">
+              <input type="text" x-model="q" placeholder="Search site/title/level…"
+                     class="w-72 px-3 py-2 rounded-lg border border-slate-300 bg-white text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
+            </div>
+          </section>
+
+          <section class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4">
+            <div class="flex items-center justify-between">
+              <h2 class="text-sm font-semibold text-slate-800">
+                Job index <span x-text="hours === 'all' || Number(hours) <= 0 ? '(all time)' : `(last ${hours} hours)`"></span>
+              </h2>
+              <div class="text-xs text-slate-500" x-show="jobsLoaded">
+                returned=<span x-text="jobsMeta.returned"></span>,
+                min_match=<span x-text="jobsMeta.min_match ?? '-'"></span>,
+                location=<span x-text="jobsMeta.location_policy ?? 'any'"></span>,
+                parse_failures=<span x-text="jobsMeta.parse_failures"></span>,
+                cutoff=<span x-text="jobsMeta.cutoff_iso"></span>
+              </div>
+            </div>
+
+            <div class="mt-3 overflow-x-auto">
+              <table class="min-w-full text-sm">
+                <thead class="text-left text-slate-600 border-b">
+                  <tr>
+                    <th class="py-2 pr-4">ID</th>
+                    <th class="py-2 pr-4">Site</th>
+                    <th class="py-2 pr-4">Title</th>
+                    <th class="py-2 pr-4">Level</th>
+                    <th class="py-2 pr-4">Pay</th>
+                    <th class="py-2 pr-4">Discovery</th>
+                    <th class="py-2 pr-4">AI</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <template x-for="row in filteredJobs()" :key="row.id">
+                    <tr class="border-b align-top">
+                      <td class="py-3 pr-4">
+                        <button type="button"
+                                class="text-indigo-700 hover:underline"
+                                @click="openJobDetail(row.id)"
+                                x-text="`ID ${row.id}`"></button>
+                      </td>
+                      <td class="py-3 pr-4 font-medium text-slate-800" x-text="row.site"></td>
+
+                      <td class="py-3 pr-4">
+                        <a class="text-indigo-700 hover:underline"
+                           :href="row.url || '#'" target="_blank" rel="noreferrer"
+                           x-text="row.title || '(no title)'"></a>
+                        <div class="text-xs text-slate-500 mt-1">
+                          <span x-text="row.job_id"></span>
+                          <span class="ml-2" x-text="row.age_hours + 'h ago'"></span>
+                        </div>
+                      </td>
+
+                      <td class="py-3 pr-4 text-slate-700" x-text="row.level"></td>
+                      <td class="py-3 pr-4 text-slate-700">
+                        <div x-text="row.pay"></div>
+                        <div class="text-green-600"
+                             :class="row.ai_row?.salary ? 'text-green-600' : 'text-red-600'"
+                             x-text="row.ai_row?.salary ?? 'No AI salary'"></div>
+                      </td>
+
+                      <td class="py-3 pr-4 text-slate-700">
+                        <div x-text="row.discovery_date"></div>
+                        <div class="text-xs" :class="row.is_active ? 'text-green-600' : 'text-red-600'" x-text="row.is_active ? 'Active' : 'Inactive'"></div>
+                      </td>
+
+                      <td class="py-3 pr-4 text-slate-700">
+                        <template x-if="(row.ai && typeof row.ai === 'object') || row.ai_row">
+                          <div class="space-y-1">
+                            <div class="text-xs">
+                              <span class="font-semibold">match</span>:
+                              <span x-text="matchValue(row) ?? '-'"></span>
+                              <span class="ml-2 font-semibold">experience_match</span>:
+                              <span x-text="row.ai_row?.experience_match ?? row.ai?.experience_match ?? '-'"></span>
+                              <span class="ml-2 font-semibold">location</span>:
+                              <span x-text="locationValue(row) ?? '-'"></span>
+                            </div>
+                            <div class="text-xs text-slate-600 line-clamp-3" x-text="row.ai_row?.fit_summary ?? row.ai?.fit_summary ?? ''"></div>
+                            <button class="text-xs text-indigo-700 hover:underline"
+                                    x-show="row.ai && typeof row.ai === 'object'"
+                                    @click="row._showAi = !row._showAi">
+                              <span x-text="row._showAi ? 'Hide JSON' : 'View JSON'"></span>
+                            </button>
+                            <pre x-show="row._showAi"
+                                 class="text-xs bg-slate-50 border border-slate-200 rounded-lg p-2 overflow-auto max-h-64"
+                                 x-text="JSON.stringify(row.ai, null, 2)"></pre>
+                          </div>
+                        </template>
+
+                        <template x-if="!((row.ai && typeof row.ai === 'object') || row.ai_row) && (row.ai_raw || '').trim().length">
+                          <div class="space-y-1">
+                            <div class="text-xs text-slate-500">ai_analysis (raw)</div>
+                            <button class="text-xs text-indigo-700 hover:underline"
+                                    @click="row._showAiRaw = !row._showAiRaw">
+                              <span x-text="row._showAiRaw ? 'Hide' : 'View'"></span>
+                            </button>
+                            <pre x-show="row._showAiRaw"
+                                 class="text-xs bg-slate-50 border border-slate-200 rounded-lg p-2 overflow-auto max-h-64"
+                                 x-text="row.ai_raw"></pre>
+                          </div>
+                        </template>
+
+                        <template x-if="!((row.ai && typeof row.ai === 'object') || row.ai_row || (row.ai_raw || '').trim().length)">
+                          <div class="text-xs text-slate-400">—</div>
+                        </template>
+                      </td>
+                    </tr>
+                  </template>
+                </tbody>
+              </table>
+
+              <div class="text-sm text-slate-500 py-3" x-show="jobsLoaded && filteredJobs().length === 0">
+                No rows match your filter.
+              </div>
+            </div>
+          </section>
+
+        </div>
+      </template>
+
+      <!-- ---------------- JOB LOOKUP VIEW ---------------- -->
+      <template x-if="view==='lookup'">
+        <div class="space-y-4">
+
+          <section class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4">
+            <form class="flex flex-col md:flex-row md:items-center gap-3" @submit.prevent="lookupJob()">
+              <label class="text-sm font-medium text-slate-700" for="jobLookup">Job ID or keyword:</label>
+              <input id="jobLookup" type="text" x-model="lookupQ" placeholder="JR1996524"
+                     class="w-full md:w-96 px-3 py-2 rounded-lg border border-slate-300 bg-white text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
+              <button type="submit"
+                      class="inline-flex items-center justify-center px-3 py-2 rounded-lg bg-indigo-600 text-white text-sm hover:bg-indigo-700 active:bg-indigo-800">
+                Search
+              </button>
+              <div class="text-sm text-slate-500" x-show="lookupLoading">Searching...</div>
+            </form>
+          </section>
+
+          <section class="grid grid-cols-1 lg:grid-cols-4 gap-4" x-show="lookupLoaded">
+            <div class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4 lg:col-span-1">
+              <div class="flex items-center justify-between">
+                <h2 class="text-sm font-semibold text-slate-800">Matches</h2>
+                <span class="text-xs text-slate-500" x-text="lookupResults.length"></span>
+              </div>
+
+              <div class="mt-3 space-y-2" x-show="lookupResults.length">
+                <template x-for="job in lookupResults" :key="job.id">
+                  <button type="button" @click="selectedJobId = job.id"
+                          class="w-full text-left rounded-lg border px-3 py-2 text-sm"
+                          :class="selectedJobId === job.id ? 'border-indigo-400 bg-indigo-50' : 'border-slate-200 bg-white hover:bg-slate-50'">
+                    <div class="font-medium text-slate-900" x-text="job.job_id"></div>
+                    <div class="text-xs text-slate-500" x-text="`ID ${job.id}`"></div>
+                    <div class="text-xs text-slate-500 truncate" x-text="job.site"></div>
+                    <div class="text-xs text-slate-700 mt-1 line-clamp-2" x-text="job.title || '(no title)'"></div>
+                  </button>
+                </template>
+              </div>
+
+              <div class="mt-3 text-sm text-slate-500" x-show="lookupLoaded && lookupResults.length === 0">
+                No jobs found.
+              </div>
+            </div>
+
+            <template x-if="selectedJob()">
+            <div class="space-y-4 lg:col-span-3">
+              <section class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4">
+                <div class="flex flex-col md:flex-row md:items-start gap-3 md:justify-between">
+                  <div>
+                    <div class="text-xs font-semibold uppercase text-slate-500" x-text="selectedJob().site"></div>
+                    <h2 class="mt-1 text-xl font-semibold text-slate-900" x-text="selectedJob().title || '(no title)'"></h2>
+                    <div class="mt-1 text-sm text-slate-600">
+                      <span class="font-medium" x-text="selectedJob().job_id"></span>
+                      <span class="ml-2 text-slate-500" x-text="`ID ${selectedJob().id}`"></span>
+                      <span class="ml-2" :class="selectedJob().is_active ? 'text-green-700' : 'text-red-700'"
+                            x-text="selectedJob().is_active ? 'Active' : 'Inactive'"></span>
+                    </div>
+                  </div>
+                  <a class="inline-flex items-center justify-center px-3 py-2 rounded-lg bg-slate-900 text-white text-sm hover:bg-slate-800"
+                     :href="selectedJob().url || '#'" target="_blank" rel="noreferrer"
+                     x-show="selectedJob().url">
+                    Open posting
+                  </a>
+                </div>
+
+                <dl class="mt-4 grid grid-cols-1 md:grid-cols-3 gap-3 text-sm">
+                  <div class="rounded-lg border border-slate-200 p-3">
+                    <dt class="text-xs text-slate-500">Level</dt>
+                    <dd class="font-medium text-slate-900" x-text="selectedJob().level || '-'"></dd>
+                  </div>
+                  <div class="rounded-lg border border-slate-200 p-3">
+                    <dt class="text-xs text-slate-500">Pay</dt>
+                    <dd class="font-medium text-slate-900" x-text="selectedJob().pay || '-'"></dd>
+                  </div>
+                  <div class="rounded-lg border border-slate-200 p-3">
+                    <dt class="text-xs text-slate-500">Discovered</dt>
+                    <dd class="font-medium text-slate-900" x-text="selectedJob().discovery_date || '-'"></dd>
+                  </div>
+                </dl>
+              </section>
+
+              <section class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4"
+                       x-show="(selectedJob().reference_fields || []).length">
+                <h3 class="text-sm font-semibold text-slate-800">Reference fields</h3>
+                <dl class="mt-3 grid grid-cols-1 md:grid-cols-2 gap-3 text-sm">
+                  <template x-for="field in (selectedJob().reference_fields || [])" :key="field.label">
+                    <div class="rounded-lg border border-slate-200 p-3">
+                      <dt class="text-xs text-slate-500" x-text="field.label"></dt>
+                      <dd class="mt-1 font-medium text-slate-900 whitespace-pre-wrap break-words"
+                          x-text="field.value || '-'"></dd>
+                    </div>
+                  </template>
+                </dl>
+              </section>
+
+              <section class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4">
+                <h3 class="text-sm font-semibold text-slate-800">Description</h3>
+                <pre class="mt-3 whitespace-pre-wrap text-sm leading-6 text-slate-800 bg-slate-50 border border-slate-200 rounded-lg p-3 max-h-[34rem] overflow-auto"
+                     x-text="selectedJob().desc || 'No description stored.'"></pre>
+              </section>
+
+              <section class="grid grid-cols-1 xl:grid-cols-2 gap-4">
+                <div class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4">
+                  <h3 class="text-sm font-semibold text-slate-800">AI analysis</h3>
+                  <template x-if="selectedJob().ai && typeof selectedJob().ai === 'object'">
+                    <pre class="mt-3 text-xs bg-slate-50 border border-slate-200 rounded-lg p-3 overflow-auto max-h-96"
+                         x-text="JSON.stringify(selectedJob().ai, null, 2)"></pre>
+                  </template>
+                  <template x-if="!(selectedJob().ai && typeof selectedJob().ai === 'object')">
+                    <pre class="mt-3 text-xs bg-slate-50 border border-slate-200 rounded-lg p-3 overflow-auto max-h-96"
+                         x-text="selectedJob().ai_raw || 'No AI analysis stored.'"></pre>
+                  </template>
+                </div>
+
+                <div class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4">
+                  <h3 class="text-sm font-semibold text-slate-800">Metadata</h3>
+                  <dl class="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-3 text-sm">
+                    <div>
+                      <dt class="text-xs text-slate-500">Updated</dt>
+                      <dd x-text="selectedJob().updated_at || '-'"></dd>
+                    </div>
+                    <div>
+                      <dt class="text-xs text-slate-500">Run ID</dt>
+                      <dd x-text="selectedJob().run_id ?? '-'"></dd>
+                    </div>
+                    <div>
+                      <dt class="text-xs text-slate-500">First seen run</dt>
+                      <dd x-text="selectedJob().first_seen_run_id ?? '-'"></dd>
+                    </div>
+                    <div>
+                      <dt class="text-xs text-slate-500">Last seen run</dt>
+                      <dd x-text="selectedJob().last_seen_run_id ?? '-'"></dd>
+                    </div>
+                    <div class="sm:col-span-2">
+                      <dt class="text-xs text-slate-500">Content hash</dt>
+                      <dd class="break-all" x-text="selectedJob().content_hash || '-'"></dd>
+                    </div>
+                  </dl>
+
+                  <h3 class="mt-5 text-sm font-semibold text-slate-800">Keywords</h3>
+                  <pre class="mt-3 whitespace-pre-wrap text-xs bg-slate-50 border border-slate-200 rounded-lg p-3 overflow-auto max-h-40"
+                       x-text="selectedJob().keywords || 'No keywords stored.'"></pre>
+                </div>
+              </section>
+
+              <section class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4">
+                <h3 class="text-sm font-semibold text-slate-800">Change history</h3>
+                <div class="mt-3 overflow-x-auto">
+                  <table class="min-w-full text-sm">
+                    <thead class="text-left text-slate-600 border-b">
+                      <tr>
+                        <th class="py-2 pr-4">When</th>
+                        <th class="py-2 pr-4">Source</th>
+                        <th class="py-2 pr-4">Type</th>
+                        <th class="py-2 pr-4">Fields</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <template x-for="change in (selectedJob().changes || [])" :key="change.id">
+                        <tr class="border-b">
+                          <td class="py-2 pr-4" x-text="change.created_at || '-'"></td>
+                          <td class="py-2 pr-4">
+                            <span class="inline-flex rounded px-2 py-0.5 text-xs font-medium"
+                                  :class="(change.change_source || 'site') === 'ai' ? 'bg-violet-100 text-violet-700' : 'bg-slate-100 text-slate-700'"
+                                  x-text="change.change_source || 'site'"></span>
+                          </td>
+                          <td class="py-2 pr-4" x-text="change.change_type || '-'"></td>
+                          <td class="py-2 pr-4" x-text="change.changed_fields || '-'"></td>
+                        </tr>
+                      </template>
+                    </tbody>
+                  </table>
+                  <div class="text-sm text-slate-500 py-3" x-show="!(selectedJob().changes || []).length">
+                    No change records found.
+                  </div>
+                </div>
+              </section>
+            </div>
+            </template>
+          </section>
+
+        </div>
+      </template>
+
+      <!-- ---------------- DISCOVERY REVIEW VIEW ---------------- -->
+      <template x-if="view==='discovery'">
+        <div class="space-y-4">
+          <section class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4">
+            <div class="flex flex-col md:flex-row md:items-center gap-3 md:justify-between">
+              <div>
+                <h2 class="text-sm font-semibold text-slate-800">Discovery suggestions</h2>
+                <p class="text-xs text-slate-500 mt-1">
+                  Review Ollama-guided career page suggestions before adding them to steps.json.
+                </p>
+              </div>
+              <div class="flex flex-wrap items-center gap-2">
+                <button @click="loadDiscovery()"
+                        class="px-3 py-2 rounded-lg border border-slate-300 bg-white text-sm text-slate-700 hover:bg-slate-50">
+                  Refresh
+                </button>
+                <button @click="applyDiscoverySelected()"
+                        :disabled="selectedDiscoveryIds.length === 0 || discoverySaving"
+                        class="px-3 py-2 rounded-lg bg-indigo-600 text-white text-sm disabled:opacity-40">
+                  Apply selected
+                </button>
+                <button @click="rejectDiscoverySelected()"
+                        :disabled="selectedDiscoveryIds.length === 0 || discoverySaving"
+                        class="px-3 py-2 rounded-lg border border-slate-300 bg-white text-sm text-slate-700 disabled:opacity-40">
+                  Reject selected
+                </button>
+              </div>
+            </div>
+            <div class="mt-3 text-sm text-slate-600" x-show="discoveryMessage" x-text="discoveryMessage"></div>
+            <div class="mt-3 text-sm text-slate-500" x-show="discoveryLoading">Loading suggestions...</div>
+          </section>
+
+          <section class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4">
+            <div class="flex flex-col md:flex-row md:items-center gap-3 md:justify-between">
+              <div>
+                <h2 class="text-sm font-semibold text-slate-800">Journey log</h2>
+                <p class="text-xs text-slate-500 mt-1">
+                  Live events from the discovery output file while Python fetches pages and Ollama chooses next steps.
+                </p>
+              </div>
+              <div class="flex flex-wrap items-center gap-3 text-sm">
+                <label class="inline-flex items-center gap-2 text-slate-700">
+                  <input type="checkbox" x-model="discoveryAutoRefresh" />
+                  Auto refresh
+                </label>
+                <button @click="loadDiscoveryEvents()"
+                        class="px-3 py-2 rounded-lg border border-slate-300 bg-white text-sm text-slate-700 hover:bg-slate-50">
+                  Refresh log
+                </button>
+              </div>
+            </div>
+
+            <div class="mt-3 text-xs text-slate-500">
+              events=<span x-text="discoveryEvents.length"></span>
+              <span class="ml-2" x-show="discoveryEventsLoaded">last refreshed=<span x-text="discoveryEventsLoadedAt || '-'"></span></span>
+            </div>
+
+            <div class="mt-3 space-y-2 max-h-96 overflow-auto">
+              <template x-for="event in recentDiscoveryEvents()" :key="`${event.timestamp || ''}-${event.type || ''}-${event.url || event.message || ''}`">
+                <div class="rounded-lg border border-slate-200 bg-slate-50 p-3">
+                  <div class="flex flex-col md:flex-row md:items-start md:justify-between gap-2">
+                    <div>
+                      <div class="flex flex-wrap items-center gap-2">
+                        <span class="inline-flex rounded bg-indigo-100 px-2 py-0.5 text-xs font-medium text-indigo-700"
+                              x-text="event.type || 'event'"></span>
+                        <span class="text-xs text-slate-500" x-text="event.timestamp || '-'"></span>
+                      </div>
+                      <div class="mt-1 text-sm text-slate-900" x-text="event.message || '-'"></div>
+                      <a class="mt-1 block text-xs text-indigo-700 hover:underline break-all"
+                         x-show="event.url"
+                         :href="event.url || '#'" target="_blank" rel="noreferrer"
+                         x-text="event.url || ''"></a>
+                    </div>
+                    <pre class="text-xs bg-white border border-slate-200 rounded p-2 overflow-auto max-h-32 md:w-96"
+                         x-show="eventDetails(event)"
+                         x-text="eventDetails(event)"></pre>
+                  </div>
+                </div>
+              </template>
+              <div class="text-sm text-slate-500 py-3" x-show="discoveryEventsLoaded && discoveryEvents.length === 0">
+                No journey events found. Publish discovery events from the crawler host.
+              </div>
+            </div>
+          </section>
+
+          <section class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4">
+            <div class="overflow-x-auto">
+              <table class="min-w-full text-sm">
+                <thead class="text-left text-slate-600 border-b">
+                  <tr>
+                    <th class="py-2 pr-4">Use</th>
+                    <th class="py-2 pr-4">Site</th>
+                    <th class="py-2 pr-4">Platform</th>
+                    <th class="py-2 pr-4">Confidence</th>
+                    <th class="py-2 pr-4">Evidence</th>
+                    <th class="py-2 pr-4">Steps</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <template x-for="item in discoverySuggestions" :key="item.id">
+                    <tr class="border-b align-top">
+                      <td class="py-3 pr-4">
+                        <input type="checkbox"
+                               :disabled="!['pending','approved'].includes(item.state || 'pending')"
+                               :checked="isDiscoverySelected(item.id)"
+                               @change="toggleDiscovery(item.id)" />
+                        <div class="mt-1 text-xs text-slate-500" x-text="item.state || 'pending'"></div>
+                      </td>
+                      <td class="py-3 pr-4">
+                        <div class="font-medium text-slate-900" x-text="item.site_key || '-'"></div>
+                        <a class="text-xs text-indigo-700 hover:underline break-all"
+                           :href="item.url || '#'" target="_blank" rel="noreferrer"
+                           x-text="item.url || '-'"></a>
+                        <div class="mt-1 text-xs text-amber-700" x-show="item.manual_review">Manual selector review</div>
+                      </td>
+                      <td class="py-3 pr-4" x-text="item.platform || 'unknown'"></td>
+                      <td class="py-3 pr-4" x-text="Math.round(Number(item.confidence || 0) * 100) + '%'"></td>
+                      <td class="py-3 pr-4 max-w-md">
+                        <div class="text-slate-800" x-text="item.reason || '-'"></div>
+                        <div class="mt-1 text-xs text-slate-500" x-show="item.remote_evidence">
+                          Remote: <span x-text="item.remote_evidence"></span>
+                        </div>
+                        <div class="mt-1 text-xs text-slate-500" x-show="item.location_evidence">
+                          Location: <span x-text="item.location_evidence"></span>
+                        </div>
+                        <div class="mt-1 text-xs text-slate-500" x-show="item.notes" x-text="item.notes"></div>
+                      </td>
+                      <td class="py-3 pr-4">
+                        <details>
+                          <summary class="cursor-pointer text-indigo-700">View steps</summary>
+                          <pre class="mt-2 text-xs bg-slate-50 border border-slate-200 rounded-lg p-2 overflow-auto max-h-80 w-[32rem]"
+                               x-text="JSON.stringify(item.steps || [], null, 2)"></pre>
+                        </details>
+                      </td>
+                    </tr>
+                  </template>
+                </tbody>
+              </table>
+              <div class="text-sm text-slate-500 py-3" x-show="discoveryLoaded && discoverySuggestions.length === 0">
+                No discovery suggestions found. Publish suggestions from the crawler host.
+              </div>
+            </div>
+          </section>
+        </div>
+      </template>
+
+    </div>
+
+    <script>
+      function dashboard() {
+        return {
+          view: 'runs',
+
+          // Runs state
+          days: 30,
+          runsLoaded: false,
+          labels: [],
+          inserted: [],
+          updated: [],
+          missing: [],
+          unchanged: [],
+          error: [],
+          total_seen: [],
+          net_change: [],
+          recentRuns: [],
+          runsVisibleLimit: 10,
+          hideTestRuns: true,
+          change_rate_pct: [],
+          net_rate_pct: [],
+          change_rate_ma7_pct: [],
+          net_rate_ma7_pct: [],
+          chartCounts: null,
+          chartRates: null,
+
+          // Jobs state
+          jobsLoaded: false,
+          hours: '48',
+          jobsLimit: 500,
+          minAiMatch: 80,
+          locationPolicy: 'any',
+          jobs: [],
+          jobsMeta: { returned: 0, parse_failures: 0, cutoff_iso: '', min_match: null, location_policy: 'any' },
+          q: '',
+
+          // Lookup state
+          lookupQ: '',
+          lookupLoaded: false,
+          lookupLoading: false,
+          lookupResults: [],
+          selectedJobId: null,
+
+          // Discovery state
+          discoveryLoaded: false,
+          discoveryLoading: false,
+          discoverySaving: false,
+          discoverySuggestions: [],
+          selectedDiscoveryIds: [],
+          discoveryMessage: '',
+          discoveryEvents: [],
+          discoveryEventsLoaded: false,
+          discoveryEventsLoadedAt: '',
+          discoveryAutoRefresh: true,
+          discoveryPoller: null,
+
+          sum(arr) { return (arr || []).reduce((a,b)=>a+(b||0), 0); },
+
+          // ---------------- RUNS ----------------
+          async loadRuns() {
+            this.runsLoaded = false;
+            const res = await fetch(`/api/data?days=${this.days}`);
+            const data = await res.json();
+
+            this.labels = data.labels || [];
+            this.inserted = data.inserted || [];
+            this.updated = data.updated || [];
+            this.missing = data.missing || [];
+            this.unchanged = data.unchanged || [];
+            this.error = data.error || [];
+            this.total_seen = data.total_seen || [];
+            this.net_change = data.net_change || [];
+            this.recentRuns = data.recent_runs || [];
+            this.runsVisibleLimit = 10;
+            this.change_rate_pct = data.change_rate_pct || [];
+            this.net_rate_pct = data.net_rate_pct || [];
+            this.change_rate_ma7_pct = data.change_rate_ma7_pct || [];
+            this.net_rate_ma7_pct = data.net_rate_ma7_pct || [];
+
+            this.renderCountsChart();
+            this.renderRatesChart();
+            this.runsLoaded = true;
+          },
+
+          filteredRuns() {
+            const rows = this.recentRuns || [];
+            if (!this.hideTestRuns) return rows;
+            return rows.filter(row => String(row.mode || '').toLowerCase() !== 'test');
+          },
+
+          visibleRuns() {
+            return this.filteredRuns().slice(0, this.runsVisibleLimit);
+          },
+
+          canLoadMoreRuns() {
+            return this.filteredRuns().length > this.runsVisibleLimit;
+          },
+
+          loadMoreRuns() {
+            this.runsVisibleLimit += 10;
+          },
+
+          formatRunTime(value) {
+            if (!value) return '-';
+            const parsed = new Date(String(value).replace(' ', 'T'));
+            if (Number.isNaN(parsed.getTime())) return value;
+            return parsed.toLocaleString([], {
+              month: 'short',
+              day: 'numeric',
+              year: 'numeric',
+              hour: 'numeric',
+              minute: '2-digit'
+            });
+          },
+
+          renderCountsChart() {
+            const ctx = document.getElementById('runsChart').getContext('2d');
+
+            const barDatasets = [
+              { label: 'Inserted', data: this.inserted, stack: 'impact', borderWidth: 1,
+                backgroundColor: 'rgba(16, 185, 129, 0.85)', borderColor: 'rgb(16, 185, 129)' },
+              { label: 'Updated', data: this.updated, stack: 'impact', borderWidth: 1,
+                backgroundColor: 'rgba(59, 130, 246, 0.85)', borderColor: 'rgb(59, 130, 246)' },
+              { label: 'Missing', data: this.missing, stack: 'impact', borderWidth: 1,
+                backgroundColor: 'rgba(249, 115, 22, 0.9)', borderColor: 'rgb(249, 115, 22)' }
+            ];
+
+            const totalDataset = {
+              label: 'Total Seen',
+              data: this.total_seen,
+              type: 'line',
+              yAxisID: 'y',
+              borderColor: 'rgb(15, 23, 42)',
+              backgroundColor: 'rgba(15, 23, 42, 0.08)',
+              tension: 0.25,
+              pointRadius: 3,
+              borderWidth: 2,
+            };
+
+            const netChangeDataset = {
+              label: 'Net Change (Inserted - Missing)',
+              data: this.net_change,
+              type: 'line',
+              yAxisID: 'y',
+              borderColor: 'rgb(34, 197, 94)',
+              backgroundColor: 'rgba(34, 197, 94, 0.1)',
+              tension: 0.25,
+              pointRadius: 3,
+              borderWidth: 2,
+            };
+
+            const config = {
+              type: 'bar',
+              data: { labels: this.labels, datasets: [...barDatasets, totalDataset, netChangeDataset] },
+              options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                scales: { x: { stacked: true, ticks: { autoSkip: true, maxRotation: 0 } },
+                          y: { stacked: true, beginAtZero: true } },
+                interaction: { mode: 'index', intersect: false },
+                plugins: { legend: { position: 'bottom' } }
+              },
+            };
+
+            if (this.chartCounts) this.chartCounts.destroy();
+            this.chartCounts = new Chart(ctx, config);
+          },
+
+          renderRatesChart() {
+            const ctx = document.getElementById('runsRateChart').getContext('2d');
+            const datasets = [
+              { label: 'Change %', data: this.change_rate_pct,
+                borderColor: 'rgb(59, 130, 246)', backgroundColor: 'rgba(59, 130, 246, 0.1)',
+                tension: 0.25, pointRadius: 2, borderWidth: 2 },
+              { label: 'Change % (7d avg)', data: this.change_rate_ma7_pct,
+                borderColor: 'rgb(59, 130, 246)', borderDash: [4,4],
+                backgroundColor: 'rgba(59, 130, 246, 0.05)', tension: 0.25, pointRadius: 0, borderWidth: 2 },
+              { label: 'Net %', data: this.net_rate_pct,
+                borderColor: 'rgb(34, 197, 94)', backgroundColor: 'rgba(34, 197, 94, 0.1)',
+                tension: 0.25, pointRadius: 2, borderWidth: 2 },
+              { label: 'Net % (7d avg)', data: this.net_rate_ma7_pct,
+                borderColor: 'rgb(34, 197, 94)', borderDash: [4,4],
+                backgroundColor: 'rgba(34, 197, 94, 0.05)', tension: 0.25, pointRadius: 0, borderWidth: 2 },
+            ];
+
+            const config = {
+              type: 'line',
+              data: { labels: this.labels, datasets },
+              options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                scales: { x: { ticks: { autoSkip: true, maxRotation: 0 } },
+                          y: { beginAtZero: true, ticks: { callback: (v) => `${v}%` } } },
+                interaction: { mode: 'index', intersect: false },
+                plugins: { legend: { position: 'bottom' } }
+              }
+            };
+
+            if (this.chartRates) this.chartRates.destroy();
+            this.chartRates = new Chart(ctx, config);
+          },
+
+          // ---------------- JOBS ----------------
+          async loadJobs() {
+            this.jobsLoaded = false;
+            const params = new URLSearchParams({
+              hours: String(this.hours || 'all'),
+              limit: String(this.jobsLimit || 500)
+            });
+            if (this.minAiMatch !== null && this.minAiMatch !== '' && !Number.isNaN(Number(this.minAiMatch))) {
+              params.set('min_match', String(this.minAiMatch));
+            }
+            if (this.locationPolicy) {
+              params.set('location_policy', this.locationPolicy);
+            }
+            const res = await fetch(`/api/jobs?${params.toString()}`);
+            const data = await res.json();
+            this.jobsMeta = {
+              returned: data.returned || 0,
+              min_match: data.min_match ?? null,
+              location_policy: data.location_policy || 'any',
+              parse_failures: data.parse_failures || 0,
+              cutoff_iso: data.cutoff_iso || ''
+            };
+            this.jobs = (data.jobs || []).map(x => ({ ...x, _showAi: false, _showAiRaw: false }));
+            this.jobsLoaded = true;
+          },
+
+          matchValue(row) {
+            const fromColumn = row?.ai_row?.match_percentage;
+            const fromJson = row?.ai?.match_percentage;
+            const value = fromColumn ?? fromJson;
+            if (value === null || value === undefined || value === '') return null;
+            const n = Number(value);
+            return Number.isFinite(n) ? n : null;
+          },
+
+          locationValue(row) {
+            const fromColumn = row?.ai_row?.location_policy_match;
+            const fromJson = row?.ai?.location_policy_match;
+            const value = (fromColumn ?? fromJson ?? '').toString().toLowerCase().trim();
+            return value || null;
+          },
+
+          locationMatches(row) {
+            const filter = (this.locationPolicy || 'any').toLowerCase();
+            if (filter === 'any') return true;
+            const value = this.locationValue(row);
+            if (filter === 'non_hybrid') return value !== 'hybrid';
+            return value === filter;
+          },
+
+          filteredJobs() {
+            const q = (this.q || '').toLowerCase().trim();
+            const minMatch = Number(this.minAiMatch);
+            return (this.jobs || []).filter(r => {
+              if (!this.locationMatches(r)) return false;
+              if (Number.isFinite(minMatch)) {
+                const match = this.matchValue(r);
+                if (match === null || match < minMatch) return false;
+              }
+              if (!q) return true;
+              const hay = `${r.site||''} ${r.job_id||''} ${r.title||''} ${r.level||''} ${r.pay||''}`.toLowerCase();
+              return hay.includes(q);
+            });
+          },
+
+          async lookupJob() {
+            const q = (this.lookupQ || '').trim();
+            if (!q) return;
+
+            this.lookupLoading = true;
+            this.lookupLoaded = false;
+            this.lookupResults = [];
+            this.selectedJobId = null;
+
+            const res = await fetch(`/api/job-lookup?q=${encodeURIComponent(q)}`);
+            const data = await res.json();
+            this.lookupResults = data.jobs || [];
+            this.selectedJobId = this.lookupResults.length ? this.lookupResults[0].id : null;
+            this.lookupLoaded = true;
+            this.lookupLoading = false;
+          },
+
+          async openJobDetail(id) {
+            const jobId = Number(id);
+            if (!Number.isFinite(jobId) || jobId <= 0) return;
+
+            this.view = 'lookup';
+            this.lookupQ = `ID ${jobId}`;
+            this.lookupLoading = true;
+            this.lookupLoaded = false;
+            this.lookupResults = [];
+            this.selectedJobId = null;
+
+            const res = await fetch(`/api/job-detail?id=${encodeURIComponent(jobId)}`);
+            const data = await res.json();
+            this.lookupResults = data.job ? [data.job] : [];
+            this.selectedJobId = data.job ? data.job.id : null;
+            this.lookupLoaded = true;
+            this.lookupLoading = false;
+          },
+
+          selectedJob() {
+            return (this.lookupResults || []).find(j => j.id === this.selectedJobId) || null;
+          },
+
+          // ---------------- DISCOVERY ----------------
+          async loadDiscovery() {
+            this.discoveryLoading = true;
+            this.discoveryMessage = '';
+            const [suggestionsRes] = await Promise.all([
+              fetch('/api/discovery/suggestions'),
+              this.loadDiscoveryEvents()
+            ]);
+            const data = await suggestionsRes.json();
+            this.discoverySuggestions = data.suggestions || [];
+            this.selectedDiscoveryIds = this.selectedDiscoveryIds.filter(id =>
+              this.discoverySuggestions.some(item => item.id === id && ['pending','approved'].includes(item.state || 'pending'))
+            );
+            this.discoveryLoaded = true;
+            this.discoveryLoading = false;
+          },
+
+          async loadDiscoveryEvents() {
+            const res = await fetch('/api/discovery/events?limit=200');
+            const data = await res.json();
+            this.discoveryEvents = data.events || [];
+            this.discoveryEventsLoaded = true;
+            this.discoveryEventsLoadedAt = new Date().toLocaleTimeString();
+          },
+
+          recentDiscoveryEvents() {
+            return [...(this.discoveryEvents || [])].reverse();
+          },
+
+          eventDetails(event) {
+            const skip = new Set(['timestamp', 'type', 'message', 'url']);
+            const details = {};
+            for (const [key, value] of Object.entries(event || {})) {
+              if (!skip.has(key) && value !== null && value !== undefined && value !== '') {
+                details[key] = value;
+              }
+            }
+            return Object.keys(details).length ? JSON.stringify(details, null, 2) : '';
+          },
+
+          isDiscoverySelected(id) {
+            return this.selectedDiscoveryIds.includes(id);
+          },
+
+          toggleDiscovery(id) {
+            if (this.isDiscoverySelected(id)) {
+              this.selectedDiscoveryIds = this.selectedDiscoveryIds.filter(x => x !== id);
+            } else {
+              this.selectedDiscoveryIds = [...this.selectedDiscoveryIds, id];
+            }
+          },
+
+          async applyDiscoverySelected() {
+            if (!this.selectedDiscoveryIds.length || this.discoverySaving) return;
+            this.discoverySaving = true;
+            this.discoveryMessage = '';
+            try {
+              const res = await fetch('/api/discovery/apply', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ids: this.selectedDiscoveryIds})
+              });
+              const data = await res.json();
+              if (!res.ok) throw new Error(data.error || 'Apply failed');
+              this.discoveryMessage = `Applied ${data.applied.length} suggestion(s); skipped ${data.skipped.length}.`;
+              this.selectedDiscoveryIds = [];
+              await this.loadDiscovery();
+            } catch (err) {
+              this.discoveryMessage = err?.message || 'Apply failed.';
+            } finally {
+              this.discoverySaving = false;
+            }
+          },
+
+          async rejectDiscoverySelected() {
+            if (!this.selectedDiscoveryIds.length || this.discoverySaving) return;
+            this.discoverySaving = true;
+            this.discoveryMessage = '';
+            try {
+              const res = await fetch('/api/discovery/reject', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ids: this.selectedDiscoveryIds})
+              });
+              const data = await res.json();
+              if (!res.ok) throw new Error(data.error || 'Reject failed');
+              this.discoveryMessage = `Rejected ${data.changed.length} suggestion(s).`;
+              this.selectedDiscoveryIds = [];
+              await this.loadDiscovery();
+            } catch (err) {
+              this.discoveryMessage = err?.message || 'Reject failed.';
+            } finally {
+              this.discoverySaving = false;
+            }
+          },
+
+          init() {
+            this.loadRuns();
+            this.loadJobs();
+            this.discoveryPoller = setInterval(() => {
+              if (this.view === 'discovery' && this.discoveryAutoRefresh) {
+                this.loadDiscoveryEvents();
+              }
+            }, 3000);
+          }
+        }
+      }
+    </script>
+  </body>
+</html>
