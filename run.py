@@ -4,6 +4,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import getpass
 import hashlib
+import json
 import logging
 import os
 import sys
@@ -28,6 +29,7 @@ from app.utils import (
     ensure_nltk,
     extract_keywords,
     get_job_level,
+    html_to_text,
     scan_for_pay_range,
     remove_canned_text,
 )
@@ -189,11 +191,42 @@ def _norm_text(x: str | None) -> str:
     return (x or "").replace("\u202f", " ").replace("\u00a0", " ").strip()
 
 
+_CORE_JOB_DATA_FIELDS = {"JobID", "JobTitle", "JobUrl", "JobDesc", "JobPay"}
+
+
+def _serialize_reference_fields(job_data: Dict[str, Any]) -> str:
+    refs: Dict[str, str] = {}
+    for key, value in job_data.items():
+        if key in _CORE_JOB_DATA_FIELDS or key.startswith("__"):
+            continue
+        if value is None:
+            continue
+        # Keep extra source fields readable in the dashboard even when APIs use HTML.
+        text_value = _norm_text(html_to_text(str(value)))
+        if text_value:
+            refs[str(key)] = text_value
+    # Stable ordering keeps hashes and change records from flipping across runs.
+    return json.dumps(refs, sort_keys=True) if refs else ""
+
+
+def _collected_field_names(jobs_raw: List[Dict[str, Any]]) -> List[str]:
+    fields: List[str] = []
+    seen = set()
+    for job in jobs_raw:
+        # Keep first-seen extraction order so CLI output follows test.json changes.
+        for field in job.keys():
+            if field not in seen:
+                seen.add(field)
+                fields.append(field)
+    return fields
+
+
 def _missing_extraction_fields(jobs_raw: List[Dict[str, Any]]) -> Dict[str, List[int]]:
-    required_fields = ["JobID", "JobTitle", "JobUrl", "JobDesc"]
-    missing: Dict[str, List[int]] = {field: [] for field in required_fields}
+    fields = _collected_field_names(jobs_raw)
+    missing: Dict[str, List[int]] = {field: [] for field in fields}
     for idx, job in enumerate(jobs_raw, 1):
-        for field in required_fields:
+        # In test mode, validate only what the current plan actually collected.
+        for field in fields:
             if not _norm_text(str(job.get(field, ""))):
                 missing[field].append(idx)
     return missing
@@ -205,8 +238,10 @@ def _log_test_extraction_summary(
     jobs_raw: List[Dict[str, Any]],
 ) -> None:
     missing = _missing_extraction_fields(jobs_raw)
+    fields = _collected_field_names(jobs_raw)
     logger.info("test extraction site=%s jobs_found=%d", site, len(jobs_raw))
     print(f"[test] {site}: jobs_found={len(jobs_raw)}")
+    print(f"[test] {site}: collected_fields={fields}")
     for field, row_numbers in missing.items():
         logger.info(
             "test extraction site=%s missing_%s=%d rows=%s",
@@ -224,30 +259,75 @@ def _print_test_extracted_values(site: str, jobs_raw: List[Dict[str, Any]]) -> N
     if not jobs_raw:
         return
 
-    preferred = ["JobID", "JobTitle", "JobUrl", "JobPay", "JobDesc"]
-    discovered = sorted({key for job in jobs_raw for key in job.keys()})
-    keys = [key for key in preferred if key in discovered]
-    keys.extend(key for key in discovered if key not in keys)
+    # Derive table columns from the extracted data instead of hardcoding site fields.
+    keys = _collected_field_names(jobs_raw)
 
-    for idx, job in enumerate(jobs_raw, 1):
-        print(f"[test] {site}: row={idx}")
-        for key in keys:
-            value = job.get(key, "")
-            text = _norm_text(str(value))
-            if key == "JobDesc" and len(text) > 500:
-                text = f"{text[:500]}... [len={len(_norm_text(str(value)))}]"
-            print(f"[test] {site}: row={idx} {key}={text}")
+    sample = jobs_raw[:3]
+    headers = ["Row"] + keys
+    # Show jobs east/west as rows so each posting can be scanned left to right.
+    rows = [
+        [f"Job {idx}"] + [_clip_table_value(job.get(key, "")) for key in keys]
+        for idx, job in enumerate(sample, 1)
+    ]
+
+    print(f"[test] {site}: sample_rows={len(sample)} of {len(jobs_raw)}")
+    print(_format_table(headers, rows))
+
+
+def _clip_table_value(value: Any, max_len: int = 48) -> str:
+    # Keep table rows single-line and bounded even for full job descriptions.
+    text = _norm_text(str(value)).replace("\r", " ").replace("\n", " ")
+    text = " ".join(text.split())
+    if len(text) <= max_len:
+        return text
+    return f"{text[: max_len - 12]}... [len={len(text)}]"
+
+
+def _format_table(headers: List[str], rows: List[List[str]]) -> str:
+    all_rows = [headers] + rows
+    widths = [max(len(str(row[idx])) for row in all_rows) for idx in range(len(headers))]
+    # Respect the common NO_COLOR convention for users piping output or using plain logs.
+    color = "NO_COLOR" not in os.environ
+
+    def paint(text: str, code: str) -> str:
+        if not color:
+            return text
+        return f"\033[{code}m{text}\033[0m"
+
+    def fmt_row(row: List[str], *, is_header: bool = False) -> str:
+        cells = [str(value).ljust(widths[idx]) for idx, value in enumerate(row)]
+        # Color only structural cells so scraped values stay easy to copy/read.
+        if is_header:
+            cells = [paint(cell, "1;36") for cell in cells]
+        elif cells:
+            cells[0] = paint(cells[0], "1;32")
+        return "| " + " | ".join(cells) + " |"
+
+    sep = "|-" + "-|-".join("-" * width for width in widths) + "-|"
+    # Dim the separator to reduce visual weight in wide extraction tables.
+    sep = paint(sep, "2")
+    return "\n".join(
+        [fmt_row(headers, is_header=True), sep, *(fmt_row(row) for row in rows)]
+    )
 
 
 def _job_hash(
-    title: str, url: str, desc: str, keywords: str, level: str, pay: str
+    title: str,
+    url: str,
+    desc: str,
+    keywords: str,
+    level: str,
+    pay: str,
+    reference_fields: str,
 ) -> str:
-    canon = "|".join([title, url, desc, keywords, level, pay]).encode("utf-8", "ignore")
+    canon = "|".join(
+        [title, url, desc, keywords, level, pay, reference_fields]
+    ).encode("utf-8", "ignore")
     return hashlib.sha256(canon).hexdigest()
 
 
 def _changed_fields(old: Job, new: Job) -> List[str]:
-    fields = ["title", "url", "desc", "keywords", "level", "pay"]
+    fields = ["title", "url", "desc", "keywords", "level", "pay", "reference_fields"]
     return [f for f in fields if (getattr(old, f) or "") != (getattr(new, f) or "")]
 
 
@@ -259,7 +339,8 @@ def _normalize_job(site: str, run_id: int, job_data: Dict[str, Any]) -> Job | No
 
     title = _norm_text(str(job_data.get("JobTitle", "")))
     url = _norm_text(str(job_data.get("JobUrl", "")))
-    desc = _norm_text(str(job_data.get("JobDesc", "")))
+    # Persist readable text even when a JSON API provides an HTML description.
+    desc = _norm_text(html_to_text(str(job_data.get("JobDesc", ""))))
 
     # Make keywords stable across runs (avoid reorder-triggered updates)
     kw = extract_keywords(desc) or []
@@ -268,8 +349,12 @@ def _normalize_job(site: str, run_id: int, job_data: Dict[str, Any]) -> Job | No
 
     level = get_job_level(title)
 
-    pay_hits = scan_for_pay_range(desc) or []
+    # Prefer source-provided pay fields; description scanning is only a fallback.
+    explicit_pay = _norm_text(str(job_data.get("JobPay", "")))
+    pay_hits = scan_for_pay_range(explicit_pay) or scan_for_pay_range(desc) or []
     pay = pay_hits[0] if pay_hits else "Unknown"
+
+    reference_fields = _serialize_reference_fields(job_data)
 
     # NOTE: Keep setting discovery_date here for inserts,
     # but DO NOT copy it onto existing rows during updates.
@@ -284,10 +369,11 @@ def _normalize_job(site: str, run_id: int, job_data: Dict[str, Any]) -> Job | No
         keywords=keywords,
         level=level,
         pay=pay,
+        reference_fields=reference_fields,
         discovery_date=discovery_date,
         run_id=run_id,
     )
-    job.content_hash = _job_hash(title, url, desc, keywords, level, pay)
+    job.content_hash = _job_hash(title, url, desc, keywords, level, pay, reference_fields)
     return job
 
 
@@ -441,7 +527,7 @@ def _process_site(
                     change_source="site",
                     old_hash=None,
                     new_hash=job_obj.content_hash,
-                    changed_fields="title,url,desc,keywords,level,pay",
+                    changed_fields="title,url,desc,keywords,level,pay,reference_fields",
                 )
             )
             counters["inserted_count"] += 1
@@ -458,6 +544,7 @@ def _process_site(
             target.keywords = job_obj.keywords
             target.level = job_obj.level
             target.pay = job_obj.pay
+            target.reference_fields = job_obj.reference_fields
 
             # CRITICAL FIX: never overwrite discovery_date on update
             # target.discovery_date stays as first-seen timestamp

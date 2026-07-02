@@ -48,7 +48,15 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # NOTE: app/models.py currently prints DATABASE_URL on import. Remove that print.
-from app.models import Base, JobChange, SessionLocal, IntegrationRun, Job, engine  # type: ignore
+from app.models import (  # type: ignore
+    Base,
+    JobChange,
+    SessionLocal,
+    IntegrationRun,
+    Job,
+    engine,
+    ensure_job_reference_fields_column,
+)
 
 OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 DEFAULT_EVENTS_PATH = os.path.join(OUTPUT_DIR, "job_board_discovery_events.jsonl")
@@ -270,6 +278,35 @@ def _safe_json_list(s: Any) -> List[str]:
     if not isinstance(value, list):
         return []
     return [str(item) for item in value if item is not None]
+
+
+_REFERENCE_FIELDS_COLUMN_READY = False
+
+
+def _ensure_reference_fields_column() -> None:
+    global _REFERENCE_FIELDS_COLUMN_READY
+    if _REFERENCE_FIELDS_COLUMN_READY:
+        return
+    # Dashboard reads can happen before run.py initdb, so apply this one
+    # additive column migration against whichever SessionLocal the app uses.
+    with SessionLocal() as session:
+        ensure_job_reference_fields_column(session.get_bind())
+    _REFERENCE_FIELDS_COLUMN_READY = True
+
+
+def _job_reference_fields(j: Job) -> List[Dict[str, str]]:
+    raw_refs = _safe_json_loads(getattr(j, "reference_fields", None))
+    if not isinstance(raw_refs, dict):
+        return []
+
+    fields: List[Dict[str, str]] = []
+    for label, value in raw_refs.items():
+        if value is None:
+            continue
+        text_value = str(value).strip()
+        if text_value:
+            fields.append({"label": str(label), "value": text_value})
+    return fields
 
 
 def _job_ai_columns(j: Job) -> Dict[str, Any]:
@@ -1067,6 +1104,7 @@ def _serialize_job_detail(j: Job, changes: List[JobChange]) -> Dict[str, Any]:
         "keywords": (j.keywords or "").strip(),
         "level": (j.level or "").strip(),
         "pay": (j.pay or "").strip(),
+        "reference_fields": _job_reference_fields(j),
         "discovery_date": _fmt_dt(j.discovery_date),
         "updated_at": _fmt_dt(j.updated_at),
         "is_active": bool(j.is_active),
@@ -1102,6 +1140,7 @@ def fetch_job_lookup(query: str, limit: int = 25) -> Dict[str, Any]:
     q_norm = q.lower()
     like_q = f"%{q_norm}%"
 
+    _ensure_reference_fields_column()
     with SessionLocal() as session:
         exact_jobs = (
             session.execute(
@@ -1156,6 +1195,7 @@ def fetch_job_detail_by_id(job_pk: int) -> Dict[str, Any]:
     if not job_pk:
         return {"id": job_pk, "found": False, "job": None}
 
+    _ensure_reference_fields_column()
     with SessionLocal() as session:
         job = session.get(Job, job_pk)
         if job is None:
@@ -1586,6 +1626,20 @@ INDEX_HTML = r"""<!doctype html>
                     <dt class="text-xs text-slate-500">Discovered</dt>
                     <dd class="font-medium text-slate-900" x-text="selectedJob().discovery_date || '-'"></dd>
                   </div>
+                </dl>
+              </section>
+
+              <section class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4"
+                       x-show="(selectedJob().reference_fields || []).length">
+                <h3 class="text-sm font-semibold text-slate-800">Reference fields</h3>
+                <dl class="mt-3 grid grid-cols-1 md:grid-cols-2 gap-3 text-sm">
+                  <template x-for="field in (selectedJob().reference_fields || [])" :key="field.label">
+                    <div class="rounded-lg border border-slate-200 p-3">
+                      <dt class="text-xs text-slate-500" x-text="field.label"></dt>
+                      <dd class="mt-1 font-medium text-slate-900 whitespace-pre-wrap break-words"
+                          x-text="field.value || '-'"></dd>
+                    </div>
+                  </template>
                 </dl>
               </section>
 

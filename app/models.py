@@ -15,6 +15,8 @@ from sqlalchemy import (
     Boolean,
     func,
     Enum,
+    inspect as sa_inspect,
+    text,
 )
 from sqlalchemy.dialects.mysql import LONGTEXT
 from sqlalchemy.ext.declarative import declarative_base
@@ -74,6 +76,9 @@ class Job(Base):
     keywords = Column(LONGTEXT().with_variant(Text, "sqlite"))
     level = Column(String(64))
     pay = Column(String(255))
+    # Extra scraper columns are stored as JSON text so site-specific references
+    # like Location, JobSummary, OpenDate, and CloseDate are not discarded.
+    reference_fields = Column(LONGTEXT().with_variant(Text, "sqlite"), nullable=True)
     discovery_date = Column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),
@@ -195,6 +200,24 @@ engine = create_engine(
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
+def ensure_job_reference_fields_column(bind=None) -> None:
+    """Add the lightweight reference-fields column on existing databases."""
+    target = bind or engine
+    inspector = sa_inspect(target)
+    if "jobs" not in inspector.get_table_names():
+        return
+    columns = {col["name"] for col in inspector.get_columns("jobs")}
+    if "reference_fields" in columns:
+        return
+
+    # SQLAlchemy create_all does not ALTER existing tables, so keep this one
+    # additive migration here instead of introducing a migration framework.
+    column_type = "LONGTEXT" if target.dialect.name == "mysql" else "TEXT"
+    with target.begin() as conn:
+        conn.execute(text(f"ALTER TABLE jobs ADD COLUMN reference_fields {column_type}"))
+
+
 def init_db() -> None:
-    """Create tables if they don't exist. (Does not ALTER existing tables.)"""
+    """Create tables and apply the small additive runtime schema updates."""
     Base.metadata.create_all(bind=engine)
+    ensure_job_reference_fields_column(engine)

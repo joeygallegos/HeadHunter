@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import html
 import re
 from collections import Counter
 
+from bs4 import BeautifulSoup
 import nltk
 
 
@@ -10,6 +12,31 @@ _NLTK_RESOURCES = [
     ("tokenizers/punkt", "punkt"),
     ("tokenizers/punkt_tab/english", "punkt_tab"),
 ]
+
+
+def html_to_text(value: str | None) -> str:
+    raw = value or ""
+    # Some APIs return escaped markup such as &lt;p&gt; and double-escaped
+    # entities such as R&amp;amp;D, so decode a few times before tag detection.
+    for _ in range(3):
+        decoded = html.unescape(raw)
+        if decoded == raw:
+            break
+        raw = decoded
+
+    # Most scraper inputs are already plain text; avoid parsing those unnecessarily.
+    if not re.search(r"</?[A-Za-z][^>]*>", raw):
+        return raw
+
+    soup = BeautifulSoup(raw, "html.parser")
+    # Preserve author-intended line breaks before collapsing the rest of the HTML.
+    for br in soup.find_all("br"):
+        br.replace_with("\n")
+
+    text = soup.get_text("\n")
+    # Normalize noisy job-board markup into stable, readable description text.
+    lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines()]
+    return "\n".join(line for line in lines if line)
 
 
 def _ensure_nltk_resource(resource_path: str, download_name: str, verbose: bool) -> None:

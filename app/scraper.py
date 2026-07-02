@@ -24,6 +24,8 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
+from app.utils import html_to_text
+
 load_dotenv()
 
 
@@ -1032,6 +1034,9 @@ class StepScraper:
                         cur = cur.get(part) if isinstance(cur, dict) else None
                         if cur is None:
                             break
+                # Some JSON APIs expose full descriptions as HTML; steps opt in per field.
+                if es.get("html_to_text") and isinstance(cur, str):
+                    cur = html_to_text(cur)
                 job[column] = cur if cur is not None else ""
             out.append(job)
         return out
