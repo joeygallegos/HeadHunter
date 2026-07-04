@@ -9,17 +9,21 @@ import difflib
 import shutil
 import sys
 import urllib.parse
+import csv
+import io
 from collections import defaultdict, OrderedDict
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, Response, jsonify, render_template, request
 from sqlalchemy import (
+    and_,
     Column,
     DateTime,
     ForeignKey,
     Integer,
     String,
+    Text,
     UniqueConstraint,
     func,
     or_,
@@ -208,6 +212,29 @@ except ImportError:
         created_at = Column(
             DateTime(timezone=True), server_default=func.now(), nullable=False
         )
+
+
+class DashboardQueryReport(Base):  # type: ignore
+    __tablename__ = "dashboard_query_reports"
+    __table_args__ = (
+        UniqueConstraint("title", name="uq_dashboard_query_report_title"),
+        {
+            "extend_existing": True,
+            "mysql_charset": "utf8mb4",
+            "mysql_collate": "utf8mb4_unicode_ci",
+        },
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    title = Column(String(120), nullable=False)
+    config_json = Column(Text, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
 
 
 # ----------------------------------------------------------------------
@@ -399,6 +426,17 @@ def _ensure_swipe_table() -> None:
     # review queue without requiring the scraper init path to run first.
     JobSwipe.__table__.create(bind=engine, checkfirst=True)
     _SWIPE_TABLE_READY = True
+
+
+_QUERY_REPORT_TABLE_READY = False
+
+
+def _ensure_query_report_table() -> None:
+    global _QUERY_REPORT_TABLE_READY
+    if _QUERY_REPORT_TABLE_READY:
+        return
+    DashboardQueryReport.__table__.create(bind=engine, checkfirst=True)
+    _QUERY_REPORT_TABLE_READY = True
 
 
 def _serialize_swipe_job(job: Job) -> Dict[str, Any]:
@@ -953,129 +991,35 @@ def fetch_jobs_last_hours(
     min_match: Optional[int] = None,
     location_policy: Optional[str] = None,
 ) -> Dict[str, Any]:
-    all_time = hours <= 0
-    hours = 0 if all_time else max(1, min(hours, 24 * 30))
-    limit = max(1, min(limit, 5000))
-    if min_match is not None:
-        min_match = max(0, min(int(min_match), 100))
-    location_policy = (location_policy or "any").strip().lower()
-    if location_policy not in {
-        "any",
-        "remote",
-        "hybrid",
-        "onsite",
-        "unknown",
-        "non_hybrid",
-    }:
-        location_policy = "any"
-
-    now = _now_local()
-    cutoff = now - timedelta(hours=hours) if not all_time else None
-
-    # MySQL DATETIME is typically stored/returned naive.
-    # Compare using naive values to avoid tz mismatch issues.
-    cutoff_q = cutoff.replace(tzinfo=None) if cutoff else None
-    now_q = now.replace(tzinfo=None)
-
-    # Pull a bit extra; still cheap with an index on discovery_date.
-    prefetch = min(5000, max(limit * 5, 1000))
-
-    with SessionLocal() as session:
-        stmt = select(Job).where(Job.discovery_date.is_not(None))
-        if cutoff_q is not None:
-            stmt = stmt.where(Job.discovery_date >= cutoff_q)
-        if min_match is not None:
-            stmt = stmt.where(Job.ai_match_percentage.is_not(None)).where(
-                Job.ai_match_percentage >= min_match
-            )
-        if location_policy == "non_hybrid":
-            stmt = stmt.where(
-                or_(
-                    Job.ai_location_policy_match.is_(None),
-                    func.lower(Job.ai_location_policy_match) != "hybrid",
-                )
-            )
-        elif location_policy != "any":
-            stmt = stmt.where(
-                func.lower(Job.ai_location_policy_match) == location_policy
-            )
-        jobs = (
-            session.execute(
-                stmt.order_by(Job.discovery_date.desc(), Job.id.desc()).limit(prefetch)
-            )
-            .scalars()
-            .all()
-        )
-
-    out: List[Dict[str, Any]] = []
-    for j in jobs:
-        dt = j.discovery_date
-        if not dt:
-            continue
-
-        # Ensure naive math for age_hours if dt is naive (typical MySQL behavior)
-        dt_q = dt.replace(tzinfo=None)
-
-        ai_raw = (getattr(j, "ai_analysis", None) or "").strip()
-        ai_obj = _safe_json_loads(ai_raw)
-        ai_row = _job_ai_columns(j)
-
-        job_changes = (
-            session.execute(
-                select(JobChange)
-                .where(JobChange.job_id_text == j.job_id)
-                .order_by(JobChange.created_at.desc())
-            )
-            .scalars()
-            .all()
-        )
-
-        # Serialize job_changes to a list of dicts
-        job_changes_list = [
-            {
-                "id": c.id,
-                "change_type": getattr(c, "change_type", None),
-                "change_source": getattr(c, "change_source", None) or "site",
-                "created_at": (
-                    c.created_at.isoformat(sep=" ")
-                    if getattr(c, "created_at", None)
-                    else None
-                ),
-                "changed_fields": getattr(c, "changed_fields", None),
-            }
-            for c in job_changes
-        ]
-
-        out.append(
-            {
-                "id": j.id,
-                "site": (j.site or "").strip(),
-                "job_id": (j.job_id or "").strip(),
-                "title": (j.title or "").strip(),
-                "level": (j.level or "").strip(),
-                "is_active": bool(j.is_active),
-                "pay": (j.pay or "").strip(),
-                "url": (j.url or "").strip(),
-                "discovery_date": dt_q.isoformat(sep=" "),
-                "age_hours": round((now_q - dt_q).total_seconds() / 3600.0, 2),
-                "ai": ai_obj,
-                "ai_row": ai_row,
-                "ai_raw": ai_raw if not ai_obj else "",
-                "changes": job_changes_list,
-            }
-        )
-
-        if len(out) >= limit:
-            break
-
-    return {
-        "hours": hours,
-        "min_match": min_match,
-        "location_policy": location_policy,
-        "cutoff_iso": cutoff_q.isoformat() if cutoff_q else "all",
-        "returned": len(out),
-        "jobs": out,
-    }
+    return fetch_jobs_query(
+        {
+            "columns": [
+                "id",
+                "site",
+                "job_id",
+                "title",
+                "level",
+                "pay",
+                "url",
+                "discovery_date",
+                "age_hours",
+                "is_active",
+                "ai_match_percentage",
+                "ai_location_policy_match",
+                "ai_salary",
+                "latest_change_type",
+                "latest_change_at",
+            ],
+            "limit": limit,
+            "quick": {
+                "hours": "all" if hours <= 0 else hours,
+                "min_match": min_match,
+                "location_policy": location_policy or "any",
+                "text": "",
+            },
+            "filter": {"op": "and", "items": []},
+        }
+    )
 
 
 def _fmt_dt(dt: Any) -> Optional[str]:
@@ -1129,6 +1073,524 @@ def _serialize_job_detail(j: Job, changes: List[JobChange]) -> Dict[str, Any]:
             for c in changes
         ],
     }
+
+
+DEFAULT_QUERY_COLUMNS = [
+    "id",
+    "site",
+    "title",
+    "level",
+    "pay",
+    "discovery_date",
+    "is_active",
+    "ai_match_percentage",
+    "ai_location_policy_match",
+    "ai_salary",
+]
+
+RAW_QUERY_COLUMNS = ["url", "desc", "keywords", "ai_raw", "ai_json", "changes_json"]
+MAX_QUERY_LIMIT = 500
+MAX_EXPORT_LIMIT = 5000
+
+STATIC_QUERY_COLUMNS: List[Dict[str, str]] = [
+    {"key": "id", "label": "ID", "group": "Core"},
+    {"key": "site", "label": "Site", "group": "Core"},
+    {"key": "job_id", "label": "Job ID", "group": "Core"},
+    {"key": "title", "label": "Title", "group": "Core"},
+    {"key": "url", "label": "URL", "group": "Core"},
+    {"key": "level", "label": "Level", "group": "Core"},
+    {"key": "pay", "label": "Pay", "group": "Core"},
+    {"key": "discovery_date", "label": "Discovery", "group": "Core"},
+    {"key": "age_hours", "label": "Age Hours", "group": "Core"},
+    {"key": "is_active", "label": "Active", "group": "Core"},
+    {"key": "updated_at", "label": "Updated", "group": "Core"},
+    {"key": "content_hash", "label": "Content Hash", "group": "Core"},
+    {"key": "run_id", "label": "Run ID", "group": "Core"},
+    {"key": "first_seen_run_id", "label": "First Seen Run", "group": "Core"},
+    {"key": "last_seen_run_id", "label": "Last Seen Run", "group": "Core"},
+    {"key": "ai_match_percentage", "label": "AI Match %", "group": "AI"},
+    {"key": "ai_salary", "label": "AI Salary", "group": "AI"},
+    {"key": "ai_fit_summary", "label": "AI Fit Summary", "group": "AI"},
+    {"key": "ai_keywords_overlap", "label": "AI Keywords Overlap", "group": "AI"},
+    {"key": "ai_missing_keywords", "label": "AI Missing Keywords", "group": "AI"},
+    {"key": "ai_experience_match", "label": "AI Experience", "group": "AI"},
+    {"key": "ai_location_policy_match", "label": "AI Location", "group": "AI"},
+    {"key": "ai_analyzed_at", "label": "AI Analyzed", "group": "AI"},
+    {"key": "latest_change_type", "label": "Latest Change", "group": "Changes"},
+    {"key": "latest_change_source", "label": "Latest Change Source", "group": "Changes"},
+    {"key": "latest_change_at", "label": "Latest Change At", "group": "Changes"},
+    {"key": "latest_changed_fields", "label": "Latest Changed Fields", "group": "Changes"},
+    {"key": "desc", "label": "Description", "group": "Raw/Long Text"},
+    {"key": "keywords", "label": "Keywords", "group": "Raw/Long Text"},
+    {"key": "ai_raw", "label": "Raw AI Text", "group": "Raw/Long Text"},
+    {"key": "ai_json", "label": "AI JSON", "group": "Raw/Long Text"},
+    {"key": "changes_json", "label": "Changes JSON", "group": "Raw/Long Text"},
+]
+
+STATIC_QUERY_COLUMN_MAP = {item["key"]: item for item in STATIC_QUERY_COLUMNS}
+QUERY_OPERATORS = {
+    "equals",
+    "not_equals",
+    "contains",
+    "not_contains",
+    "is_empty",
+    "is_not_empty",
+    "gte",
+    "lte",
+    "between",
+}
+
+
+def _query_column_label(key: str) -> str:
+    if key.startswith("reference."):
+        return key.split(".", 1)[1]
+    return STATIC_QUERY_COLUMN_MAP.get(key, {}).get("label", key)
+
+
+def _query_column_group(key: str) -> str:
+    if key.startswith("reference."):
+        return "Reference Fields"
+    return STATIC_QUERY_COLUMN_MAP.get(key, {}).get("group", "Core")
+
+
+def _normalize_selected_columns(columns: Any) -> List[str]:
+    selected: List[str] = []
+    for key in columns if isinstance(columns, list) else DEFAULT_QUERY_COLUMNS:
+        key = str(key or "").strip()
+        if not key:
+            continue
+        if key in STATIC_QUERY_COLUMN_MAP or key.startswith("reference."):
+            if key not in selected:
+                selected.append(key)
+    return selected or list(DEFAULT_QUERY_COLUMNS)
+
+
+def _query_value_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (list, dict)):
+        return json.dumps(value, ensure_ascii=False)
+    return str(value)
+
+
+def _query_to_number(value: Any) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _query_to_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _query_rule_matches(row: Dict[str, Any], rule: Dict[str, Any]) -> bool:
+    field = str(rule.get("field") or "").strip()
+    operator = str(rule.get("operator") or "").strip()
+    if not _is_allowed_query_field(field):
+        raise ValueError(f"unsupported query field: {field}")
+    if operator not in QUERY_OPERATORS:
+        raise ValueError(f"unsupported query operator: {operator}")
+
+    actual = row.get(field)
+    actual_text = _query_value_text(actual).lower()
+    expected = rule.get("value")
+    expected_text = _query_value_text(expected).lower()
+
+    if operator == "is_empty":
+        return actual_text.strip() == ""
+    if operator == "is_not_empty":
+        return actual_text.strip() != ""
+    if operator == "contains":
+        return expected_text in actual_text
+    if operator == "not_contains":
+        return expected_text not in actual_text
+    if operator == "equals":
+        return actual_text == expected_text
+    if operator == "not_equals":
+        return actual_text != expected_text
+
+    actual_num = _query_to_number(actual)
+    if actual_num is None:
+        return False
+    if operator == "gte":
+        expected_num = _query_to_number(expected)
+        return expected_num is not None and actual_num >= expected_num
+    if operator == "lte":
+        expected_num = _query_to_number(expected)
+        return expected_num is not None and actual_num <= expected_num
+    if operator == "between":
+        bounds = expected if isinstance(expected, list) else []
+        if len(bounds) != 2:
+            return False
+        low = _query_to_number(bounds[0])
+        high = _query_to_number(bounds[1])
+        return low is not None and high is not None and low <= actual_num <= high
+    return False
+
+
+def _query_group_matches(row: Dict[str, Any], group: Any) -> bool:
+    if not isinstance(group, dict):
+        return True
+    items = group.get("items")
+    if not isinstance(items, list) or not items:
+        return True
+    op = str(group.get("op") or "and").lower()
+    if op not in {"and", "or"}:
+        raise ValueError("query group op must be and or or")
+
+    results = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if "items" in item:
+            results.append(_query_group_matches(row, item))
+        else:
+            results.append(_query_rule_matches(row, item))
+    if not results:
+        return True
+    return any(results) if op == "or" else all(results)
+
+
+def _validate_query_group(group: Any) -> None:
+    if not isinstance(group, dict):
+        return
+    op = str(group.get("op") or "and").lower()
+    if op not in {"and", "or"}:
+        raise ValueError("query group op must be and or or")
+    items = group.get("items")
+    if not isinstance(items, list):
+        return
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if "items" in item:
+            _validate_query_group(item)
+            continue
+        field = str(item.get("field") or "").strip()
+        operator = str(item.get("operator") or "").strip()
+        if not _is_allowed_query_field(field):
+            raise ValueError(f"unsupported query field: {field}")
+        if operator not in QUERY_OPERATORS:
+            raise ValueError(f"unsupported query operator: {operator}")
+
+
+def _is_allowed_query_field(field: str) -> bool:
+    return field in STATIC_QUERY_COLUMN_MAP or field.startswith("reference.")
+
+
+def _job_reference_map(j: Job) -> Dict[str, str]:
+    return {item["label"]: item["value"] for item in _job_reference_fields(j)}
+
+
+def _serialize_query_row(
+    j: Job,
+    changes: List[JobChange],
+    now_q: datetime,
+) -> Dict[str, Any]:
+    dt = j.discovery_date
+    dt_q = dt.replace(tzinfo=None) if dt else None
+    ai_raw = (getattr(j, "ai_analysis", None) or "").strip()
+    ai_obj = _safe_json_loads(ai_raw)
+    refs = _job_reference_map(j)
+    latest = changes[0] if changes else None
+
+    row: Dict[str, Any] = {
+        "id": j.id,
+        "site": (j.site or "").strip(),
+        "job_id": (j.job_id or "").strip(),
+        "title": (j.title or "").strip(),
+        "url": (j.url or "").strip(),
+        "desc": (j.desc or "").strip(),
+        "keywords": (j.keywords or "").strip(),
+        "level": (j.level or "").strip(),
+        "pay": (j.pay or "").strip(),
+        "discovery_date": dt_q.isoformat(sep=" ") if dt_q else "",
+        "age_hours": round((now_q - dt_q).total_seconds() / 3600.0, 2) if dt_q else "",
+        "is_active": bool(j.is_active),
+        "updated_at": _fmt_dt(j.updated_at) or "",
+        "content_hash": j.content_hash or "",
+        "run_id": j.run_id,
+        "first_seen_run_id": j.first_seen_run_id,
+        "last_seen_run_id": j.last_seen_run_id,
+        "ai_match_percentage": j.ai_match_percentage,
+        "ai_salary": j.ai_salary or "",
+        "ai_fit_summary": j.ai_fit_summary or "",
+        "ai_keywords_overlap": _safe_json_list(j.ai_keywords_overlap),
+        "ai_missing_keywords": _safe_json_list(j.ai_missing_keywords),
+        "ai_experience_match": j.ai_experience_match or "",
+        "ai_location_policy_match": j.ai_location_policy_match or "",
+        "ai_analyzed_at": _fmt_dt(j.ai_analyzed_at) or "",
+        "ai_raw": ai_raw if not ai_obj else "",
+        "ai_json": ai_obj or "",
+        "latest_change_type": getattr(latest, "change_type", "") if latest else "",
+        "latest_change_source": (getattr(latest, "change_source", None) or "site") if latest else "",
+        "latest_change_at": _fmt_dt(getattr(latest, "created_at", None)) if latest else "",
+        "latest_changed_fields": getattr(latest, "changed_fields", "") if latest else "",
+        "changes_json": [
+            {
+                "id": c.id,
+                "change_type": getattr(c, "change_type", None),
+                "change_source": getattr(c, "change_source", None) or "site",
+                "created_at": _fmt_dt(getattr(c, "created_at", None)),
+                "changed_fields": getattr(c, "changed_fields", None),
+            }
+            for c in changes
+        ],
+    }
+    for label, value in refs.items():
+        row[f"reference.{label}"] = value
+    return row
+
+
+def _extract_query_payload(data: Optional[Dict[str, Any]], export: bool = False) -> Dict[str, Any]:
+    payload = data or {}
+    quick = payload.get("quick") if isinstance(payload.get("quick"), dict) else {}
+    hours_raw = quick.get("hours", payload.get("hours", "48"))
+    hours = 0 if str(hours_raw).strip().lower() == "all" else _query_to_int(hours_raw, 48)
+    limit_default = MAX_EXPORT_LIMIT if export else MAX_QUERY_LIMIT
+    limit_max = MAX_EXPORT_LIMIT if export else MAX_QUERY_LIMIT
+    limit = max(1, min(_query_to_int(payload.get("limit", quick.get("limit", limit_default)), limit_default), limit_max))
+    min_match_raw = quick.get("min_match", payload.get("min_match"))
+    min_match = None if min_match_raw in {None, ""} else max(0, min(_query_to_int(min_match_raw, 0), 100))
+    location_policy = str(quick.get("location_policy", payload.get("location_policy", "any")) or "any").strip().lower()
+    if location_policy not in {"any", "remote", "hybrid", "onsite", "unknown", "non_hybrid"}:
+        location_policy = "any"
+    text_query = str(quick.get("text", payload.get("text", "")) or "").strip()
+    return {
+        "hours": hours,
+        "limit": limit,
+        "min_match": min_match,
+        "location_policy": location_policy,
+        "text": text_query,
+        "columns": _normalize_selected_columns(payload.get("columns")),
+        "filter": payload.get("filter") if isinstance(payload.get("filter"), dict) else {"op": "and", "items": []},
+    }
+
+
+def _query_jobs(payload: Optional[Dict[str, Any]], export: bool = False) -> Dict[str, Any]:
+    query = _extract_query_payload(payload, export=export)
+    all_time = query["hours"] <= 0
+    hours = 0 if all_time else max(1, min(query["hours"], 24 * 30))
+    now = _now_local()
+    now_q = now.replace(tzinfo=None)
+    cutoff = now - timedelta(hours=hours) if not all_time else None
+    cutoff_q = cutoff.replace(tzinfo=None) if cutoff else None
+
+    _ensure_reference_fields_column()
+    _validate_query_group(query["filter"])
+    with SessionLocal() as session:
+        stmt = select(Job).where(Job.discovery_date.is_not(None))
+        if cutoff_q is not None:
+            stmt = stmt.where(Job.discovery_date >= cutoff_q)
+        if query["min_match"] is not None:
+            stmt = stmt.where(Job.ai_match_percentage.is_not(None)).where(
+                Job.ai_match_percentage >= query["min_match"]
+            )
+        if query["location_policy"] == "non_hybrid":
+            stmt = stmt.where(
+                or_(
+                    Job.ai_location_policy_match.is_(None),
+                    func.lower(Job.ai_location_policy_match) != "hybrid",
+                )
+            )
+        elif query["location_policy"] != "any":
+            stmt = stmt.where(func.lower(Job.ai_location_policy_match) == query["location_policy"])
+        if query["text"]:
+            like_q = f"%{query['text'].lower()}%"
+            stmt = stmt.where(
+                or_(
+                    func.lower(Job.site).like(like_q),
+                    func.lower(Job.job_id).like(like_q),
+                    func.lower(Job.title).like(like_q),
+                    func.lower(Job.level).like(like_q),
+                    func.lower(Job.pay).like(like_q),
+                )
+            )
+
+        jobs = (
+            session.execute(
+                stmt.order_by(Job.discovery_date.desc(), Job.id.desc()).limit(MAX_EXPORT_LIMIT)
+            )
+            .scalars()
+            .all()
+        )
+
+        rows: List[Dict[str, Any]] = []
+        reference_keys = set()
+        for job in jobs:
+            changes = (
+                session.execute(
+                    select(JobChange)
+                    .where(JobChange.job_id_text == job.job_id)
+                    .where(JobChange.site == job.site)
+                    .order_by(JobChange.created_at.desc(), JobChange.id.desc())
+                    .limit(100)
+                )
+                .scalars()
+                .all()
+            )
+            row = _serialize_query_row(job, changes, now_q)
+            reference_keys.update(key for key in row if key.startswith("reference."))
+            if not _query_group_matches(row, query["filter"]):
+                continue
+            rows.append(row)
+            if len(rows) >= query["limit"]:
+                break
+
+    columns = _normalize_selected_columns(query["columns"])
+    selected_rows = [
+        {key: row.get(key, "") for key in columns}
+        for row in rows
+    ]
+    available_columns = get_query_columns(sorted(reference_keys))
+    return {
+        "hours": hours,
+        "limit": query["limit"],
+        "min_match": query["min_match"],
+        "location_policy": query["location_policy"],
+        "text": query["text"],
+        "cutoff_iso": cutoff_q.isoformat() if cutoff_q else "all",
+        "returned": len(selected_rows),
+        "columns": columns,
+        "available_columns": available_columns,
+        "jobs": selected_rows,
+    }
+
+
+def get_query_columns(reference_keys: Optional[List[str]] = None) -> List[Dict[str, str]]:
+    out = [dict(item) for item in STATIC_QUERY_COLUMNS]
+    for key in reference_keys or []:
+        if key.startswith("reference."):
+            out.append({"key": key, "label": _query_column_label(key), "group": "Reference Fields"})
+    return out
+
+
+def fetch_query_columns() -> Dict[str, Any]:
+    _ensure_reference_fields_column()
+    reference_keys = set()
+    with SessionLocal() as session:
+        jobs = (
+            session.execute(
+                select(Job.reference_fields)
+                .where(Job.reference_fields.is_not(None))
+                .order_by(Job.discovery_date.desc(), Job.id.desc())
+                .limit(1000)
+            )
+            .scalars()
+            .all()
+        )
+    for raw in jobs:
+        refs = _safe_json_loads(raw)
+        if isinstance(refs, dict):
+            for key, value in refs.items():
+                if value not in {None, ""}:
+                    reference_keys.add(f"reference.{key}")
+    return {
+        "columns": get_query_columns(sorted(reference_keys)),
+        "default_columns": DEFAULT_QUERY_COLUMNS,
+        "raw_columns": RAW_QUERY_COLUMNS,
+        "operators": sorted(QUERY_OPERATORS),
+    }
+
+
+def _format_export_value(value: Any) -> Any:
+    if isinstance(value, (list, dict)):
+        return json.dumps(value, ensure_ascii=False)
+    return value
+
+
+def export_query_jobs(payload: Optional[Dict[str, Any]], fmt: str) -> Response:
+    data = _query_jobs(payload, export=True)
+    rows = data["jobs"]
+    columns = data["columns"]
+    if fmt == "json":
+        body = json.dumps({"columns": columns, "rows": rows, "returned": data["returned"]}, ensure_ascii=False, indent=2)
+        return Response(body + "\n", mimetype="application/json")
+    if fmt != "csv":
+        raise ValueError("format must be csv or json")
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow([_query_column_label(key) for key in columns])
+    for row in rows:
+        writer.writerow([_format_export_value(row.get(key, "")) for key in columns])
+    return Response(
+        buf.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": "attachment; filename=query-builder-export.csv"},
+    )
+
+
+def fetch_jobs_query(payload: Optional[Dict[str, Any]], export: bool = False) -> Dict[str, Any]:
+    return _query_jobs(payload, export=export)
+
+
+def fetch_query_reports() -> Dict[str, Any]:
+    _ensure_query_report_table()
+    with SessionLocal() as session:
+        reports = (
+            session.execute(select(DashboardQueryReport).order_by(DashboardQueryReport.title.asc()))
+            .scalars()
+            .all()
+        )
+        return {
+            "reports": [
+                {
+                    "id": report.id,
+                    "title": report.title,
+                    "config": _safe_json_loads(report.config_json) or {},
+                    "created_at": _fmt_dt(report.created_at),
+                    "updated_at": _fmt_dt(report.updated_at),
+                }
+                for report in reports
+            ]
+        }
+
+
+def save_query_report(data: Dict[str, Any], report_id: Optional[int] = None) -> Dict[str, Any]:
+    title = str(data.get("title") or "").strip()
+    if not title:
+        raise ValueError("title is required")
+    if len(title) > 120:
+        raise ValueError("title must be 120 characters or fewer")
+    config = data.get("config")
+    if not isinstance(config, dict):
+        raise ValueError("config must be an object")
+
+    _ensure_query_report_table()
+    with SessionLocal() as session:
+        report = session.get(DashboardQueryReport, report_id) if report_id else None
+        if report is None:
+            report = DashboardQueryReport(title=title, config_json="{}")
+            session.add(report)
+        report.title = title
+        report.config_json = json.dumps(config, ensure_ascii=False, indent=2)
+        session.commit()
+        session.refresh(report)
+        return {
+            "id": report.id,
+            "title": report.title,
+            "config": _safe_json_loads(report.config_json) or {},
+            "created_at": _fmt_dt(report.created_at),
+            "updated_at": _fmt_dt(report.updated_at),
+        }
+
+
+def delete_query_report(report_id: int) -> Dict[str, Any]:
+    _ensure_query_report_table()
+    with SessionLocal() as session:
+        report = session.get(DashboardQueryReport, max(0, int(report_id or 0)))
+        if report is None:
+            return {"deleted": False}
+        session.delete(report)
+        session.commit()
+        return {"deleted": True}
 
 
 def fetch_job_lookup(query: str, limit: int = 25) -> Dict[str, Any]:
@@ -1339,6 +1801,71 @@ def api_jobs():
             location_policy=location_policy,
         )
     )
+
+
+@app.route("/api/jobs/query", methods=["POST"])
+def api_jobs_query():
+    data = request.get_json(silent=True) or {}
+    try:
+        return jsonify(fetch_jobs_query(data))
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
+    except Exception as exc:
+        return jsonify(error=str(exc)), 500
+
+
+@app.route("/api/jobs/columns")
+def api_jobs_columns():
+    try:
+        return jsonify(fetch_query_columns())
+    except Exception as exc:
+        return jsonify(error=str(exc), columns=[]), 500
+
+
+@app.route("/api/jobs/export", methods=["POST"])
+def api_jobs_export():
+    fmt = (request.args.get("format", "csv") or "csv").strip().lower()
+    data = request.get_json(silent=True) or {}
+    try:
+        return export_query_jobs(data, fmt)
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
+    except Exception as exc:
+        return jsonify(error=str(exc)), 500
+
+
+@app.route("/api/query-reports", methods=["GET", "POST"])
+def api_query_reports():
+    if request.method == "GET":
+        try:
+            return jsonify(fetch_query_reports())
+        except Exception as exc:
+            return jsonify(error=str(exc), reports=[]), 500
+
+    data = request.get_json(silent=True) or {}
+    try:
+        return jsonify(save_query_report(data))
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
+    except Exception as exc:
+        return jsonify(error=str(exc)), 500
+
+
+@app.route("/api/query-reports/<int:report_id>", methods=["PUT", "DELETE"])
+def api_query_report_detail(report_id: int):
+    if request.method == "DELETE":
+        try:
+            return jsonify(delete_query_report(report_id))
+        except Exception as exc:
+            return jsonify(error=str(exc)), 500
+
+    data = request.get_json(silent=True) or {}
+    try:
+        return jsonify(save_query_report(data, report_id=report_id))
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
+    except Exception as exc:
+        return jsonify(error=str(exc)), 500
 
 
 @app.route("/api/job-lookup")

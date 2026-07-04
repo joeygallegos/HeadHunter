@@ -11,7 +11,7 @@
   </head>
 
   <body class="bg-slate-50 text-slate-900">
-    <div class="max-w-7xl mx-auto p-4 space-y-6">
+    <div class="w-full p-4 space-y-6">
       <header class="space-y-2">
         <h1 class="text-2xl font-bold tracking-tight">Impact Dashboard</h1>
 
@@ -24,7 +24,7 @@
           <button @click="view='jobs'"
                   :class="view==='jobs' ? 'bg-indigo-600 text-white' : 'bg-white text-slate-700'"
                   class="px-3 py-2 rounded-lg border border-slate-200 text-sm">
-            Job index
+            Query Builder
           </button>
           <button @click="view='lookup'"
                   :class="view==='lookup' ? 'bg-indigo-600 text-white' : 'bg-white text-slate-700'"
@@ -157,175 +157,229 @@
         </div>
       </template>
 
-          <!-- ---------------- JOB INDEX VIEW ---------------- -->
+          <!-- ---------------- QUERY BUILDER VIEW ---------------- -->
       <template x-if="view==='jobs'">
-        <div class="space-y-4">
-
-          <section class="flex flex-col lg:flex-row lg:items-center gap-3">
-            <div class="flex items-center gap-2">
-              <label class="text-sm font-medium text-slate-700">Hours:</label>
-              <select x-model="hours"
-                      class="px-3 py-2 rounded-lg border border-slate-300 bg-white text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
-                <option value="all">All</option>
-                <option value="24">24</option>
-                <option value="48">48</option>
-                <option value="72">72</option>
-                <option value="168">168</option>
+        <div class="space-y-3">
+          <section class="bg-white border border-slate-200 p-3">
+            <div class="flex flex-wrap items-center gap-2">
+              <h2 class="text-base font-semibold text-slate-900 mr-2">Query Builder</h2>
+              <select x-model="selectedReportId" @change="loadSelectedReport()"
+                      class="min-w-48 px-3 py-2 border border-slate-300 bg-white text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
+                <option value="">Unsaved report</option>
+                <template x-for="report in queryReports" :key="report.id">
+                  <option :value="String(report.id)" x-text="report.title"></option>
+                </template>
               </select>
-
-              <label class="ml-3 text-sm font-medium text-slate-700">Limit:</label>
-              <input type="number" x-model.number="jobsLimit" min="1" max="5000"
-                     class="w-28 px-3 py-2 rounded-lg border border-slate-300 bg-white text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
-
-              <label class="ml-3 text-sm font-medium text-slate-700">Min match:</label>
-              <input type="number" x-model.number="minAiMatch" min="0" max="100" step="1"
-                     class="w-24 px-3 py-2 rounded-lg border border-slate-300 bg-white text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
-              <button @click="minAiMatch=80; loadJobs()"
-                      class="px-3 py-2 rounded-lg border border-slate-300 bg-white text-sm text-slate-700 hover:bg-slate-50">
-                80%+
-              </button>
-              <button @click="minAiMatch=90; loadJobs()"
-                      class="px-3 py-2 rounded-lg border border-slate-300 bg-white text-sm text-slate-700 hover:bg-slate-50">
-                90%+
-              </button>
-
-              <label class="ml-3 text-sm font-medium text-slate-700">Location:</label>
-              <select x-model="locationPolicy"
-                      class="px-3 py-2 rounded-lg border border-slate-300 bg-white text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
-                <option value="any">Any</option>
-                <option value="non_hybrid">Exclude hybrid</option>
-                <option value="remote">Remote only</option>
-                <option value="hybrid">Hybrid only</option>
-                <option value="onsite">Onsite only</option>
-                <option value="unknown">Unknown only</option>
-              </select>
-
+              <input type="text" x-model="reportTitle" placeholder="Short report title"
+                     class="w-56 px-3 py-2 border border-slate-300 bg-white text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
               <button @click="loadJobs()"
-                      class="ml-2 inline-flex items-center px-3 py-2 rounded-lg bg-indigo-600 text-white text-sm hover:bg-indigo-700 active:bg-indigo-800">
-                Refresh
-              </button>
+                      class="px-3 py-2 bg-indigo-600 text-white text-sm hover:bg-indigo-700">Run</button>
+              <button @click="saveReport(false)"
+                      class="px-3 py-2 border border-slate-300 bg-white text-sm text-slate-700 hover:bg-slate-50">Save</button>
+              <button @click="saveReport(true)" :disabled="!selectedReportId"
+                      class="px-3 py-2 border border-slate-300 bg-white text-sm text-slate-700 hover:bg-slate-50 disabled:opacity-40">Update</button>
+              <button @click="deleteReport()" :disabled="!selectedReportId"
+                      class="px-3 py-2 border border-red-200 bg-white text-sm text-red-700 hover:bg-red-50 disabled:opacity-40">Delete</button>
+              <button @click="exportJobs('csv')"
+                      class="px-3 py-2 border border-slate-300 bg-white text-sm text-slate-700 hover:bg-slate-50">Export CSV</button>
+              <button @click="exportJobs('json')"
+                      class="px-3 py-2 border border-slate-300 bg-white text-sm text-slate-700 hover:bg-slate-50">Export JSON</button>
+              <button @click="queryPanelOpen = !queryPanelOpen"
+                      class="ml-auto px-3 py-2 border border-slate-300 bg-white text-sm text-slate-700 hover:bg-slate-50"
+                      x-text="queryPanelOpen ? 'Hide builder' : 'Show builder'"></button>
             </div>
-
-            <div class="flex-1"></div>
-
-            <div class="flex items-center gap-2">
-              <input type="text" x-model="q" placeholder="Search site/title/level…"
-                     class="w-72 px-3 py-2 rounded-lg border border-slate-300 bg-white text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
+            <div class="mt-2 flex flex-wrap items-center gap-3 text-xs text-slate-500">
+              <span x-text="queryMessage"></span>
+              <span x-show="jobsLoaded">returned=<span x-text="jobsMeta.returned"></span></span>
+              <span x-show="jobsLoaded">cutoff=<span x-text="jobsMeta.cutoff_iso"></span></span>
+              <span x-show="jobsLoaded">columns=<span x-text="selectedColumns.length"></span></span>
             </div>
           </section>
 
-          <section class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4">
-            <div class="flex items-center justify-between">
-              <h2 class="text-sm font-semibold text-slate-800">
-                Job index <span x-text="hours === 'all' || Number(hours) <= 0 ? '(all time)' : `(last ${hours} hours)`"></span>
-              </h2>
-              <div class="text-xs text-slate-500" x-show="jobsLoaded">
-                returned=<span x-text="jobsMeta.returned"></span>,
-                min_match=<span x-text="jobsMeta.min_match ?? '-'"></span>,
-                location=<span x-text="jobsMeta.location_policy ?? 'any'"></span>,
-                parse_failures=<span x-text="jobsMeta.parse_failures"></span>,
-                cutoff=<span x-text="jobsMeta.cutoff_iso"></span>
+          <div class="grid grid-cols-1 xl:grid-cols-[340px_minmax(0,1fr)] gap-3">
+            <aside class="bg-white border border-slate-200 p-3 space-y-4" x-show="queryPanelOpen">
+              <div class="space-y-2">
+                <div class="text-sm font-semibold text-slate-800">Quick filters</div>
+                <div class="grid grid-cols-2 gap-2">
+                  <label class="text-xs text-slate-600">Hours
+                    <select x-model="hours" class="mt-1 w-full px-2 py-2 border border-slate-300 bg-white text-sm">
+                      <option value="all">All</option>
+                      <option value="24">24</option>
+                      <option value="48">48</option>
+                      <option value="72">72</option>
+                      <option value="168">168</option>
+                    </select>
+                  </label>
+                  <label class="text-xs text-slate-600">Limit
+                    <input type="number" x-model.number="jobsLimit" min="1" max="500"
+                           class="mt-1 w-full px-2 py-2 border border-slate-300 bg-white text-sm"/>
+                  </label>
+                  <label class="text-xs text-slate-600">Min match
+                    <input type="number" x-model.number="minAiMatch" min="0" max="100"
+                           class="mt-1 w-full px-2 py-2 border border-slate-300 bg-white text-sm"/>
+                  </label>
+                  <label class="text-xs text-slate-600">Location
+                    <select x-model="locationPolicy" class="mt-1 w-full px-2 py-2 border border-slate-300 bg-white text-sm">
+                      <option value="any">Any</option>
+                      <option value="non_hybrid">Exclude hybrid</option>
+                      <option value="remote">Remote only</option>
+                      <option value="hybrid">Hybrid only</option>
+                      <option value="onsite">Onsite only</option>
+                      <option value="unknown">Unknown only</option>
+                    </select>
+                  </label>
+                </div>
+                <input type="text" x-model="q" placeholder="Search site, job ID, title, level, pay"
+                       class="w-full px-3 py-2 border border-slate-300 bg-white text-sm"/>
               </div>
-            </div>
 
-            <div class="mt-3 overflow-x-auto">
-              <table class="min-w-full text-sm">
-                <thead class="text-left text-slate-600 border-b">
-                  <tr>
-                    <th class="py-2 pr-4">ID</th>
-                    <th class="py-2 pr-4">Site</th>
-                    <th class="py-2 pr-4">Title</th>
-                    <th class="py-2 pr-4">Level</th>
-                    <th class="py-2 pr-4">Pay</th>
-                    <th class="py-2 pr-4">Discovery</th>
-                    <th class="py-2 pr-4">AI</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <template x-for="row in filteredJobs()" :key="row.id">
-                    <tr class="border-b align-top">
-                      <td class="py-3 pr-4">
-                        <button type="button"
-                                class="text-indigo-700 hover:underline"
-                                @click="openJobDetail(row.id)"
-                                x-text="`ID ${row.id}`"></button>
-                      </td>
-                      <td class="py-3 pr-4 font-medium text-slate-800" x-text="row.site"></td>
+              <div class="space-y-2">
+                <div class="flex items-center justify-between gap-2">
+                  <div class="text-sm font-semibold text-slate-800">Columns</div>
+                  <input type="text" x-model="columnSearch" placeholder="Find"
+                         class="w-28 px-2 py-1 border border-slate-300 bg-white text-xs"/>
+                </div>
+                <div class="flex flex-wrap gap-1">
+                  <button @click="setDefaultColumns()" class="px-2 py-1 border border-slate-300 text-xs">Default</button>
+                  <button @click="selectAllColumns()" class="px-2 py-1 border border-slate-300 text-xs">Select all</button>
+                  <button @click="clearColumns()" class="px-2 py-1 border border-slate-300 text-xs">Clear</button>
+                  <button @click="selectRawColumns()" class="px-2 py-1 border border-slate-300 text-xs">Raw fields</button>
+                </div>
+                <div class="border border-slate-200">
+                  <div class="px-2 py-1 bg-slate-50 text-xs font-semibold text-slate-600">Selected order</div>
+                  <div class="max-h-44 overflow-auto p-2 space-y-1">
+                    <template x-for="(key, index) in selectedColumns" :key="key">
+                      <div draggable="true"
+                           @dragstart="dragColumnStart(key)"
+                           @dragover.prevent
+                           @drop.prevent="dropColumn(key)"
+                           class="flex items-center gap-1 border border-slate-200 bg-white px-2 py-1 text-xs text-slate-700 cursor-move">
+                        <span class="select-none text-slate-400" title="Drag to reorder">::</span>
+                        <span class="flex-1 truncate" x-text="columnLabel(key)"></span>
+                        <button type="button" @click="moveColumn(index, -1)" class="px-1 text-slate-500 hover:text-slate-900" title="Move left">Up</button>
+                        <button type="button" @click="moveColumn(index, 1)" class="px-1 text-slate-500 hover:text-slate-900" title="Move right">Down</button>
+                        <button type="button" @click="toggleColumn(key)" class="px-1 text-red-600" title="Remove column">x</button>
+                      </div>
+                    </template>
+                    <div class="text-xs text-slate-400" x-show="selectedColumns.length === 0">No columns selected.</div>
+                  </div>
+                </div>
+                <template x-for="group in columnGroups()" :key="group.name">
+                  <div class="border border-slate-200">
+                    <div class="px-2 py-1 bg-slate-50 text-xs font-semibold text-slate-600" x-text="group.name"></div>
+                    <div class="max-h-44 overflow-auto p-2 space-y-1">
+                      <template x-for="col in group.columns" :key="col.key">
+                        <label class="flex items-center gap-2 text-xs text-slate-700">
+                          <input type="checkbox" :checked="selectedColumns.includes(col.key)" @change="toggleColumn(col.key)">
+                          <span x-text="col.label"></span>
+                        </label>
+                      </template>
+                    </div>
+                  </div>
+                </template>
+              </div>
 
-                      <td class="py-3 pr-4">
-                        <a class="text-indigo-700 hover:underline"
-                           :href="row.url || '#'" target="_blank" rel="noreferrer"
-                           x-text="row.title || '(no title)'"></a>
-                        <div class="text-xs text-slate-500 mt-1">
-                          <span x-text="row.job_id"></span>
-                          <span class="ml-2" x-text="row.age_hours + 'h ago'"></span>
+              <div class="space-y-2">
+                <div class="flex items-center justify-between">
+                  <div class="text-sm font-semibold text-slate-800">Filters</div>
+                  <select x-model="filterRoot.op" class="px-2 py-1 border border-slate-300 bg-white text-xs uppercase">
+                    <option value="and">AND</option>
+                    <option value="or">OR</option>
+                  </select>
+                </div>
+                <div class="space-y-2">
+                  <template x-for="(item, index) in filterRoot.items" :key="item.id">
+                    <div class="border border-slate-200 p-2 space-y-2">
+                      <template x-if="!item.items">
+                        <div class="grid grid-cols-[1fr_110px_1fr_24px] gap-1">
+                          <select x-model="item.field" class="px-2 py-1 border border-slate-300 bg-white text-xs">
+                            <template x-for="col in availableColumns" :key="col.key">
+                              <option :value="col.key" x-text="col.label"></option>
+                            </template>
+                          </select>
+                          <select x-model="item.operator" class="px-2 py-1 border border-slate-300 bg-white text-xs">
+                            <template x-for="op in operators" :key="op">
+                              <option :value="op" x-text="op"></option>
+                            </template>
+                          </select>
+                          <input x-model="item.value" class="px-2 py-1 border border-slate-300 text-xs" placeholder="Value">
+                          <button @click="removeFilter(filterRoot, index)" class="text-red-600 text-xs">x</button>
                         </div>
-                      </td>
-
-                      <td class="py-3 pr-4 text-slate-700" x-text="row.level"></td>
-                      <td class="py-3 pr-4 text-slate-700">
-                        <div x-text="row.pay"></div>
-                        <div class="text-green-600"
-                             :class="row.ai_row?.salary ? 'text-green-600' : 'text-red-600'"
-                             x-text="row.ai_row?.salary ?? 'No AI salary'"></div>
-                      </td>
-
-                      <td class="py-3 pr-4 text-slate-700">
-                        <div x-text="row.discovery_date"></div>
-                        <div class="text-xs" :class="row.is_active ? 'text-green-600' : 'text-red-600'" x-text="row.is_active ? 'Active' : 'Inactive'"></div>
-                      </td>
-
-                      <td class="py-3 pr-4 text-slate-700">
-                        <template x-if="(row.ai && typeof row.ai === 'object') || row.ai_row">
-                          <div class="space-y-1">
-                            <div class="text-xs">
-                              <span class="font-semibold">match</span>:
-                              <span x-text="matchValue(row) ?? '-'"></span>
-                              <span class="ml-2 font-semibold">experience_match</span>:
-                              <span x-text="row.ai_row?.experience_match ?? row.ai?.experience_match ?? '-'"></span>
-                              <span class="ml-2 font-semibold">location</span>:
-                              <span x-text="locationValue(row) ?? '-'"></span>
+                      </template>
+                      <template x-if="item.items">
+                        <div class="space-y-2">
+                          <div class="flex items-center gap-2">
+                            <select x-model="item.op" class="px-2 py-1 border border-slate-300 bg-white text-xs uppercase">
+                              <option value="and">AND</option>
+                              <option value="or">OR</option>
+                            </select>
+                            <button @click="addFilter(item)" class="px-2 py-1 border border-slate-300 text-xs">Add filter</button>
+                            <button @click="removeFilter(filterRoot, index)" class="ml-auto text-red-600 text-xs">Remove group</button>
+                          </div>
+                          <template x-for="(child, childIndex) in item.items" :key="child.id">
+                            <div class="grid grid-cols-[1fr_110px_1fr_24px] gap-1">
+                              <select x-model="child.field" class="px-2 py-1 border border-slate-300 bg-white text-xs">
+                                <template x-for="col in availableColumns" :key="col.key">
+                                  <option :value="col.key" x-text="col.label"></option>
+                                </template>
+                              </select>
+                              <select x-model="child.operator" class="px-2 py-1 border border-slate-300 bg-white text-xs">
+                                <template x-for="op in operators" :key="op">
+                                  <option :value="op" x-text="op"></option>
+                                </template>
+                              </select>
+                              <input x-model="child.value" class="px-2 py-1 border border-slate-300 text-xs" placeholder="Value">
+                              <button @click="removeFilter(item, childIndex)" class="text-red-600 text-xs">x</button>
                             </div>
-                            <div class="text-xs text-slate-600 line-clamp-3" x-text="row.ai_row?.fit_summary ?? row.ai?.fit_summary ?? ''"></div>
-                            <button class="text-xs text-indigo-700 hover:underline"
-                                    x-show="row.ai && typeof row.ai === 'object'"
-                                    @click="row._showAi = !row._showAi">
-                              <span x-text="row._showAi ? 'Hide JSON' : 'View JSON'"></span>
-                            </button>
-                            <pre x-show="row._showAi"
-                                 class="text-xs bg-slate-50 border border-slate-200 rounded-lg p-2 overflow-auto max-h-64"
-                                 x-text="JSON.stringify(row.ai, null, 2)"></pre>
-                          </div>
-                        </template>
-
-                        <template x-if="!((row.ai && typeof row.ai === 'object') || row.ai_row) && (row.ai_raw || '').trim().length">
-                          <div class="space-y-1">
-                            <div class="text-xs text-slate-500">ai_analysis (raw)</div>
-                            <button class="text-xs text-indigo-700 hover:underline"
-                                    @click="row._showAiRaw = !row._showAiRaw">
-                              <span x-text="row._showAiRaw ? 'Hide' : 'View'"></span>
-                            </button>
-                            <pre x-show="row._showAiRaw"
-                                 class="text-xs bg-slate-50 border border-slate-200 rounded-lg p-2 overflow-auto max-h-64"
-                                 x-text="row.ai_raw"></pre>
-                          </div>
-                        </template>
-
-                        <template x-if="!((row.ai && typeof row.ai === 'object') || row.ai_row || (row.ai_raw || '').trim().length)">
-                          <div class="text-xs text-slate-400">—</div>
-                        </template>
-                      </td>
-                    </tr>
+                          </template>
+                        </div>
+                      </template>
+                    </div>
                   </template>
-                </tbody>
-              </table>
-
-              <div class="text-sm text-slate-500 py-3" x-show="jobsLoaded && filteredJobs().length === 0">
-                No rows match your filter.
+                </div>
+                <div class="flex gap-2">
+                  <button @click="addFilter(filterRoot)" class="px-2 py-1 border border-slate-300 bg-white text-xs">Add filter</button>
+                  <button @click="addGroup()" class="px-2 py-1 border border-slate-300 bg-white text-xs">Add group</button>
+                </div>
               </div>
-            </div>
-          </section>
+            </aside>
 
+            <section class="min-w-0 bg-white border border-slate-200">
+              <div class="overflow-auto max-h-[72vh]">
+                <table class="min-w-full text-xs">
+                  <thead class="sticky top-0 z-10 bg-slate-100 text-left text-slate-700 border-b border-slate-200">
+                    <tr>
+                      <template x-for="col in visibleColumns()" :key="col.key">
+                        <th class="px-2 py-2 whitespace-nowrap font-semibold" x-text="col.label"></th>
+                      </template>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <template x-for="row in jobs" :key="row.id || JSON.stringify(row)">
+                      <tr class="border-b border-slate-100 hover:bg-slate-50 align-top">
+                        <template x-for="col in visibleColumns()" :key="col.key">
+                          <td class="px-2 py-1.5 max-w-80 truncate" :title="cellText(row[col.key])">
+                            <template x-if="col.key === 'id'">
+                              <button type="button" class="text-indigo-700 hover:underline" @click="openJobDetail(row.id)" x-text="cellText(row[col.key])"></button>
+                            </template>
+                            <template x-if="col.key === 'title' && row.url">
+                              <a class="text-indigo-700 hover:underline" :href="row.url" target="_blank" rel="noreferrer" x-text="cellText(row[col.key])"></a>
+                            </template>
+                            <template x-if="!(col.key === 'id') && !(col.key === 'title' && row.url)">
+                              <span x-text="cellText(row[col.key])"></span>
+                            </template>
+                          </td>
+                        </template>
+                      </tr>
+                    </template>
+                  </tbody>
+                </table>
+                <div class="p-4 text-sm text-slate-500" x-show="jobsLoaded && jobs.length === 0">
+                  No rows match this query.
+                </div>
+              </div>
+            </section>
+          </div>
         </div>
       </template>
 
@@ -687,13 +741,26 @@
 
           // Jobs state
           jobsLoaded: false,
+          queryPanelOpen: true,
           hours: '48',
           jobsLimit: 500,
           minAiMatch: 80,
           locationPolicy: 'any',
           jobs: [],
-          jobsMeta: { returned: 0, parse_failures: 0, cutoff_iso: '', min_match: null, location_policy: 'any' },
+          jobsMeta: { returned: 0, cutoff_iso: '', min_match: null, location_policy: 'any' },
           q: '',
+          availableColumns: [],
+          defaultColumns: [],
+          rawColumns: [],
+          selectedColumns: [],
+          draggedColumnKey: '',
+          columnSearch: '',
+          operators: [],
+          filterRoot: { op: 'and', items: [] },
+          queryReports: [],
+          selectedReportId: '',
+          reportTitle: '',
+          queryMessage: '',
 
           // Lookup state
           lookupQ: '',
@@ -862,68 +929,274 @@
           },
 
           // ---------------- JOBS ----------------
+          queryPayload(limitOverride = null) {
+            return {
+              columns: this.selectedColumns.length ? this.selectedColumns : this.defaultColumns,
+              limit: limitOverride || this.jobsLimit || 500,
+              quick: {
+                hours: this.hours || 'all',
+                min_match: this.minAiMatch,
+                location_policy: this.locationPolicy || 'any',
+                text: this.q || ''
+              },
+              filter: this.filterRoot
+            };
+          },
+
           async loadJobs() {
             this.jobsLoaded = false;
-            const params = new URLSearchParams({
-              hours: String(this.hours || 'all'),
-              limit: String(this.jobsLimit || 500)
+            this.queryMessage = 'Running query...';
+            const res = await fetch('/api/jobs/query', {
+              method: 'POST',
+              headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify(this.queryPayload())
             });
-            if (this.minAiMatch !== null && this.minAiMatch !== '' && !Number.isNaN(Number(this.minAiMatch))) {
-              params.set('min_match', String(this.minAiMatch));
-            }
-            if (this.locationPolicy) {
-              params.set('location_policy', this.locationPolicy);
-            }
-            const res = await fetch(`/api/jobs?${params.toString()}`);
             const data = await res.json();
+            if (!res.ok) {
+              this.queryMessage = data.error || 'Query failed.';
+              this.jobsLoaded = true;
+              return;
+            }
             this.jobsMeta = {
               returned: data.returned || 0,
               min_match: data.min_match ?? null,
               location_policy: data.location_policy || 'any',
-              parse_failures: data.parse_failures || 0,
               cutoff_iso: data.cutoff_iso || ''
             };
-            this.jobs = (data.jobs || []).map(x => ({ ...x, _showAi: false, _showAiRaw: false }));
+            this.jobs = data.jobs || [];
+            if (Array.isArray(data.available_columns) && data.available_columns.length) {
+              this.mergeAvailableColumns(data.available_columns);
+            }
             this.jobsLoaded = true;
+            this.queryMessage = `Query returned ${this.jobs.length} row(s).`;
           },
 
-          matchValue(row) {
-            const fromColumn = row?.ai_row?.match_percentage;
-            const fromJson = row?.ai?.match_percentage;
-            const value = fromColumn ?? fromJson;
-            if (value === null || value === undefined || value === '') return null;
-            const n = Number(value);
-            return Number.isFinite(n) ? n : null;
+          async loadQueryBuilderMetadata() {
+            const [columnsRes, reportsRes] = await Promise.all([
+              fetch('/api/jobs/columns'),
+              fetch('/api/query-reports')
+            ]);
+            const columnsData = await columnsRes.json();
+            const reportsData = await reportsRes.json();
+            this.availableColumns = columnsData.columns || [];
+            this.defaultColumns = columnsData.default_columns || [];
+            this.rawColumns = columnsData.raw_columns || [];
+            this.operators = columnsData.operators || [];
+            this.selectedColumns = [...this.defaultColumns];
+            this.queryReports = reportsData.reports || [];
           },
 
-          locationValue(row) {
-            const fromColumn = row?.ai_row?.location_policy_match;
-            const fromJson = row?.ai?.location_policy_match;
-            const value = (fromColumn ?? fromJson ?? '').toString().toLowerCase().trim();
-            return value || null;
-          },
-
-          locationMatches(row) {
-            const filter = (this.locationPolicy || 'any').toLowerCase();
-            if (filter === 'any') return true;
-            const value = this.locationValue(row);
-            if (filter === 'non_hybrid') return value !== 'hybrid';
-            return value === filter;
-          },
-
-          filteredJobs() {
-            const q = (this.q || '').toLowerCase().trim();
-            const minMatch = Number(this.minAiMatch);
-            return (this.jobs || []).filter(r => {
-              if (!this.locationMatches(r)) return false;
-              if (Number.isFinite(minMatch)) {
-                const match = this.matchValue(r);
-                if (match === null || match < minMatch) return false;
+          mergeAvailableColumns(columns) {
+            const seen = new Set(this.availableColumns.map(col => col.key));
+            for (const col of columns || []) {
+              if (!seen.has(col.key)) {
+                this.availableColumns.push(col);
+                seen.add(col.key);
               }
-              if (!q) return true;
-              const hay = `${r.site||''} ${r.job_id||''} ${r.title||''} ${r.level||''} ${r.pay||''}`.toLowerCase();
-              return hay.includes(q);
+            }
+          },
+
+          columnGroups() {
+            const q = (this.columnSearch || '').toLowerCase().trim();
+            const groups = {};
+            for (const col of this.availableColumns || []) {
+              if (q && !`${col.label} ${col.key}`.toLowerCase().includes(q)) continue;
+              const name = col.group || 'Core';
+              if (!groups[name]) groups[name] = [];
+              groups[name].push(col);
+            }
+            return Object.entries(groups).map(([name, columns]) => ({ name, columns }));
+          },
+
+          visibleColumns() {
+            const byKey = new Map((this.availableColumns || []).map(col => [col.key, col]));
+            return (this.selectedColumns || []).map(key => byKey.get(key) || {key, label: key});
+          },
+
+          columnLabel(key) {
+            const found = (this.availableColumns || []).find(col => col.key === key);
+            return found?.label || key;
+          },
+
+          toggleColumn(key) {
+            if (this.selectedColumns.includes(key)) {
+              this.selectedColumns = this.selectedColumns.filter(item => item !== key);
+            } else {
+              this.selectedColumns = [...this.selectedColumns, key];
+            }
+          },
+
+          dragColumnStart(key) {
+            this.draggedColumnKey = key;
+          },
+
+          dropColumn(targetKey) {
+            const sourceKey = this.draggedColumnKey;
+            this.draggedColumnKey = '';
+            if (!sourceKey || sourceKey === targetKey) return;
+            this.reorderColumn(sourceKey, targetKey);
+          },
+
+          reorderColumn(sourceKey, targetKey) {
+            const columns = [...this.selectedColumns];
+            const from = columns.indexOf(sourceKey);
+            const to = columns.indexOf(targetKey);
+            if (from < 0 || to < 0) return;
+            const [moved] = columns.splice(from, 1);
+            columns.splice(to, 0, moved);
+            this.selectedColumns = columns;
+          },
+
+          moveColumn(index, direction) {
+            const to = index + direction;
+            if (to < 0 || to >= this.selectedColumns.length) return;
+            const columns = [...this.selectedColumns];
+            const [moved] = columns.splice(index, 1);
+            columns.splice(to, 0, moved);
+            this.selectedColumns = columns;
+          },
+
+          setDefaultColumns() {
+            this.selectedColumns = [...this.defaultColumns];
+          },
+
+          selectAllColumns() {
+            this.selectedColumns = (this.availableColumns || []).map(col => col.key);
+          },
+
+          clearColumns() {
+            this.selectedColumns = [];
+          },
+
+          selectRawColumns() {
+            this.selectedColumns = [...new Set([...this.defaultColumns, ...this.rawColumns])];
+          },
+
+          newFilter() {
+            return {
+              id: `${Date.now()}-${Math.random()}`,
+              field: (this.availableColumns[0] || {}).key || 'title',
+              operator: 'contains',
+              value: ''
+            };
+          },
+
+          addFilter(group) {
+            if (!Array.isArray(group.items)) group.items = [];
+            group.items.push(this.newFilter());
+          },
+
+          addGroup() {
+            this.filterRoot.items.push({ id: `${Date.now()}-${Math.random()}`, op: 'and', items: [this.newFilter()] });
+          },
+
+          removeFilter(group, index) {
+            group.items.splice(index, 1);
+          },
+
+          cellText(value) {
+            if (value === null || value === undefined) return '';
+            if (Array.isArray(value)) return value.map(item => typeof item === 'object' ? JSON.stringify(item) : String(item)).join(', ');
+            if (typeof value === 'object') return JSON.stringify(value);
+            return String(value);
+          },
+
+          currentReportConfig() {
+            return {
+              columns: this.selectedColumns,
+              limit: this.jobsLimit,
+              quick: {
+                hours: this.hours,
+                min_match: this.minAiMatch,
+                location_policy: this.locationPolicy,
+                text: this.q
+              },
+              filter: this.filterRoot
+            };
+          },
+
+          applyReportConfig(config) {
+            const quick = config?.quick || {};
+            this.selectedColumns = Array.isArray(config?.columns) ? [...config.columns] : [...this.defaultColumns];
+            this.jobsLimit = config?.limit || 500;
+            this.hours = quick.hours || '48';
+            this.minAiMatch = quick.min_match ?? 80;
+            this.locationPolicy = quick.location_policy || 'any';
+            this.q = quick.text || '';
+            this.filterRoot = config?.filter || { op: 'and', items: [] };
+          },
+
+          loadSelectedReport() {
+            const report = (this.queryReports || []).find(item => String(item.id) === String(this.selectedReportId));
+            if (!report) return;
+            this.reportTitle = report.title;
+            this.applyReportConfig(report.config || {});
+          },
+
+          async saveReport(updateExisting) {
+            const title = (this.reportTitle || '').trim();
+            if (!title) {
+              this.queryMessage = 'Report title is required.';
+              return;
+            }
+            const method = updateExisting && this.selectedReportId ? 'PUT' : 'POST';
+            const url = updateExisting && this.selectedReportId ? `/api/query-reports/${this.selectedReportId}` : '/api/query-reports';
+            const res = await fetch(url, {
+              method,
+              headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify({title, config: this.currentReportConfig()})
             });
+            const data = await res.json();
+            if (!res.ok) {
+              this.queryMessage = data.error || 'Could not save report.';
+              return;
+            }
+            this.selectedReportId = String(data.id);
+            await this.loadReports();
+            this.queryMessage = `Saved report "${data.title}".`;
+          },
+
+          async loadReports() {
+            const res = await fetch('/api/query-reports');
+            const data = await res.json();
+            this.queryReports = data.reports || [];
+          },
+
+          async deleteReport() {
+            if (!this.selectedReportId) return;
+            const res = await fetch(`/api/query-reports/${this.selectedReportId}`, {method: 'DELETE'});
+            const data = await res.json();
+            if (!res.ok) {
+              this.queryMessage = data.error || 'Could not delete report.';
+              return;
+            }
+            this.selectedReportId = '';
+            this.reportTitle = '';
+            await this.loadReports();
+            this.queryMessage = data.deleted ? 'Deleted report.' : 'Report was already gone.';
+          },
+
+          async exportJobs(format) {
+            const res = await fetch(`/api/jobs/export?format=${encodeURIComponent(format)}`, {
+              method: 'POST',
+              headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify(this.queryPayload(5000))
+            });
+            if (!res.ok) {
+              const data = await res.json();
+              this.queryMessage = data.error || 'Export failed.';
+              return;
+            }
+            const blob = await res.blob();
+            const href = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = href;
+            a.download = `query-builder-export.${format}`;
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            URL.revokeObjectURL(href);
+            this.queryMessage = `Exported ${format.toUpperCase()}.`;
           },
 
           async lookupJob() {
@@ -1062,8 +1335,9 @@
             }
           },
 
-          init() {
+          async init() {
             this.loadRuns();
+            await this.loadQueryBuilderMetadata();
             this.loadJobs();
             this.discoveryPoller = setInterval(() => {
               if (this.view === 'discovery' && this.discoveryAutoRefresh) {
