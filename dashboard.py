@@ -1189,6 +1189,13 @@ def _query_to_int(value: Any, default: int) -> int:
         return default
 
 
+def _normalize_min_match(value: Any) -> Optional[int]:
+    parsed = _query_to_int(value, 0)
+    if parsed <= 0:
+        return None
+    return min(parsed, 100)
+
+
 def _query_rule_matches(row: Dict[str, Any], rule: Dict[str, Any]) -> bool:
     field = str(rule.get("field") or "").strip()
     operator = str(rule.get("operator") or "").strip()
@@ -1357,7 +1364,7 @@ def _extract_query_payload(data: Optional[Dict[str, Any]], export: bool = False)
     limit_max = MAX_EXPORT_LIMIT if export else MAX_QUERY_LIMIT
     limit = max(1, min(_query_to_int(payload.get("limit", quick.get("limit", limit_default)), limit_default), limit_max))
     min_match_raw = quick.get("min_match", payload.get("min_match"))
-    min_match = None if min_match_raw in {None, ""} else max(0, min(_query_to_int(min_match_raw, 0), 100))
+    min_match = None if min_match_raw in {None, ""} else _normalize_min_match(min_match_raw)
     location_policy = str(quick.get("location_policy", payload.get("location_policy", "any")) or "any").strip().lower()
     if location_policy not in {"any", "remote", "hybrid", "onsite", "unknown", "non_hybrid"}:
         location_policy = "any"
