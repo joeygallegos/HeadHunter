@@ -8,6 +8,7 @@
     <script src="https://cdn.tailwindcss.com"></script>
     <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+    <style>[x-cloak] { display: none !important; }</style>
   </head>
 
   <body class="bg-slate-50 text-slate-900">
@@ -160,6 +161,25 @@
           <!-- ---------------- QUERY BUILDER VIEW ---------------- -->
       <template x-if="view==='jobs'">
         <div class="space-y-3">
+          <div x-show="queryLoading"
+               x-cloak
+               role="dialog"
+               aria-modal="true"
+               aria-live="polite"
+               class="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/45 px-4">
+            <div class="w-full max-w-sm border border-slate-200 bg-white p-5 shadow-xl">
+              <div class="flex items-start gap-3">
+                <div class="h-9 w-9 shrink-0 animate-spin rounded-full border-2 border-slate-200 border-t-indigo-600"></div>
+                <div>
+                  <h2 class="text-base font-semibold text-slate-950">Running query</h2>
+                  <p class="mt-1 text-sm text-slate-600">
+                    Loading results from the database. The dashboard will unlock when the query finishes.
+                  </p>
+                </div>
+              </div>
+            </div>
+          </div>
+
           <section class="bg-white border border-slate-200 p-3">
             <div class="flex flex-wrap items-center gap-2">
               <h2 class="text-base font-semibold text-slate-900 mr-2">Query Builder</h2>
@@ -189,7 +209,7 @@
                       x-text="queryPanelOpen ? 'Hide builder' : 'Show builder'"></button>
             </div>
             <div class="mt-2 flex flex-wrap items-center gap-3 text-xs text-slate-500">
-              <span x-text="queryMessage"></span>
+              <span x-text="queryMessage" :class="queryError ? 'font-medium text-red-700' : ''"></span>
               <span x-show="jobsLoaded">returned=<span x-text="jobsMeta.returned"></span></span>
               <span x-show="jobsLoaded">cutoff=<span x-text="jobsMeta.cutoff_iso"></span></span>
               <span x-show="jobsLoaded">columns=<span x-text="selectedColumns.length"></span></span>
@@ -741,6 +761,7 @@
 
           // Jobs state
           jobsLoaded: false,
+          queryLoading: false,
           queryPanelOpen: true,
           hours: '48',
           jobsLimit: 500,
@@ -761,6 +782,7 @@
           selectedReportId: '',
           reportTitle: '',
           queryMessage: '',
+          queryError: false,
 
           // Lookup state
           lookupQ: '',
@@ -943,32 +965,104 @@
             };
           },
 
+          responseDetailText(value) {
+            if (!value) return '';
+            if (typeof value === 'string') return value;
+            if (Array.isArray(value)) return value.map(item => this.responseDetailText(item)).filter(Boolean).join('; ');
+            if (typeof value === 'object') return JSON.stringify(value);
+            return String(value);
+          },
+
+          cleanResponseText(text) {
+            return (text || '')
+              .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+              .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+              .replace(/<[^>]+>/g, ' ')
+              .replace(/\s+/g, ' ')
+              .trim()
+              .slice(0, 1000);
+          },
+
+          async readResponseBody(res) {
+            const text = await res.text();
+            if (!text) return {};
+            try {
+              return JSON.parse(text);
+            } catch (err) {
+              return {error: this.cleanResponseText(text) || res.statusText || 'Non-JSON response'};
+            }
+          },
+
+          formatQueryError(res, data) {
+            const status = `${res.status || 'HTTP'} ${res.statusText || 'error'}`.trim();
+            const detail = this.responseDetailText(data?.error || data?.details || data?.message);
+            return detail
+              ? `An error occurred (${status}). ${detail}`
+              : `An error occurred (${status}).`;
+          },
+
+          sleep(ms) {
+            return new Promise(resolve => window.setTimeout(resolve, ms));
+          },
+
+          async pollQueryJob(queryId, pollAfterMs = 1000) {
+            let waitMs = pollAfterMs || 1000;
+            while (true) {
+              await this.sleep(waitMs);
+              const res = await fetch(`/api/jobs/query/${encodeURIComponent(queryId)}`);
+              const data = await this.readResponseBody(res);
+              if (res.status === 202 && data.status === 'running') {
+                waitMs = data.poll_after_ms || waitMs;
+                this.queryMessage = `Running query... ${data.age_seconds || 0}s`;
+                continue;
+              }
+              if (!res.ok) {
+                throw new Error(this.formatQueryError(res, data));
+              }
+              return data;
+            }
+          },
+
           async loadJobs() {
             this.jobsLoaded = false;
+            this.queryLoading = true;
+            this.queryError = false;
             this.queryMessage = 'Running query...';
-            const res = await fetch('/api/jobs/query', {
-              method: 'POST',
-              headers: {'Content-Type': 'application/json'},
-              body: JSON.stringify(this.queryPayload())
-            });
-            const data = await res.json();
-            if (!res.ok) {
-              this.queryMessage = data.error || 'Query failed.';
+            try {
+              const res = await fetch('/api/jobs/query?background=1', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(this.queryPayload())
+              });
+              let data = await this.readResponseBody(res);
+              if (res.status === 202 && data.query_id) {
+                data = await this.pollQueryJob(data.query_id, data.poll_after_ms);
+              } else if (!res.ok) {
+                this.queryError = true;
+                this.queryMessage = this.formatQueryError(res, data);
+                this.jobsLoaded = true;
+                return;
+              }
+              this.jobsMeta = {
+                returned: data.returned || 0,
+                min_match: data.min_match ?? null,
+                location_policy: data.location_policy || 'any',
+                cutoff_iso: data.cutoff_iso || ''
+              };
+              this.jobs = data.jobs || [];
+              if (Array.isArray(data.available_columns) && data.available_columns.length) {
+                this.mergeAvailableColumns(data.available_columns);
+              }
               this.jobsLoaded = true;
-              return;
+              this.queryMessage = `Query returned ${this.jobs.length} row(s).`;
+            } catch (err) {
+              this.queryError = true;
+              this.jobsLoaded = true;
+              const message = err?.message || 'Query failed.';
+              this.queryMessage = message.startsWith('An error occurred') ? message : `An error occurred. ${message}`;
+            } finally {
+              this.queryLoading = false;
             }
-            this.jobsMeta = {
-              returned: data.returned || 0,
-              min_match: data.min_match ?? null,
-              location_policy: data.location_policy || 'any',
-              cutoff_iso: data.cutoff_iso || ''
-            };
-            this.jobs = data.jobs || [];
-            if (Array.isArray(data.available_columns) && data.available_columns.length) {
-              this.mergeAvailableColumns(data.available_columns);
-            }
-            this.jobsLoaded = true;
-            this.queryMessage = `Query returned ${this.jobs.length} row(s).`;
           },
 
           async loadQueryBuilderMetadata() {

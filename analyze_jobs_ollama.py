@@ -88,8 +88,11 @@ MAX_JOB_DESC_TOKENS = int(os.getenv("MAX_JOB_DESC_TOKENS", "700"))
 MAX_RESUME_TOKENS = int(os.getenv("MAX_RESUME_TOKENS", "500"))
 OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "2048"))
 OLLAMA_NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT", "300"))
+AI_THINKING_RETRY_NUM_PREDICT = max(
+    OLLAMA_NUM_PREDICT,
+    int(os.getenv("AI_THINKING_RETRY_NUM_PREDICT", str(OLLAMA_NUM_PREDICT * 3))),
+)
 OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "30m")
-OLLAMA_THINK = os.getenv("OLLAMA_THINK", "false").lower() == "true"
 KEYWORD_LIST_LIMIT = int(os.getenv("AI_KEYWORD_LIST_LIMIT", "5"))
 FIT_SUMMARY_MAX_CHARS = int(os.getenv("AI_FIT_SUMMARY_MAX_CHARS", "400"))
 AI_CONCURRENCY = max(1, int(os.getenv("AI_CONCURRENCY", "2")))
@@ -103,6 +106,23 @@ AI_MAX_ATTEMPTS = max(1, int(os.getenv("AI_MAX_ATTEMPTS", "4")))
 AI_SECOND_PASS_REVIEW = os.getenv("AI_SECOND_PASS_REVIEW", "true").lower() == "true"
 AI_REVIEW_MIN_MATCH = int(os.getenv("AI_REVIEW_MIN_MATCH", "60"))
 AI_REVIEW_MAX_MATCH = int(os.getenv("AI_REVIEW_MAX_MATCH", "89"))
+
+
+def parse_ollama_think(value: str) -> Any:
+    """Parse Ollama's boolean or level-based thinking control."""
+    normalized = (value or "").strip().lower()
+    if normalized in {"", "0", "false", "no", "off"}:
+        return False
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"low", "medium", "high", "max"}:
+        return normalized
+    raise ValueError(
+        "OLLAMA_THINK must be one of false, true, low, medium, high, or max"
+    )
+
+
+OLLAMA_THINK = parse_ollama_think(os.getenv("OLLAMA_THINK", "false"))
 
 REQUIRED_KEYS = {
     "match_percentage",
@@ -166,20 +186,42 @@ class JobResult:
     index: int
 
 
+class OllamaEmptyContentError(RuntimeError):
+    """Raised when Ollama returns reasoning text but no final answer."""
+
+    def __init__(self, done_reason: Any, thinking_chars: int, eval_count: Any) -> None:
+        self.done_reason = done_reason
+        self.thinking_chars = thinking_chars
+        self.eval_count = eval_count
+        super().__init__(
+            "Ollama returned empty message.content "
+            f"(done_reason={done_reason!r}, thinking_chars={thinking_chars}, "
+            f"eval_count={eval_count!r})."
+        )
+
+
 # -------------------------------
 # Logging
 # -------------------------------
+def _console_safe_line(line: str) -> str:
+    """Return text that can be written to the current Windows console encoding."""
+    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+    return line.encode(encoding, errors="replace").decode(encoding, errors="replace")
+
+
 def log(msg: str) -> None:
     """Print a timestamped message and append it to the configured log file."""
     ts = datetime.now().strftime("%H:%M:%S")
     line = f"[{ts}] {msg}"
-    print(line)
+    try:
+        print(line)
+    except UnicodeEncodeError:
+        print(_console_safe_line(line))
     try:
         with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write(line + "\n")
     except Exception:
         pass
-
 
 def _handle_sigint(signum, frame) -> None:
     """Force immediate process exit on Ctrl+C to avoid thread-pool hangs."""
@@ -216,7 +258,7 @@ def get_thread_llm() -> ChatOllama:
     return llm
 
 
-def invoke_ollama_json(messages: list) -> str:
+def invoke_ollama_json(messages: list, num_predict: Optional[int] = None) -> str:
     """Call Ollama directly so socket timeout failures return to the worker."""
     wire_messages = []
     for msg in messages:
@@ -225,6 +267,7 @@ def invoke_ollama_json(messages: list) -> str:
             role = "system"
         wire_messages.append({"role": role, "content": str(msg.content)})
 
+    effective_num_predict = num_predict or OLLAMA_NUM_PREDICT
     payload = {
         "model": OLLAMA_MODEL,
         "messages": wire_messages,
@@ -234,7 +277,7 @@ def invoke_ollama_json(messages: list) -> str:
         "keep_alive": OLLAMA_KEEP_ALIVE,
         "options": {
             "num_ctx": OLLAMA_NUM_CTX,
-            "num_predict": OLLAMA_NUM_PREDICT,
+            "num_predict": effective_num_predict,
             "temperature": 0.2,
         },
     }
@@ -269,10 +312,10 @@ def invoke_ollama_json(messages: list) -> str:
         thinking = message.get("thinking")
         thinking_len = len(thinking) if isinstance(thinking, str) else 0
         done_reason = data.get("done_reason")
-        raise RuntimeError(
-            "Ollama returned empty message.content "
-            f"(done_reason={done_reason!r}, thinking_chars={thinking_len}). "
-            "For reasoning models, keep OLLAMA_THINK=false or increase OLLAMA_NUM_PREDICT."
+        raise OllamaEmptyContentError(
+            done_reason=done_reason,
+            thinking_chars=thinking_len,
+            eval_count=data.get("eval_count"),
         )
     return content
 
@@ -433,16 +476,22 @@ def _token_like_chunks(text: str) -> List[str]:
 
 
 def _is_counted_token(chunk: str) -> bool:
-    """Return whether a chunk should count against a rough token budget."""
+    # Return whether a chunk should count against a rough token budget.
     return bool(chunk and not chunk.isspace())
 
 
+def token_budget_label(max_tokens: int) -> str:
+    """Return the startup-log label for an approximate prompt budget."""
+    if max_tokens <= 0:
+        return "full"
+    return f"~{max_tokens} tokens"
+
 def truncate_to_token_budget(text: str, max_tokens: int) -> Tuple[str, int, bool]:
-    """Trim text to a rough token budget and report original size/truncation."""
+    """Trim text only when max_tokens is positive; zero keeps full text."""
     cleaned = clean_text(text)
     if max_tokens <= 0:
         original_tokens = _estimate_token_count(cleaned)
-        return "", original_tokens, original_tokens > 0
+        return cleaned, original_tokens, False
 
     chunks = _token_like_chunks(cleaned)
     original_tokens = sum(1 for chunk in chunks if _is_counted_token(chunk))
@@ -685,6 +734,18 @@ def ai_changed_fields(update_params: Dict[str, Any], current_pay: str) -> str:
     return ",".join(fields)
 
 
+
+def should_expand_thinking_budget(
+    exc: OllamaEmptyContentError, current_num_predict: int
+) -> bool:
+    """Return whether a reasoning-only response should get a larger retry."""
+    return (
+        exc.done_reason == "length"
+        and exc.thinking_chars > 0
+        and current_num_predict < AI_THINKING_RETRY_NUM_PREDICT
+    )
+
+
 def analyze_job_worker(resume_text: str, task: JobTask, index: int) -> JobResult:
     """Run LLM analysis for one job and return normalized worker output."""
     if not task.title and not task.desc:
@@ -709,12 +770,13 @@ def analyze_job_worker(resume_text: str, task: JobTask, index: int) -> JobResult
     data: Dict[str, Any] = {}
     ok = False
     current_msgs = list(msgs)
+    current_num_predict = OLLAMA_NUM_PREDICT
 
     for attempt in range(1, AI_MAX_ATTEMPTS + 1):
         raw = ""
+        t0 = time.time()
         try:
-            t0 = time.time()
-            raw = invoke_ollama_json(current_msgs)
+            raw = invoke_ollama_json(current_msgs, num_predict=current_num_predict)
             took += time.time() - t0
             parsed = parse_json_strict(raw) or {}
             ok, why = validate_schema(parsed)
@@ -724,12 +786,23 @@ def analyze_job_worker(resume_text: str, task: JobTask, index: int) -> JobResult
             detail = f"attempt {attempt}: {why}; {_payload_debug(parsed, raw)}"
             attempts.append(detail)
             current_msgs = msgs + [HumanMessage(content=repair_prompt(raw))]
+        except OllamaEmptyContentError as e:
+            took += time.time() - t0
+            detail = f"attempt {attempt}: {e}"
+            if should_expand_thinking_budget(e, current_num_predict) and attempt < AI_MAX_ATTEMPTS:
+                current_num_predict = AI_THINKING_RETRY_NUM_PREDICT
+                detail += f"; retrying with num_predict={current_num_predict}"
+                attempts.append(detail)
+                warnings.append(detail)
+                current_msgs = list(msgs)
+                continue
+            attempts.append(detail)
+            current_msgs = msgs + [HumanMessage(content=fresh_retry_prompt(str(e)))]
         except Exception as e:
-            took += time.time() - t0 if "t0" in locals() else 0.0
+            took += time.time() - t0
             detail = f"attempt {attempt}: {e}"
             attempts.append(detail)
             current_msgs = msgs + [HumanMessage(content=fresh_retry_prompt(str(e)))]
-
     if not ok:
         error_text = " | ".join(attempts)
         return JobResult(
@@ -817,10 +890,10 @@ def main() -> None:
         f"Model={OLLAMA_MODEL} | ONLY_EMPTY={ONLY_EMPTY} | SITE_FILTER='{SITE_FILTER}' | LIMIT={LIMIT} | REDO={args.redo if args.redo is not None else 'off'}"
     )
     log(
-        f"Prompt budgets: resume~{MAX_RESUME_TOKENS} tokens | job_desc~{MAX_JOB_DESC_TOKENS} tokens"
+        f"Prompt budgets: resume={token_budget_label(MAX_RESUME_TOKENS)} | job_desc={token_budget_label(MAX_JOB_DESC_TOKENS)}"
     )
     log(
-        f"Ollama options: num_ctx={OLLAMA_NUM_CTX} | num_predict={OLLAMA_NUM_PREDICT} | keep_alive={OLLAMA_KEEP_ALIVE}"
+        f"Ollama options: think={OLLAMA_THINK!r} | num_ctx={OLLAMA_NUM_CTX} | num_predict={OLLAMA_NUM_PREDICT} | thinking_retry_num_predict={AI_THINKING_RETRY_NUM_PREDICT} | keep_alive={OLLAMA_KEEP_ALIVE}"
     )
     log(
         f"Parallelism: workers={AI_CONCURRENCY} | max_inflight={AI_MAX_INFLIGHT} | progress_every={AI_BATCH_LOG_EVERY}"
@@ -1085,3 +1158,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

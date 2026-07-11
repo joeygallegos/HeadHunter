@@ -11,8 +11,11 @@ import sys
 import urllib.parse
 import csv
 import io
+import threading
+import time
+import uuid
 from collections import defaultdict, OrderedDict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from flask import Flask, Response, jsonify, render_template, request
@@ -29,6 +32,7 @@ from sqlalchemy import (
     or_,
     select,
     text as sa_text,
+    tuple_,
 )
 
 try:
@@ -1091,6 +1095,11 @@ DEFAULT_QUERY_COLUMNS = [
 RAW_QUERY_COLUMNS = ["url", "desc", "keywords", "ai_raw", "ai_json", "changes_json"]
 MAX_QUERY_LIMIT = 500
 MAX_EXPORT_LIMIT = 5000
+QUERY_JOB_DIR = os.getenv("DASH_QUERY_JOB_DIR", os.path.join(OUTPUT_DIR, "dashboard_query_jobs"))
+QUERY_JOB_TTL_SEC = max(60, int(os.getenv("DASH_QUERY_JOB_TTL_SEC", "3600")))
+QUERY_JOB_POLL_MS = max(250, int(os.getenv("DASH_QUERY_JOB_POLL_MS", "1000")))
+_QUERY_JOB_THREADS: Dict[str, threading.Thread] = {}
+_QUERY_JOB_THREADS_LOCK = threading.Lock()
 
 STATIC_QUERY_COLUMNS: List[Dict[str, str]] = [
     {"key": "id", "label": "ID", "group": "Core"},
@@ -1264,6 +1273,43 @@ def _query_group_matches(row: Dict[str, Any], group: Any) -> bool:
     return any(results) if op == "or" else all(results)
 
 
+def _query_group_has_rules(group: Any) -> bool:
+    if not isinstance(group, dict):
+        return False
+    items = group.get("items")
+    if not isinstance(items, list):
+        return False
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if "items" in item:
+            if _query_group_has_rules(item):
+                return True
+            continue
+        if str(item.get("field") or "").strip():
+            return True
+    return False
+
+
+def _query_group_fields(group: Any) -> set[str]:
+    fields: set[str] = set()
+    if not isinstance(group, dict):
+        return fields
+    items = group.get("items")
+    if not isinstance(items, list):
+        return fields
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if "items" in item:
+            fields.update(_query_group_fields(item))
+            continue
+        field = str(item.get("field") or "").strip()
+        if field:
+            fields.add(field)
+    return fields
+
+
 def _validate_query_group(group: Any) -> None:
     if not isinstance(group, dict):
         return
@@ -1293,6 +1339,45 @@ def _is_allowed_query_field(field: str) -> bool:
 
 def _job_reference_map(j: Job) -> Dict[str, str]:
     return {item["label"]: item["value"] for item in _job_reference_fields(j)}
+
+
+def _changes_by_job(session: Any, jobs: List[Job], per_job_limit: int = 100) -> Dict[tuple[str, str], List[JobChange]]:
+    pairs = [((job.site or ""), (job.job_id or "")) for job in jobs]
+    pairs = [(site, job_id) for site, job_id in pairs if site and job_id]
+    if not pairs:
+        return {}
+
+    job_pks = [job.id for job in jobs if job.id is not None]
+    valid_pairs = set(pairs)
+    conditions = [tuple_(JobChange.site, JobChange.job_id_text).in_(pairs)]
+    if job_pks:
+        conditions.append(JobChange.job_pk.in_(job_pks))
+
+    changes = (
+        session.execute(
+            select(JobChange)
+            .where(or_(*conditions))
+            .order_by(JobChange.created_at.desc(), JobChange.id.desc())
+        )
+        .scalars()
+        .all()
+    )
+
+    grouped: Dict[tuple[str, str], List[JobChange]] = defaultdict(list)
+    for change in changes:
+        key = ((change.site or ""), (change.job_id_text or ""))
+        if key not in valid_pairs:
+            continue
+        bucket = grouped[key]
+        if len(bucket) < per_job_limit:
+            bucket.append(change)
+    return grouped
+
+
+def _query_needs_changes(columns: List[str], filter_group: Any) -> bool:
+    fields = set(columns)
+    fields.update(_query_group_fields(filter_group))
+    return any(field.startswith("latest_") or field == "changes_json" for field in fields)
 
 
 def _serialize_query_row(
@@ -1382,6 +1467,10 @@ def _extract_query_payload(data: Optional[Dict[str, Any]], export: bool = False)
 
 def _query_jobs(payload: Optional[Dict[str, Any]], export: bool = False) -> Dict[str, Any]:
     query = _extract_query_payload(payload, export=export)
+    columns = _normalize_selected_columns(query["columns"])
+    has_row_filter = _query_group_has_rules(query["filter"])
+    needs_changes = _query_needs_changes(columns, query["filter"])
+    db_limit = MAX_EXPORT_LIMIT if has_row_filter else query["limit"]
     all_time = query["hours"] <= 0
     hours = 0 if all_time else max(1, min(query["hours"], 24 * 30))
     now = _now_local()
@@ -1422,7 +1511,7 @@ def _query_jobs(payload: Optional[Dict[str, Any]], export: bool = False) -> Dict
 
         jobs = (
             session.execute(
-                stmt.order_by(Job.discovery_date.desc(), Job.id.desc()).limit(MAX_EXPORT_LIMIT)
+                stmt.order_by(Job.discovery_date.desc(), Job.id.desc()).limit(db_limit)
             )
             .scalars()
             .all()
@@ -1430,18 +1519,9 @@ def _query_jobs(payload: Optional[Dict[str, Any]], export: bool = False) -> Dict
 
         rows: List[Dict[str, Any]] = []
         reference_keys = set()
+        changes_by_job = _changes_by_job(session, jobs) if needs_changes else {}
         for job in jobs:
-            changes = (
-                session.execute(
-                    select(JobChange)
-                    .where(JobChange.job_id_text == job.job_id)
-                    .where(JobChange.site == job.site)
-                    .order_by(JobChange.created_at.desc(), JobChange.id.desc())
-                    .limit(100)
-                )
-                .scalars()
-                .all()
-            )
+            changes = changes_by_job.get(((job.site or ""), (job.job_id or "")), [])
             row = _serialize_query_row(job, changes, now_q)
             reference_keys.update(key for key in row if key.startswith("reference."))
             if not _query_group_matches(row, query["filter"]):
@@ -1450,7 +1530,6 @@ def _query_jobs(payload: Optional[Dict[str, Any]], export: bool = False) -> Dict
             if len(rows) >= query["limit"]:
                 break
 
-    columns = _normalize_selected_columns(query["columns"])
     selected_rows = [
         {key: row.get(key, "") for key in columns}
         for row in rows
@@ -1536,6 +1615,146 @@ def export_query_jobs(payload: Optional[Dict[str, Any]], fmt: str) -> Response:
 
 def fetch_jobs_query(payload: Optional[Dict[str, Any]], export: bool = False) -> Dict[str, Any]:
     return _query_jobs(payload, export=export)
+
+
+def _query_job_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _query_job_path(query_id: str) -> str:
+    safe_id = re.sub(r"[^a-f0-9]", "", str(query_id or "").lower())
+    if not safe_id or safe_id != query_id:
+        raise ValueError("invalid query job id")
+    return os.path.join(QUERY_JOB_DIR, f"{safe_id}.json")
+
+
+def _write_query_job_state(query_id: str, state: Dict[str, Any]) -> None:
+    path = _query_job_path(query_id)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    write_json(path, state)
+
+
+def _read_query_job_state(query_id: str) -> Optional[Dict[str, Any]]:
+    try:
+        data = read_json_file(_query_job_path(query_id), None)
+    except ValueError:
+        raise
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _cleanup_query_jobs() -> None:
+    try:
+        os.makedirs(QUERY_JOB_DIR, exist_ok=True)
+        now = time.time()
+        for name in os.listdir(QUERY_JOB_DIR):
+            if not name.endswith(".json"):
+                continue
+            path = os.path.join(QUERY_JOB_DIR, name)
+            try:
+                if now - os.path.getmtime(path) > QUERY_JOB_TTL_SEC:
+                    os.remove(path)
+            except OSError:
+                continue
+    except OSError:
+        return
+
+
+def _run_query_job(query_id: str, payload: Dict[str, Any]) -> None:
+    try:
+        result = fetch_jobs_query(payload)
+        _write_query_job_state(
+            query_id,
+            {
+                "query_id": query_id,
+                "status": "complete",
+                "created_at": _query_job_now_iso(),
+                "completed_at": _query_job_now_iso(),
+                "result": result,
+            },
+        )
+    except ValueError as exc:
+        _write_query_job_state(
+            query_id,
+            {
+                "query_id": query_id,
+                "status": "failed",
+                "http_status": 400,
+                "error": str(exc),
+                "completed_at": _query_job_now_iso(),
+            },
+        )
+    except Exception as exc:
+        _write_query_job_state(
+            query_id,
+            {
+                "query_id": query_id,
+                "status": "failed",
+                "http_status": 500,
+                "error": str(exc),
+                "completed_at": _query_job_now_iso(),
+            },
+        )
+    finally:
+        with _QUERY_JOB_THREADS_LOCK:
+            _QUERY_JOB_THREADS.pop(query_id, None)
+
+
+def start_query_job(payload: Dict[str, Any]) -> Dict[str, Any]:
+    _cleanup_query_jobs()
+    query_id = uuid.uuid4().hex
+    state = {
+        "query_id": query_id,
+        "status": "running",
+        "created_at": _query_job_now_iso(),
+        "created_at_epoch": time.time(),
+        "poll_after_ms": QUERY_JOB_POLL_MS,
+    }
+    _write_query_job_state(query_id, state)
+    thread = threading.Thread(target=_run_query_job, args=(query_id, payload), daemon=True)
+    with _QUERY_JOB_THREADS_LOCK:
+        _QUERY_JOB_THREADS[query_id] = thread
+    thread.start()
+    return state
+
+
+def fetch_query_job_state(query_id: str) -> tuple[Dict[str, Any], int]:
+    state = _read_query_job_state(query_id)
+    if state is None:
+        return {"error": "query job not found"}, 404
+    if state.get("status") == "running":
+        created = float(state.get("created_at_epoch") or time.time())
+        age_seconds = max(0, int(time.time() - created))
+        if age_seconds > QUERY_JOB_TTL_SEC:
+            failed = {
+                "query_id": query_id,
+                "status": "failed",
+                "http_status": 504,
+                "error": f"query job expired after {QUERY_JOB_TTL_SEC} seconds",
+                "completed_at": _query_job_now_iso(),
+            }
+            _write_query_job_state(query_id, failed)
+            return failed, 504
+        return {
+            "query_id": query_id,
+            "status": "running",
+            "age_seconds": age_seconds,
+            "poll_after_ms": QUERY_JOB_POLL_MS,
+        }, 202
+    if state.get("status") == "failed":
+        return {
+            "query_id": query_id,
+            "status": "failed",
+            "error": state.get("error") or "query failed",
+        }, int(state.get("http_status") or 500)
+    if state.get("status") == "complete":
+        result = state.get("result") if isinstance(state.get("result"), dict) else {}
+        result = dict(result)
+        result["query_id"] = query_id
+        result["status"] = "complete"
+        return result, 200
+    return {"error": "query job state is invalid"}, 500
 
 
 def fetch_query_reports() -> Dict[str, Any]:
@@ -1813,8 +2032,26 @@ def api_jobs():
 @app.route("/api/jobs/query", methods=["POST"])
 def api_jobs_query():
     data = request.get_json(silent=True) or {}
+    background = str(request.args.get("background", "")).strip().lower() in {"1", "true", "yes"}
+    if background:
+        try:
+            state = start_query_job(data)
+            return jsonify(state), 202
+        except Exception as exc:
+            return jsonify(error=str(exc)), 500
     try:
         return jsonify(fetch_jobs_query(data))
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
+    except Exception as exc:
+        return jsonify(error=str(exc)), 500
+
+
+@app.route("/api/jobs/query/<query_id>")
+def api_jobs_query_status(query_id: str):
+    try:
+        data, status = fetch_query_job_state(query_id)
+        return jsonify(data), status
     except ValueError as exc:
         return jsonify(error=str(exc)), 400
     except Exception as exc:
