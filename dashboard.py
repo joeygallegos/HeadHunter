@@ -1662,6 +1662,8 @@ def _cleanup_query_jobs() -> None:
 
 
 def _run_query_job(query_id: str, payload: Dict[str, Any]) -> None:
+    started_state = _read_query_job_state(query_id) or {}
+    created_at = started_state.get("created_at") or _query_job_now_iso()
     try:
         result = fetch_jobs_query(payload)
         _write_query_job_state(
@@ -1669,8 +1671,9 @@ def _run_query_job(query_id: str, payload: Dict[str, Any]) -> None:
             {
                 "query_id": query_id,
                 "status": "complete",
-                "created_at": _query_job_now_iso(),
+                "created_at": created_at,
                 "completed_at": _query_job_now_iso(),
+                "message": "Query complete.",
                 "result": result,
             },
         )
@@ -1681,8 +1684,10 @@ def _run_query_job(query_id: str, payload: Dict[str, Any]) -> None:
                 "query_id": query_id,
                 "status": "failed",
                 "http_status": 400,
+                "created_at": created_at,
                 "error": str(exc),
                 "completed_at": _query_job_now_iso(),
+                "message": "Query failed.",
             },
         )
     except Exception as exc:
@@ -1692,8 +1697,10 @@ def _run_query_job(query_id: str, payload: Dict[str, Any]) -> None:
                 "query_id": query_id,
                 "status": "failed",
                 "http_status": 500,
+                "created_at": created_at,
                 "error": str(exc),
                 "completed_at": _query_job_now_iso(),
+                "message": "Query failed.",
             },
         )
     finally:
@@ -1710,6 +1717,8 @@ def start_query_job(payload: Dict[str, Any]) -> Dict[str, Any]:
         "created_at": _query_job_now_iso(),
         "created_at_epoch": time.time(),
         "poll_after_ms": QUERY_JOB_POLL_MS,
+        "ttl_seconds": QUERY_JOB_TTL_SEC,
+        "message": "Query queued.",
     }
     _write_query_job_state(query_id, state)
     thread = threading.Thread(target=_run_query_job, args=(query_id, payload), daemon=True)
@@ -1722,7 +1731,12 @@ def start_query_job(payload: Dict[str, Any]) -> Dict[str, Any]:
 def fetch_query_job_state(query_id: str) -> tuple[Dict[str, Any], int]:
     state = _read_query_job_state(query_id)
     if state is None:
-        return {"error": "query job not found"}, 404
+        return {
+            "query_id": query_id,
+            "status": "not_found",
+            "error": "query job not found",
+            "message": "Query job was not found.",
+        }, 404
     if state.get("status") == "running":
         created = float(state.get("created_at_epoch") or time.time())
         age_seconds = max(0, int(time.time() - created))
@@ -1731,28 +1745,39 @@ def fetch_query_job_state(query_id: str) -> tuple[Dict[str, Any], int]:
                 "query_id": query_id,
                 "status": "failed",
                 "http_status": 504,
+                "created_at": state.get("created_at") or "",
                 "error": f"query job expired after {QUERY_JOB_TTL_SEC} seconds",
                 "completed_at": _query_job_now_iso(),
+                "message": "Query expired.",
             }
             _write_query_job_state(query_id, failed)
             return failed, 504
         return {
             "query_id": query_id,
             "status": "running",
+            "created_at": state.get("created_at") or "",
             "age_seconds": age_seconds,
             "poll_after_ms": QUERY_JOB_POLL_MS,
+            "ttl_seconds": QUERY_JOB_TTL_SEC,
+            "message": f"Query running for {age_seconds}s.",
         }, 202
     if state.get("status") == "failed":
         return {
             "query_id": query_id,
             "status": "failed",
+            "created_at": state.get("created_at") or "",
+            "completed_at": state.get("completed_at") or "",
             "error": state.get("error") or "query failed",
+            "message": state.get("message") or "Query failed.",
         }, int(state.get("http_status") or 500)
     if state.get("status") == "complete":
         result = state.get("result") if isinstance(state.get("result"), dict) else {}
         result = dict(result)
         result["query_id"] = query_id
         result["status"] = "complete"
+        result["created_at"] = state.get("created_at") or ""
+        result["completed_at"] = state.get("completed_at") or ""
+        result["message"] = state.get("message") or "Query complete."
         return result, 200
     return {"error": "query job state is invalid"}, 500
 

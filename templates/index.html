@@ -172,8 +172,9 @@
                 <div class="h-9 w-9 shrink-0 animate-spin rounded-full border-2 border-slate-200 border-t-indigo-600"></div>
                 <div>
                   <h2 class="text-base font-semibold text-slate-950">Running query</h2>
-                  <p class="mt-1 text-sm text-slate-600">
-                    Loading results from the database. The dashboard will unlock when the query finishes.
+                  <p class="mt-1 text-sm text-slate-600" x-text="queryMessage || 'Loading results from the database.'"></p>
+                  <p class="mt-2 font-mono text-xs text-slate-400" x-show="activeQueryId">
+                    id=<span x-text="queryDebugId()"></span>
                   </p>
                 </div>
               </div>
@@ -213,6 +214,7 @@
               <span x-show="jobsLoaded">returned=<span x-text="jobsMeta.returned"></span></span>
               <span x-show="jobsLoaded">cutoff=<span x-text="jobsMeta.cutoff_iso"></span></span>
               <span x-show="jobsLoaded">columns=<span x-text="selectedColumns.length"></span></span>
+              <span x-show="activeQueryId && !jobsLoaded">query=<span class="font-mono" x-text="queryDebugId()"></span></span>
             </div>
           </section>
 
@@ -783,6 +785,9 @@
           reportTitle: '',
           queryMessage: '',
           queryError: false,
+          activeQueryId: '',
+          queryRunToken: 0,
+          queryPollTimeoutMs: 0,
 
           // Lookup state
           lookupQ: '',
@@ -1005,15 +1010,58 @@
             return new Promise(resolve => window.setTimeout(resolve, ms));
           },
 
-          async pollQueryJob(queryId, pollAfterMs = 1000) {
-            let waitMs = pollAfterMs || 1000;
+          queryDebugId() {
+            return this.activeQueryId ? this.activeQueryId.slice(0, 8) : '';
+          },
+
+          queryStatusText(data, fallback = 'Running query...') {
+            const message = data?.message || fallback;
+            const age = Number(data?.age_seconds);
+            const id = data?.query_id ? String(data.query_id).slice(0, 8) : this.queryDebugId();
+            const parts = [message];
+            if (Number.isFinite(age)) parts.push(`elapsed=${age}s`);
+            if (id) parts.push(`id=${id}`);
+            return parts.join(' ');
+          },
+
+          async pollQueryJob(queryId, pollAfterMs = 1000, runToken = this.queryRunToken, ttlSeconds = null) {
+            let waitMs = Math.max(250, Number(pollAfterMs) || 1000);
+            const startedAt = Date.now();
+            let maxPollMs = ((Number(ttlSeconds) || 3600) * 1000) + 10000;
+            let networkFailures = 0;
             while (true) {
+              if (runToken !== this.queryRunToken || queryId !== this.activeQueryId) {
+                return {stale: true};
+              }
+              if (Date.now() - startedAt > maxPollMs) {
+                throw new Error(`Query ${String(queryId).slice(0, 8)} timed out while polling.`);
+              }
               await this.sleep(waitMs);
-              const res = await fetch(`/api/jobs/query/${encodeURIComponent(queryId)}`);
+              if (runToken !== this.queryRunToken || queryId !== this.activeQueryId) {
+                return {stale: true};
+              }
+              let res;
+              try {
+                res = await fetch(`/api/jobs/query/${encodeURIComponent(queryId)}`);
+                networkFailures = 0;
+              } catch (err) {
+                networkFailures += 1;
+                if (networkFailures <= 3) {
+                  this.queryMessage = `Network issue while polling query ${String(queryId).slice(0, 8)}; retry ${networkFailures}/3...`;
+                  await this.sleep(1000 * networkFailures);
+                  continue;
+                }
+                throw new Error(`Polling failed after ${networkFailures} network errors. ${err?.message || err}`);
+              }
               const data = await this.readResponseBody(res);
+              if (runToken !== this.queryRunToken || queryId !== this.activeQueryId) {
+                return {stale: true};
+              }
               if (res.status === 202 && data.status === 'running') {
-                waitMs = data.poll_after_ms || waitMs;
-                this.queryMessage = `Running query... ${data.age_seconds || 0}s`;
+                waitMs = Math.max(250, Number(data.poll_after_ms) || waitMs);
+                if (data.ttl_seconds) maxPollMs = (Number(data.ttl_seconds) * 1000) + 10000;
+                this.queryPollTimeoutMs = maxPollMs;
+                this.queryMessage = this.queryStatusText(data);
                 continue;
               }
               if (!res.ok) {
@@ -1024,6 +1072,10 @@
           },
 
           async loadJobs() {
+            const runToken = this.queryRunToken + 1;
+            this.queryRunToken = runToken;
+            this.activeQueryId = '';
+            this.queryPollTimeoutMs = 0;
             this.jobsLoaded = false;
             this.queryLoading = true;
             this.queryError = false;
@@ -1036,13 +1088,19 @@
               });
               let data = await this.readResponseBody(res);
               if (res.status === 202 && data.query_id) {
-                data = await this.pollQueryJob(data.query_id, data.poll_after_ms);
+                if (runToken !== this.queryRunToken) return;
+                this.activeQueryId = data.query_id;
+                this.queryPollTimeoutMs = ((Number(data.ttl_seconds) || 3600) * 1000) + 10000;
+                this.queryMessage = this.queryStatusText(data, 'Query queued.');
+                data = await this.pollQueryJob(data.query_id, data.poll_after_ms, runToken, data.ttl_seconds);
+                if (data?.stale) return;
               } else if (!res.ok) {
                 this.queryError = true;
                 this.queryMessage = this.formatQueryError(res, data);
                 this.jobsLoaded = true;
                 return;
               }
+              if (runToken !== this.queryRunToken) return;
               this.jobsMeta = {
                 returned: data.returned || 0,
                 min_match: data.min_match ?? null,
@@ -1054,14 +1112,17 @@
                 this.mergeAvailableColumns(data.available_columns);
               }
               this.jobsLoaded = true;
-              this.queryMessage = `Query returned ${this.jobs.length} row(s).`;
+              this.queryMessage = `Query complete. Returned ${this.jobs.length} row(s).`;
             } catch (err) {
+              if (runToken !== this.queryRunToken) return;
               this.queryError = true;
               this.jobsLoaded = true;
               const message = err?.message || 'Query failed.';
               this.queryMessage = message.startsWith('An error occurred') ? message : `An error occurred. ${message}`;
             } finally {
-              this.queryLoading = false;
+              if (runToken === this.queryRunToken) {
+                this.queryLoading = false;
+              }
             }
           },
 
