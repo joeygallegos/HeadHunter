@@ -34,6 +34,7 @@ from sqlalchemy import (
     text as sa_text,
     tuple_,
 )
+from sqlalchemy.exc import IntegrityError
 
 try:
     from zoneinfo import ZoneInfo
@@ -1816,13 +1817,44 @@ def save_query_report(data: Dict[str, Any], report_id: Optional[int] = None) -> 
 
     _ensure_query_report_table()
     with SessionLocal() as session:
-        report = session.get(DashboardQueryReport, report_id) if report_id else None
+        if report_id:
+            report = session.get(DashboardQueryReport, report_id)
+            if report is None:
+                raise ValueError("report not found")
+            duplicate = (
+                session.execute(
+                    select(DashboardQueryReport)
+                    .where(DashboardQueryReport.title == title)
+                    .where(DashboardQueryReport.id != report_id)
+                    .limit(1)
+                )
+                .scalars()
+                .first()
+            )
+            if duplicate is not None:
+                raise ValueError("report title already exists")
+        else:
+            # Treat "Save" on an existing title as a replace/update so changing
+            # filters or column order does not hit the unique title constraint.
+            report = (
+                session.execute(
+                    select(DashboardQueryReport)
+                    .where(DashboardQueryReport.title == title)
+                    .limit(1)
+                )
+                .scalars()
+                .first()
+            )
         if report is None:
             report = DashboardQueryReport(title=title, config_json="{}")
             session.add(report)
         report.title = title
         report.config_json = json.dumps(config, ensure_ascii=False, indent=2)
-        session.commit()
+        try:
+            session.commit()
+        except IntegrityError as exc:
+            session.rollback()
+            raise ValueError("report title already exists") from exc
         session.refresh(report)
         return {
             "id": report.id,
