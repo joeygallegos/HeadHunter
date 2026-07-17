@@ -181,42 +181,179 @@
             </div>
           </div>
 
-          <section class="bg-white border border-slate-200 p-3">
-            <div class="flex flex-wrap items-center gap-2">
-              <h2 class="text-base font-semibold text-slate-900 mr-2">Query Builder</h2>
-              <select x-model="selectedReportId" @change="loadSelectedReport()"
-                      class="min-w-48 px-3 py-2 border border-slate-300 bg-white text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
-                <option value="">Unsaved report</option>
-                <template x-for="report in queryReports" :key="report.id">
-                  <option :value="String(report.id)" x-text="report.title"></option>
-                </template>
-              </select>
-              <input type="text" x-model="reportTitle" placeholder="Short report title"
-                     class="w-56 px-3 py-2 border border-slate-300 bg-white text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
-              <button @click="loadJobs()"
-                      class="px-3 py-2 bg-indigo-600 text-white text-sm hover:bg-indigo-700">Run</button>
-              <button @click="saveReport(false)"
-                      class="px-3 py-2 border border-slate-300 bg-white text-sm text-slate-700 hover:bg-slate-50">Save</button>
-              <button @click="saveReport(true)" :disabled="!selectedReportId"
-                      class="px-3 py-2 border border-slate-300 bg-white text-sm text-slate-700 hover:bg-slate-50 disabled:opacity-40">Update</button>
-              <button @click="deleteReport()" :disabled="!selectedReportId"
-                      class="px-3 py-2 border border-red-200 bg-white text-sm text-red-700 hover:bg-red-50 disabled:opacity-40">Delete</button>
-              <button @click="exportJobs('csv')"
-                      class="px-3 py-2 border border-slate-300 bg-white text-sm text-slate-700 hover:bg-slate-50">Export CSV</button>
-              <button @click="exportJobs('json')"
-                      class="px-3 py-2 border border-slate-300 bg-white text-sm text-slate-700 hover:bg-slate-50">Export JSON</button>
-              <button @click="queryPanelOpen = !queryPanelOpen"
-                      class="ml-auto px-3 py-2 border border-slate-300 bg-white text-sm text-slate-700 hover:bg-slate-50"
-                      x-text="queryPanelOpen ? 'Hide builder' : 'Show builder'"></button>
-            </div>
-            <div class="mt-2 flex flex-wrap items-center gap-3 text-xs text-slate-500">
-              <span x-text="queryMessage" :class="queryError ? 'font-medium text-red-700' : ''"></span>
-              <span x-show="jobsLoaded">returned=<span x-text="jobsMeta.returned"></span></span>
-              <span x-show="jobsLoaded">cutoff=<span x-text="jobsMeta.cutoff_iso"></span></span>
-              <span x-show="jobsLoaded">columns=<span x-text="selectedColumns.length"></span></span>
-              <span x-show="activeQueryId && !jobsLoaded">query=<span class="font-mono" x-text="queryDebugId()"></span></span>
+          <section class="bg-white border border-slate-200 p-3 sm:p-4">
+            <div class="flex flex-col gap-4">
+              <!-- Keep the page title and builder visibility separate from report actions. -->
+              <div class="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+                <div>
+                  <h2 class="text-base font-semibold text-slate-900">Query Builder</h2>
+                  <p class="mt-0.5 text-xs text-slate-500">Run a query, then save its filters and column layout for later.</p>
+                </div>
+                <button @click="queryPanelOpen = !queryPanelOpen"
+                        class="w-full px-3 py-2 border border-slate-300 bg-white text-sm text-slate-700 hover:bg-slate-50 sm:w-auto"
+                        :aria-expanded="queryPanelOpen"
+                        x-text="queryPanelOpen ? 'Hide builder' : 'Show builder'"></button>
+              </div>
+
+              <!-- The picker owns report identity; the badge reflects the current save state. -->
+              <div class="grid gap-3 lg:grid-cols-[minmax(240px,1fr)_auto] lg:items-end">
+                <div class="min-w-0">
+                  <label for="query-report-picker" class="text-xs font-medium text-slate-600">Saved report</label>
+                  <div class="mt-1 flex flex-col gap-2 sm:flex-row sm:items-center">
+                    <select id="query-report-picker"
+                            x-model="reportPickerId"
+                            @change="requestReportSelection($event.target.value)"
+                            :disabled="reportBusy"
+                            class="min-w-0 w-full px-3 py-2 border border-slate-300 bg-white text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 disabled:bg-slate-100 disabled:text-slate-500 sm:max-w-md">
+                      <option value="">Unsaved report</option>
+                      <template x-for="report in queryReports" :key="report.id">
+                        <option :value="String(report.id)" x-text="report.title"></option>
+                      </template>
+                    </select>
+                    <span class="inline-flex w-fit items-center gap-1.5 whitespace-nowrap text-xs font-medium"
+                          :class="reportStateClass()">
+                      <span class="h-1.5 w-1.5 rounded-full bg-current" aria-hidden="true"></span>
+                      <span x-text="reportStateLabel()"></span>
+                    </span>
+                  </div>
+                </div>
+
+                <!-- Primary actions stay visible; less common report operations live in the disclosure. -->
+                <div class="grid grid-cols-2 gap-2 sm:flex sm:flex-wrap sm:justify-end">
+                  <button @click="loadJobs()" :disabled="queryLoading"
+                          class="px-3 py-2 bg-indigo-600 text-white text-sm font-medium hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-50">
+                    Run query
+                  </button>
+                  <button @click="selectedReportId ? saveReportChanges() : openReportDialog('create')"
+                          :disabled="reportBusy || (selectedReportId && !reportIsDirty())"
+                          class="px-3 py-2 border border-indigo-200 bg-indigo-50 text-sm font-medium text-indigo-700 hover:bg-indigo-100 disabled:cursor-not-allowed disabled:border-slate-200 disabled:bg-slate-50 disabled:text-slate-400"
+                          x-text="reportBusy ? 'Saving…' : (selectedReportId ? 'Save changes' : 'Save report')">
+                  </button>
+
+                  <!-- Report actions only apply after a saved report has been selected. -->
+                  <div class="relative col-span-2 sm:col-span-1" x-show="selectedReportId">
+                    <button @click="reportMenuOpen = !reportMenuOpen"
+                            @keydown.escape.stop="reportMenuOpen = false"
+                            :aria-expanded="reportMenuOpen"
+                            :disabled="reportBusy"
+                            aria-controls="query-report-actions"
+                            class="w-full px-3 py-2 border border-slate-300 bg-white text-sm text-slate-700 hover:bg-slate-50 disabled:opacity-50">
+                      Report actions
+                    </button>
+                    <div id="query-report-actions"
+                         x-show="reportMenuOpen"
+                         x-cloak
+                         @click.outside="reportMenuOpen = false"
+                         @keydown.escape.stop="reportMenuOpen = false"
+                         aria-label="Report actions"
+                         class="absolute right-0 z-20 mt-1 w-44 border border-slate-200 bg-white p-1 shadow-lg">
+                      <button @click="openReportDialog('copy')"
+                              class="block w-full px-3 py-2 text-left text-sm text-slate-700 hover:bg-slate-50">Save as new</button>
+                      <button @click="openReportDialog('rename')"
+                              class="block w-full px-3 py-2 text-left text-sm text-slate-700 hover:bg-slate-50">Rename</button>
+                      <button @click="openDeleteReportDialog()"
+                              class="block w-full px-3 py-2 text-left text-sm text-red-700 hover:bg-red-50">Delete</button>
+                    </div>
+                  </div>
+
+                  <!-- Export remains independent from saving a reusable report configuration. -->
+                  <div class="col-span-2 flex min-w-0" role="group" aria-label="Export query results">
+                    <button @click="exportJobs('csv')"
+                            class="flex-1 px-3 py-2 border border-slate-300 bg-white text-sm text-slate-700 hover:bg-slate-50 sm:flex-none">Export CSV</button>
+                    <button @click="exportJobs('json')"
+                            class="flex-1 px-3 py-2 border-y border-r border-slate-300 bg-white text-sm text-slate-700 hover:bg-slate-50 sm:flex-none">Export JSON</button>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Report feedback is separate from query execution feedback below it. -->
+              <div x-show="reportMessage"
+                   x-cloak
+                   :role="reportError ? 'alert' : 'status'"
+                   aria-live="polite"
+                   class="border-l-2 px-3 py-2 text-sm"
+                   :class="reportError ? 'border-red-400 bg-red-50 text-red-700' : 'border-indigo-400 bg-indigo-50 text-indigo-700'"
+                   x-text="reportMessage"></div>
+
+              <div class="flex flex-wrap items-center gap-3 border-t border-slate-100 pt-3 text-xs text-slate-500">
+                <span x-text="queryMessage" :class="queryError ? 'font-medium text-red-700' : ''"></span>
+                <span x-show="jobsLoaded">returned=<span x-text="jobsMeta.returned"></span></span>
+                <span x-show="jobsLoaded">cutoff=<span x-text="jobsMeta.cutoff_iso"></span></span>
+                <span x-show="jobsLoaded">columns=<span x-text="selectedColumns.length"></span></span>
+                <span x-show="activeQueryId && !jobsLoaded">query=<span class="font-mono" x-text="queryDebugId()"></span></span>
+              </div>
             </div>
           </section>
+
+          <!-- One shared naming dialog handles create, copy, and rename modes. -->
+          <!-- Native dialogs provide focus trapping and Escape-to-close without another library. -->
+          <dialog x-ref="reportNameDialog"
+                  @close="reportDialogError = ''"
+                  class="w-[calc(100%-2rem)] max-w-md border border-slate-200 bg-white p-0 text-slate-900 shadow-xl backdrop:bg-slate-950/45">
+            <form @submit.prevent="submitReportDialog()" class="p-5">
+              <div class="flex items-start justify-between gap-4">
+                <div>
+                  <h3 class="text-base font-semibold" x-text="reportDialogTitle()"></h3>
+                  <p class="mt-1 text-sm text-slate-600" x-text="reportDialogDescription()"></p>
+                </div>
+                <button type="button" @click="$refs.reportNameDialog.close()" :disabled="reportBusy"
+                        class="h-8 w-8 shrink-0 text-xl leading-none text-slate-400 hover:text-slate-700 disabled:opacity-40"
+                        aria-label="Close dialog">×</button>
+              </div>
+              <label for="query-report-title" class="mt-5 block text-sm font-medium text-slate-700">Report name</label>
+              <input id="query-report-title"
+                     x-ref="reportTitleInput"
+                     x-model="reportTitle"
+                     maxlength="120"
+                     required
+                     :disabled="reportBusy"
+                     class="mt-1 w-full px-3 py-2 border border-slate-300 bg-white text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 disabled:bg-slate-100"
+                     placeholder="For example, Recent remote matches" />
+              <div class="mt-1 flex items-start justify-between gap-3 text-xs">
+                <span class="text-red-700" role="alert" x-text="reportDialogError"></span>
+                <span class="ml-auto whitespace-nowrap text-slate-400"><span x-text="reportTitle.length"></span>/120</span>
+              </div>
+              <div class="mt-5 flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+                <button type="button" @click="$refs.reportNameDialog.close()" :disabled="reportBusy"
+                        class="px-3 py-2 border border-slate-300 bg-white text-sm text-slate-700 hover:bg-slate-50 disabled:opacity-40">Cancel</button>
+                <button type="submit" :disabled="reportBusy || !reportTitle.trim()"
+                        class="px-3 py-2 bg-indigo-600 text-sm font-medium text-white hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-50"
+                        x-text="reportBusy ? 'Saving…' : reportDialogActionLabel()"></button>
+              </div>
+            </form>
+          </dialog>
+
+          <!-- Switching reports is destructive when the current builder differs from its snapshot. -->
+          <dialog x-ref="discardReportDialog"
+                  @close="pendingReportId = ''; reportPickerId = selectedReportId"
+                  class="w-[calc(100%-2rem)] max-w-md border border-slate-200 bg-white p-0 text-slate-900 shadow-xl backdrop:bg-slate-950/45">
+            <div class="p-5">
+              <h3 class="text-base font-semibold">Discard unsaved changes?</h3>
+              <p class="mt-2 text-sm text-slate-600">Loading another report will replace the filters and columns currently in the builder.</p>
+              <div class="mt-5 flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+                <button type="button" @click="cancelReportSelection()"
+                        class="px-3 py-2 border border-slate-300 bg-white text-sm text-slate-700 hover:bg-slate-50">Keep editing</button>
+                <button type="button" @click="discardChangesAndLoadReport()"
+                        class="px-3 py-2 bg-red-600 text-sm font-medium text-white hover:bg-red-700">Discard and switch</button>
+              </div>
+            </div>
+          </dialog>
+
+          <!-- Deleting a preset never deletes jobs or clears the current builder. -->
+          <dialog x-ref="deleteReportDialog"
+                  class="w-[calc(100%-2rem)] max-w-md border border-slate-200 bg-white p-0 text-slate-900 shadow-xl backdrop:bg-slate-950/45">
+            <div class="p-5">
+              <h3 class="text-base font-semibold">Delete saved report?</h3>
+              <p class="mt-2 text-sm text-slate-600">This permanently deletes <span class="font-medium text-slate-900" x-text="activeReportTitle()"></span>. Your jobs are not affected.</p>
+              <div class="mt-5 flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+                <button type="button" @click="$refs.deleteReportDialog.close()" :disabled="reportBusy"
+                        class="px-3 py-2 border border-slate-300 bg-white text-sm text-slate-700 hover:bg-slate-50 disabled:opacity-40">Cancel</button>
+                <button type="button" @click="deleteReport()" :disabled="reportBusy"
+                        class="px-3 py-2 bg-red-600 text-sm font-medium text-white hover:bg-red-700 disabled:cursor-not-allowed disabled:opacity-50"
+                        x-text="reportBusy ? 'Deleting…' : 'Delete report'"></button>
+              </div>
+            </div>
+          </dialog>
 
           <div class="grid grid-cols-1 xl:grid-cols-[340px_minmax(0,1fr)] gap-3">
             <aside class="bg-white border border-slate-200 p-3 space-y-4" x-show="queryPanelOpen">
@@ -268,19 +405,22 @@
                   <button @click="selectRawColumns()" class="px-2 py-1 border border-slate-300 text-xs">Raw fields</button>
                 </div>
                 <div class="border border-slate-200">
-                  <div class="px-2 py-1 bg-slate-50 text-xs font-semibold text-slate-600">Selected order</div>
+                  <div class="flex items-center justify-between gap-2 px-2 py-1 bg-slate-50 text-xs font-semibold text-slate-600">
+                    <span>Selected order</span>
+                    <span class="font-normal text-slate-500"><span x-text="selectedColumns.length"></span> selected</span>
+                  </div>
                   <div class="max-h-44 overflow-auto p-2 space-y-1">
                     <template x-for="(key, index) in selectedColumns" :key="key">
                       <div draggable="true"
                            @dragstart="dragColumnStart(key)"
                            @dragover.prevent
                            @drop.prevent="dropColumn(key)"
-                           class="flex items-center gap-1 border border-slate-200 bg-white px-2 py-1 text-xs text-slate-700 cursor-move">
+                           class="flex items-center gap-1 border border-slate-200 bg-white px-2 py-1 text-xs text-slate-700 cursor-move hover:border-indigo-200 hover:bg-indigo-50/30">
                         <span class="select-none text-slate-400" title="Drag to reorder">::</span>
                         <span class="flex-1 truncate" x-text="columnLabel(key)"></span>
-                        <button type="button" @click="moveColumn(index, -1)" class="px-1 text-slate-500 hover:text-slate-900" title="Move left">Up</button>
-                        <button type="button" @click="moveColumn(index, 1)" class="px-1 text-slate-500 hover:text-slate-900" title="Move right">Down</button>
-                        <button type="button" @click="toggleColumn(key)" class="px-1 text-red-600" title="Remove column">x</button>
+                        <button type="button" @click="moveColumn(index, -1)" class="h-6 w-6 text-slate-500 hover:text-slate-900 disabled:opacity-30" :disabled="index === 0" title="Move up" aria-label="Move column up">↑</button>
+                        <button type="button" @click="moveColumn(index, 1)" class="h-6 w-6 text-slate-500 hover:text-slate-900 disabled:opacity-30" :disabled="index === selectedColumns.length - 1" title="Move down" aria-label="Move column down">↓</button>
+                        <button type="button" @click="toggleColumn(key)" class="h-6 w-6 text-red-600 hover:text-red-800" title="Remove column" aria-label="Remove column">×</button>
                       </div>
                     </template>
                     <div class="text-xs text-slate-400" x-show="selectedColumns.length === 0">No columns selected.</div>
@@ -304,16 +444,19 @@
               <div class="space-y-2">
                 <div class="flex items-center justify-between">
                   <div class="text-sm font-semibold text-slate-800">Filters</div>
-                  <select x-model="filterRoot.op" class="px-2 py-1 border border-slate-300 bg-white text-xs uppercase">
-                    <option value="and">AND</option>
-                    <option value="or">OR</option>
-                  </select>
+                  <div class="flex items-center gap-2">
+                    <button type="button" @click="clearFilters()" class="px-2 py-1 border border-slate-300 bg-white text-xs text-slate-700 hover:bg-slate-50" x-show="filterRoot.items.length">Clear filters</button>
+                    <select x-model="filterRoot.op" class="px-2 py-1 border border-slate-300 bg-white text-xs uppercase">
+                      <option value="and">AND</option>
+                      <option value="or">OR</option>
+                    </select>
+                  </div>
                 </div>
                 <div class="space-y-2">
                   <template x-for="(item, index) in filterRoot.items" :key="item.id">
-                    <div class="border border-slate-200 p-2 space-y-2">
+                    <div class="border border-slate-200 bg-slate-50/40 p-2 space-y-2">
                       <template x-if="!item.items">
-                        <div class="grid grid-cols-[1fr_110px_1fr_24px] gap-1">
+                        <div class="grid grid-cols-[minmax(0,1fr)_110px_minmax(0,1fr)_32px] gap-1">
                           <select x-model="item.field" class="px-2 py-1 border border-slate-300 bg-white text-xs">
                             <template x-for="col in availableColumns" :key="col.key">
                               <option :value="col.key" x-text="col.label"></option>
@@ -325,7 +468,7 @@
                             </template>
                           </select>
                           <input x-model="item.value" class="px-2 py-1 border border-slate-300 text-xs" placeholder="Value">
-                          <button @click="removeFilter(filterRoot, index)" class="text-red-600 text-xs">x</button>
+                          <button type="button" @click="removeFilter(filterRoot, index)" class="border border-red-100 bg-white text-red-600 text-xs hover:bg-red-50" title="Remove filter" aria-label="Remove filter">×</button>
                         </div>
                       </template>
                       <template x-if="item.items">
@@ -339,7 +482,7 @@
                             <button @click="removeFilter(filterRoot, index)" class="ml-auto text-red-600 text-xs">Remove group</button>
                           </div>
                           <template x-for="(child, childIndex) in item.items" :key="child.id">
-                            <div class="grid grid-cols-[1fr_110px_1fr_24px] gap-1">
+                            <div class="grid grid-cols-[minmax(0,1fr)_110px_minmax(0,1fr)_32px] gap-1">
                               <select x-model="child.field" class="px-2 py-1 border border-slate-300 bg-white text-xs">
                                 <template x-for="col in availableColumns" :key="col.key">
                                   <option :value="col.key" x-text="col.label"></option>
@@ -351,7 +494,7 @@
                                 </template>
                               </select>
                               <input x-model="child.value" class="px-2 py-1 border border-slate-300 text-xs" placeholder="Value">
-                              <button @click="removeFilter(item, childIndex)" class="text-red-600 text-xs">x</button>
+                              <button type="button" @click="removeFilter(item, childIndex)" class="border border-red-100 bg-white text-red-600 text-xs hover:bg-red-50" title="Remove filter" aria-label="Remove filter">×</button>
                             </div>
                           </template>
                         </div>
@@ -380,15 +523,15 @@
                     <template x-for="row in jobs" :key="row.id || JSON.stringify(row)">
                       <tr class="border-b border-slate-100 hover:bg-slate-50 align-top">
                         <template x-for="col in visibleColumns()" :key="col.key">
-                          <td class="px-2 py-1.5 max-w-80 truncate" :title="cellText(row[col.key])">
+                          <td class="px-2 py-1.5 max-w-80" :title="cellText(row[col.key])">
                             <template x-if="col.key === 'id'">
                               <button type="button" class="text-indigo-700 hover:underline" @click="openJobDetail(row.id)" x-text="cellText(row[col.key])"></button>
                             </template>
                             <template x-if="col.key === 'title' && row.url">
-                              <a class="text-indigo-700 hover:underline" :href="row.url" target="_blank" rel="noreferrer" x-text="cellText(row[col.key])"></a>
+                              <a class="block max-w-80 truncate text-indigo-700 hover:underline" :href="row.url" target="_blank" rel="noreferrer" x-text="cellText(row[col.key])"></a>
                             </template>
                             <template x-if="!(col.key === 'id') && !(col.key === 'title' && row.url)">
-                              <span x-text="cellText(row[col.key])"></span>
+                              <span class="block max-w-80" :class="isLongCell(col.key) ? 'max-h-16 overflow-hidden whitespace-normal leading-5' : 'truncate'" x-text="cellText(row[col.key])"></span>
                             </template>
                           </td>
                         </template>
@@ -396,6 +539,12 @@
                     </template>
                   </tbody>
                 </table>
+                <div class="p-4 text-sm text-slate-500" x-show="queryLoading">
+                  Loading query results...
+                </div>
+                <div class="p-4 text-sm text-red-700" x-show="queryError">
+                  <span x-text="queryMessage"></span>
+                </div>
                 <div class="p-4 text-sm text-slate-500" x-show="jobsLoaded && jobs.length === 0">
                   No rows match this query.
                 </div>
@@ -780,9 +929,25 @@
           columnSearch: '',
           operators: [],
           filterRoot: { op: 'and', items: [] },
+
+          // Saved report state. selectedReportId is the report currently loaded
+          // into the builder; reportPickerId may briefly hold a requested switch.
           queryReports: [],
           selectedReportId: '',
+          reportPickerId: '',
           reportTitle: '',
+
+          // The serialized snapshot is the baseline used to detect unsaved edits.
+          reportSnapshot: '',
+          pendingReportId: '',
+
+          // Dialog, feedback, and busy state are kept separate from query state.
+          reportDialogMode: 'create',
+          reportDialogError: '',
+          reportMessage: '',
+          reportError: false,
+          reportBusy: false,
+          reportMenuOpen: false,
           queryMessage: '',
           queryError: false,
           activeQueryId: '',
@@ -1139,6 +1304,7 @@
             this.operators = columnsData.operators || [];
             this.selectedColumns = [...this.defaultColumns];
             this.queryReports = reportsData.reports || [];
+            this.reportSnapshot = this.reportConfigSnapshot();
           },
 
           mergeAvailableColumns(columns) {
@@ -1227,6 +1393,10 @@
             this.selectedColumns = [...new Set([...this.defaultColumns, ...this.rawColumns])];
           },
 
+          isLongCell(key) {
+            return ['desc', 'keywords', 'ai_raw', 'ai_json', 'changes_json'].includes(key) || String(key || '').startsWith('reference.');
+          },
+
           newFilter() {
             return {
               id: `${Date.now()}-${Math.random()}`,
@@ -1249,6 +1419,10 @@
             group.items.splice(index, 1);
           },
 
+          clearFilters() {
+            this.filterRoot = { op: 'and', items: [] };
+          },
+
           cellText(value) {
             if (value === null || value === undefined) return '';
             if (Array.isArray(value)) return value.map(item => typeof item === 'object' ? JSON.stringify(item) : String(item)).join(', ');
@@ -1256,9 +1430,11 @@
             return String(value);
           },
 
+          // ---------------- SAVED REPORTS ----------------
+          // Build the complete report payload from the controls currently on screen.
           currentReportConfig() {
             return {
-              columns: this.selectedColumns,
+              columns: [...this.selectedColumns],
               limit: this.jobsLimit,
               quick: {
                 hours: this.hours,
@@ -1270,6 +1446,62 @@
             };
           },
 
+          // Clone report data before placing it in editable Alpine state. Without
+          // this copy, changing a loaded filter also changes queryReports in memory.
+          cloneReportValue(value) {
+            return JSON.parse(JSON.stringify(value));
+          },
+
+          // Return a fresh default every time so callers can safely edit it.
+          defaultUnsavedReportConfig() {
+            return {
+              columns: [...this.defaultColumns],
+              limit: 500,
+              quick: {
+                hours: '48',
+                min_match: 80,
+                location_policy: 'any',
+                text: ''
+              },
+              filter: { op: 'and', items: [] }
+            };
+          },
+
+          // Config keys are created in a stable order, so JSON is a simple and
+          // reliable comparison format for this small client-side object.
+          reportConfigSnapshot(config = this.currentReportConfig()) {
+            return JSON.stringify(config);
+          },
+
+          // A missing snapshot means metadata has not finished loading yet.
+          reportIsDirty() {
+            if (!this.reportSnapshot) return false;
+            return this.reportConfigSnapshot() !== this.reportSnapshot;
+          },
+
+          // Resolve the persisted report separately from the picker selection.
+          activeReport() {
+            return (this.queryReports || []).find(item => String(item.id) === String(this.selectedReportId));
+          },
+
+          activeReportTitle() {
+            return this.activeReport()?.title || 'this report';
+          },
+
+          // Keep status wording and color in small helpers so the markup stays readable.
+          reportStateLabel() {
+            if (this.reportBusy) return 'Saving';
+            if (this.reportIsDirty()) return 'Unsaved changes';
+            return this.selectedReportId ? 'Saved' : 'Unsaved report';
+          },
+
+          reportStateClass() {
+            if (this.reportBusy) return 'text-indigo-700';
+            if (this.reportIsDirty()) return 'text-amber-700';
+            return this.selectedReportId ? 'text-green-700' : 'text-slate-500';
+          },
+
+          // Copy a saved config into all editable builder controls.
           applyReportConfig(config) {
             const quick = config?.quick || {};
             this.selectedColumns = Array.isArray(config?.columns) ? [...config.columns] : [...this.defaultColumns];
@@ -1278,57 +1510,231 @@
             this.minAiMatch = quick.min_match ?? 80;
             this.locationPolicy = quick.location_policy || 'any';
             this.q = quick.text || '';
-            this.filterRoot = config?.filter || { op: 'and', items: [] };
+            this.filterRoot = this.cloneReportValue(config?.filter || { op: 'and', items: [] });
           },
 
-          loadSelectedReport() {
-            const report = (this.queryReports || []).find(item => String(item.id) === String(this.selectedReportId));
-            if (!report) return;
-            this.reportTitle = report.title;
+          // Load either a persisted report or a clean unsaved builder.
+          loadReportById(reportId) {
+            const nextId = String(reportId || '');
+            if (!nextId) {
+              this.applyReportConfig(this.defaultUnsavedReportConfig());
+              this.selectedReportId = '';
+              this.reportPickerId = '';
+              this.reportSnapshot = this.reportConfigSnapshot();
+              return;
+            }
+            // The report may have been deleted in another browser tab.
+            const report = (this.queryReports || []).find(item => String(item.id) === nextId);
+            if (!report) {
+              this.reportPickerId = this.selectedReportId;
+              this.setReportMessage('That saved report is no longer available.', true);
+              return;
+            }
             this.applyReportConfig(report.config || {});
+            this.selectedReportId = nextId;
+            this.reportPickerId = nextId;
+            this.reportSnapshot = this.reportConfigSnapshot();
+            this.setReportMessage(`Loaded “${report.title}”.`);
           },
 
-          async saveReport(updateExisting) {
-            const title = (this.reportTitle || '').trim();
-            if (!title) {
-              this.queryMessage = 'Report title is required.';
+          // Intercept picker changes before they can replace unsaved builder edits.
+          requestReportSelection(reportId) {
+            const nextId = String(reportId || '');
+            if (nextId === String(this.selectedReportId || '')) return;
+            if (this.reportIsDirty()) {
+              this.pendingReportId = nextId;
+              this.reportPickerId = this.selectedReportId;
+              this.$refs.discardReportDialog.showModal();
               return;
             }
-            const method = updateExisting && this.selectedReportId ? 'PUT' : 'POST';
-            const url = updateExisting && this.selectedReportId ? `/api/query-reports/${this.selectedReportId}` : '/api/query-reports';
-            const res = await fetch(url, {
-              method,
-              headers: {'Content-Type': 'application/json'},
-              body: JSON.stringify({title, config: this.currentReportConfig()})
+            this.loadReportById(nextId);
+          },
+
+          // Restore the picker to the report that is still loaded.
+          cancelReportSelection() {
+            this.pendingReportId = '';
+            this.reportPickerId = this.selectedReportId;
+            this.$refs.discardReportDialog.close();
+          },
+
+          // Capture the pending ID before closing because the dialog close handler clears it.
+          discardChangesAndLoadReport() {
+            const nextId = this.pendingReportId;
+            this.pendingReportId = '';
+            this.$refs.discardReportDialog.close();
+            this.loadReportById(nextId);
+          },
+
+          // Centralize accessible success/error feedback for every report action.
+          setReportMessage(message, isError = false) {
+            this.reportMessage = message;
+            this.reportError = isError;
+          },
+
+          // Reuse one dialog while pre-filling a sensible name for each mode.
+          openReportDialog(mode) {
+            this.reportMenuOpen = false;
+            this.reportDialogMode = mode;
+            this.reportDialogError = '';
+            if (mode === 'rename') {
+              this.reportTitle = this.activeReportTitle();
+            } else if (mode === 'copy') {
+              this.reportTitle = `${this.activeReportTitle()} copy`;
+            } else {
+              this.reportTitle = '';
+            }
+            this.$refs.reportNameDialog.showModal();
+            // Wait for Alpine to render the modal before moving focus.
+            this.$nextTick(() => {
+              this.$refs.reportTitleInput.focus();
+              this.$refs.reportTitleInput.select();
             });
-            const data = await res.json();
-            if (!res.ok) {
-              this.queryMessage = data.error || 'Could not save report.';
-              return;
-            }
-            this.selectedReportId = String(data.id);
-            await this.loadReports();
-            this.queryMessage = `Saved report "${data.title}".`;
           },
 
+          // These helpers supply mode-specific dialog copy without duplicating markup.
+          reportDialogTitle() {
+            if (this.reportDialogMode === 'rename') return 'Rename report';
+            if (this.reportDialogMode === 'copy') return 'Save as a new report';
+            return 'Save this report';
+          },
+
+          reportDialogDescription() {
+            if (this.reportDialogMode === 'rename') return 'Only the report name will change. Unsaved builder edits will stay unsaved.';
+            if (this.reportDialogMode === 'copy') return 'Create a separate report from the filters and columns currently in the builder.';
+            return 'Save the current filters and column layout so you can reuse them later.';
+          },
+
+          reportDialogActionLabel() {
+            if (this.reportDialogMode === 'rename') return 'Rename report';
+            if (this.reportDialogMode === 'copy') return 'Save as new';
+            return 'Save report';
+          },
+
+          // Rename uses the stored config; create/copy use the visible builder config.
+          async submitReportDialog() {
+            if (this.reportDialogMode === 'rename') {
+              await this.renameReport();
+            } else {
+              await this.saveNewReport();
+            }
+          },
+
+          // Refresh after writes so IDs, names, and timestamps match the database.
           async loadReports() {
             const res = await fetch('/api/query-reports');
             const data = await res.json();
+            if (!res.ok) throw new Error(data.error || 'Could not load saved reports.');
             this.queryReports = data.reports || [];
           },
 
-          async deleteReport() {
-            if (!this.selectedReportId) return;
-            const res = await fetch(`/api/query-reports/${this.selectedReportId}`, {method: 'DELETE'});
-            const data = await res.json();
-            if (!res.ok) {
-              this.queryMessage = data.error || 'Could not delete report.';
-              return;
+          // Create a new preset from the builder. create_only prevents a duplicate
+          // title from silently replacing an existing report.
+          async saveNewReport() {
+            const title = (this.reportTitle || '').trim();
+            if (!title || this.reportBusy) return;
+            this.reportBusy = true;
+            this.reportDialogError = '';
+            try {
+              const res = await fetch('/api/query-reports', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({title, config: this.currentReportConfig(), create_only: true})
+              });
+              const data = await res.json();
+              if (!res.ok) throw new Error(data.error || 'Could not save report.');
+              this.selectedReportId = String(data.id);
+              this.reportPickerId = String(data.id);
+              await this.loadReports();
+              // The successfully saved builder becomes the new clean baseline.
+              this.reportSnapshot = this.reportConfigSnapshot();
+              this.$refs.reportNameDialog.close();
+              this.setReportMessage(`Saved “${data.title}”.`);
+            } catch (err) {
+              this.reportDialogError = err?.message || 'Could not save report.';
+            } finally {
+              this.reportBusy = false;
             }
-            this.selectedReportId = '';
-            this.reportTitle = '';
-            await this.loadReports();
-            this.queryMessage = data.deleted ? 'Deleted report.' : 'Report was already gone.';
+          },
+
+          // Update only when a loaded report actually differs from its snapshot.
+          async saveReportChanges() {
+            const report = this.activeReport();
+            if (!report || !this.reportIsDirty() || this.reportBusy) return;
+            this.reportBusy = true;
+            this.setReportMessage('Saving changes…');
+            try {
+              const res = await fetch(`/api/query-reports/${this.selectedReportId}`, {
+                method: 'PUT',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({title: report.title, config: this.currentReportConfig()})
+              });
+              const data = await res.json();
+              if (!res.ok) throw new Error(data.error || 'Could not save report changes.');
+              await this.loadReports();
+              // Reset dirty state only after the server confirms the update.
+              this.reportSnapshot = this.reportConfigSnapshot();
+              this.setReportMessage(`Changes saved to “${data.title}”.`);
+            } catch (err) {
+              this.setReportMessage(err?.message || 'Could not save report changes.', true);
+            } finally {
+              this.reportBusy = false;
+            }
+          },
+
+          // Rename the persisted record without committing unrelated builder edits.
+          async renameReport() {
+            const report = this.activeReport();
+            const title = (this.reportTitle || '').trim();
+            if (!report || !title || this.reportBusy) return;
+            this.reportBusy = true;
+            this.reportDialogError = '';
+            try {
+              const res = await fetch(`/api/query-reports/${this.selectedReportId}`, {
+                method: 'PUT',
+                headers: {'Content-Type': 'application/json'},
+                // Renaming must not commit the builder's unsaved configuration.
+                body: JSON.stringify({title, config: this.cloneReportValue(report.config || {})})
+              });
+              const data = await res.json();
+              if (!res.ok) throw new Error(data.error || 'Could not rename report.');
+              await this.loadReports();
+              this.$refs.reportNameDialog.close();
+              this.setReportMessage(`Renamed report to “${data.title}”.`);
+            } catch (err) {
+              this.reportDialogError = err?.message || 'Could not rename report.';
+            } finally {
+              this.reportBusy = false;
+            }
+          },
+
+          // Require an explicit confirmation before deleting a saved preset.
+          openDeleteReportDialog() {
+            this.reportMenuOpen = false;
+            if (this.selectedReportId) this.$refs.deleteReportDialog.showModal();
+          },
+
+          // Delete the preset but leave its current filters and columns on screen.
+          async deleteReport() {
+            if (!this.selectedReportId || this.reportBusy) return;
+            const deletedTitle = this.activeReportTitle();
+            this.reportBusy = true;
+            try {
+              const res = await fetch(`/api/query-reports/${this.selectedReportId}`, {method: 'DELETE'});
+              const data = await res.json();
+              if (!res.ok) throw new Error(data.error || 'Could not delete report.');
+              this.$refs.deleteReportDialog.close();
+              this.selectedReportId = '';
+              this.reportPickerId = '';
+              await this.loadReports();
+              // Keep the current builder as an unsaved report after deletion.
+              this.reportSnapshot = this.reportConfigSnapshot(this.defaultUnsavedReportConfig());
+              this.setReportMessage(data.deleted ? `Deleted “${deletedTitle}”. The current builder is now unsaved.` : 'Report was already gone.');
+            } catch (err) {
+              this.$refs.deleteReportDialog.close();
+              this.setReportMessage(err?.message || 'Could not delete report.', true);
+            } finally {
+              this.reportBusy = false;
+            }
           },
 
           async exportJobs(format) {

@@ -1806,6 +1806,7 @@ def fetch_query_reports() -> Dict[str, Any]:
 
 
 def save_query_report(data: Dict[str, Any], report_id: Optional[int] = None) -> Dict[str, Any]:
+    """Create, update, or rename a saved Query Builder configuration."""
     title = str(data.get("title") or "").strip()
     if not title:
         raise ValueError("title is required")
@@ -1814,10 +1815,14 @@ def save_query_report(data: Dict[str, Any], report_id: Optional[int] = None) -> 
     config = data.get("config")
     if not isinstance(config, dict):
         raise ValueError("config must be an object")
+    # Save-as uses create_only so a duplicate title cannot silently overwrite
+    # another report. Existing POST callers retain the original upsert behavior.
+    create_only = data.get("create_only") is True
 
     _ensure_query_report_table()
     with SessionLocal() as session:
         if report_id:
+            # PUT targets one known report and must never steal another title.
             report = session.get(DashboardQueryReport, report_id)
             if report is None:
                 raise ValueError("report not found")
@@ -1845,7 +1850,12 @@ def save_query_report(data: Dict[str, Any], report_id: Optional[int] = None) -> 
                 .scalars()
                 .first()
             )
+            # The UI uses this stricter mode for "Save as new". Legacy POST
+            # callers omit the flag and keep the original upsert behavior.
+            if report is not None and create_only:
+                raise ValueError("report title already exists")
         if report is None:
+            # New rows start with valid JSON before receiving the submitted config.
             report = DashboardQueryReport(title=title, config_json="{}")
             session.add(report)
         report.title = title
