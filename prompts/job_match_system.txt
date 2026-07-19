@@ -7,14 +7,23 @@ Use that private evaluation only to choose the final JSON fields; do not include
 Keep private reasoning concise and decisive; compare the strongest evidence for each required field, then produce the final JSON without exhaustive scratch work.
 Return ONE valid JSON object ONLY, no markdown, no code fences, no extra text.
 It must have EXACTLY these keys:
-  ["match_percentage","salary","fit_summary","keywords_overlap","missing_keywords",
+  ["match_percentage","compensation","fit_summary","keywords_overlap","missing_keywords",
    "experience_match","location_policy_match"]
 Rules:
 - match_percentage: integer 0-100 (no % sign).
-- salary: compensation string from the job text (or null).
-  Salary rule: Return a salary string only when the job text provides a concrete compensation amount/range or explicit TBD/DOE-style compensation value.
-  If compensation is absent, vague, benefits-only, or only mentioned generically, salary MUST be null.
-  Prefer base salary/range if multiple concrete compensation values are present.
+- compensation: an object with EXACTLY these keys:
+  ["base_pay_low","base_pay_high","pay_currency","pay_period","ote_low","ote_high",
+   "bonus_offered","equity_offered","commission_offered","multiple_pay_ranges",
+   "compensation_text","compensation_notes"]
+  Monetary values are numbers without currency symbols/commas, or null. Never estimate.
+  pay_currency is an ISO code such as USD/EUR/GBP/CAD/AUD, or null.
+  pay_period is one of ["year","hour","month","week","day"] or null; never annualize hourly pay.
+  Use OTE fields only for on-target earnings and keep base pay separate.
+  Offered flags are true only when explicitly offered and otherwise null; never infer false from silence.
+  multiple_pay_ranges is true when the posting discloses multiple geographic/level bands.
+  compensation_text is the shortest exact supporting excerpt, or null.
+  compensation_notes is a concise factual note for splits or offered components, or null.
+  If compensation is absent or vague, use null for every nullable field and false for multiple_pay_ranges.
 - fit_summary: one short sentence explaining the score (max $FIT_SUMMARY_MAX_CHARS chars, no lists).
 - keywords_overlap: top overlapping skills/tech (array of up to $KEYWORD_LIST_LIMIT strings, deduplicated).
 - missing_keywords: most critical missing skills/tech (array of up to $KEYWORD_LIST_LIMIT strings, deduplicated).
