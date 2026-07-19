@@ -2,7 +2,7 @@ from __future__ import annotations
 import json
 import os
 
-from .db import resolve_db_url
+from .db import resolve_db_url, resolve_display_timezone
 
 
 class Config:
@@ -19,6 +19,7 @@ class Config:
         os.makedirs(data_dir, exist_ok=True)
         # Use the shared DB resolver so Config matches app.models and dashboard.
         self.db_url = resolve_db_url(script_dir)
+        self.display_timezone = resolve_display_timezone(script_dir)
         self.steps_path = os.path.join(script_dir, "steps.json")
         self.test_steps_path = os.path.join(script_dir, "test.json")
 

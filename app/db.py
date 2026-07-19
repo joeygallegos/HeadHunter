@@ -2,15 +2,30 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote_plus
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker, DeclarativeBase
 
 
 class Base(DeclarativeBase):
     """Global metadata container."""
+
+
+def utc_now_naive() -> datetime:
+    """Return UTC without tzinfo for the app's database DATETIME convention."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _set_mysql_session_utc(dbapi_connection, _connection_record) -> None:
+    """Make MySQL server defaults such as NOW() persist UTC wall-clock values."""
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute("SET SESSION time_zone = '+00:00'")
+    finally:
+        cursor.close()
 
 
 def _repo_root(script_dir: str | os.PathLike[str] | None = None) -> Path:
@@ -20,15 +35,34 @@ def _repo_root(script_dir: str | os.PathLike[str] | None = None) -> Path:
     return Path(__file__).resolve().parents[1]
 
 
-def _config_db_url(root: Path) -> str | None:
-    # Preserve the old config.json DB_URL override as a fallback after env vars.
+def _load_config_json(root: Path) -> dict:
     cfg_path = root / "config.json"
     if not cfg_path.exists():
-        return None
+        return {}
     with cfg_path.open("r", encoding="utf-8") as f:
         cfg = json.load(f)
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def _config_db_url(root: Path) -> str | None:
+    # Preserve the old config.json DB_URL override as a fallback after env vars.
+    cfg = _load_config_json(root)
     value = cfg.get("DB_URL")
     return str(value) if value else None
+
+
+def resolve_display_timezone(
+    script_dir: str | os.PathLike[str] | None = None,
+    default: str = "America/Chicago",
+) -> str:
+    """Resolve the user-facing timezone used for rendering timestamps."""
+    root = _repo_root(script_dir)
+    value = os.getenv("DISPLAY_TIMEZONE")
+    if value:
+        return str(value)
+    cfg = _load_config_json(root)
+    value = cfg.get("DISPLAY_TIMEZONE")
+    return str(value) if value else default
 
 
 def _with_mysql_charset(db_url: str) -> str:
@@ -74,7 +108,7 @@ def make_engine(db_url: str):
     elif db_url.startswith("sqlite"):
         # The dashboard and tests can share SQLite connections across threads.
         connect_args["check_same_thread"] = False
-    return create_engine(
+    engine = create_engine(
         db_url,
         future=True,
         pool_pre_ping=True,
@@ -84,6 +118,11 @@ def make_engine(db_url: str):
         pool_recycle=1800 if not db_url.startswith("sqlite") else None,
         connect_args=connect_args,
     )
+    if db_url.startswith("mysql+pymysql://"):
+        # MySQL DATETIME does not retain timezone metadata, so every connection
+        # must use UTC before server defaults or func.now() are evaluated.
+        event.listen(engine, "connect", _set_mysql_session_utc)
+    return engine
 
 
 def make_session_factory(engine):

@@ -224,10 +224,23 @@
                           class="px-3 py-2 bg-indigo-600 text-white text-sm font-medium hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-50">
                     Run query
                   </button>
-                  <button @click="selectedReportId ? saveReportChanges() : openReportDialog('create')"
-                          :disabled="reportBusy || (selectedReportId && !reportIsDirty())"
+                  <!-- New reports are always savable. Keeping this button free of
+                       a disabled binding avoids boolean-attribute edge cases. -->
+                  <button x-show="!selectedReportId"
+                          x-cloak
+                          data-report-action="create"
+                          @click="openReportDialog('create')"
+                          class="px-3 py-2 border border-indigo-200 bg-indigo-50 text-sm font-medium text-indigo-700 hover:bg-indigo-100">
+                    Save report
+                  </button>
+                  <!-- Existing reports only need saving after their config changes. -->
+                  <button x-show="selectedReportId"
+                          x-cloak
+                          data-report-action="update"
+                          @click="saveReportChanges()"
+                          :disabled="reportBusy || !reportIsDirty()"
                           class="px-3 py-2 border border-indigo-200 bg-indigo-50 text-sm font-medium text-indigo-700 hover:bg-indigo-100 disabled:cursor-not-allowed disabled:border-slate-200 disabled:bg-slate-50 disabled:text-slate-400"
-                          x-text="reportBusy ? 'Saving…' : (selectedReportId ? 'Save changes' : 'Save report')">
+                          x-text="reportBusy ? 'Saving…' : 'Save changes'">
                   </button>
 
                   <!-- Report actions only apply after a saved report has been selected. -->
@@ -457,17 +470,56 @@
                     <div class="border border-slate-200 bg-slate-50/40 p-2 space-y-2">
                       <template x-if="!item.items">
                         <div class="grid grid-cols-[minmax(0,1fr)_110px_minmax(0,1fr)_32px] gap-1">
-                          <select x-model="item.field" class="px-2 py-1 border border-slate-300 bg-white text-xs">
+                          <select x-model="item.field" @change="setFilterField(item, $event.target.value)" class="px-2 py-1 border border-slate-300 bg-white text-xs">
                             <template x-for="col in availableColumns" :key="col.key">
                               <option :value="col.key" x-text="col.label"></option>
                             </template>
                           </select>
-                          <select x-model="item.operator" class="px-2 py-1 border border-slate-300 bg-white text-xs">
-                            <template x-for="op in operators" :key="op">
+                          <select x-model="item.operator" @change="setFilterOperator(item, $event.target.value)" class="px-2 py-1 border border-slate-300 bg-white text-xs">
+                            <template x-for="op in filterOperatorsForField(item.field)" :key="op">
                               <option :value="op" x-text="op"></option>
                             </template>
                           </select>
-                          <input x-model="item.value" class="px-2 py-1 border border-slate-300 text-xs" placeholder="Value">
+                          <div class="min-w-0 space-y-1">
+                            <template x-if="columnType(item.field) === 'datetime' && item.operator !== 'between'">
+                              <div class="flex items-center gap-1">
+                                <select x-show="true" x-model="item.value_mode" @change="setFilterValueMode(item, $event.target.value)" class="px-2 py-1 border border-slate-300 bg-white text-xs">
+                                  <option value="relative">Relative</option>
+                                  <option value="absolute">Absolute</option>
+                                </select>
+                                <input x-model="item.value"
+                                       :type="filterInputType(item)"
+                                       class="min-w-0 flex-1 px-2 py-1 border border-slate-300 text-xs"
+                                       :placeholder="filterPlaceholder(item)"
+                                       :title="filterValueTitle(item)">
+                              </div>
+                            </template>
+                            <template x-if="columnType(item.field) === 'datetime' && item.operator === 'between'">
+                              <div class="grid grid-cols-2 gap-1">
+                                <select x-model="item.value_mode" @change="setFilterValueMode(item, $event.target.value)" class="px-2 py-1 border border-slate-300 bg-white text-xs">
+                                  <option value="relative">Relative</option>
+                                  <option value="absolute">Absolute</option>
+                                </select>
+                                <input x-model="item.value"
+                                       :type="filterInputType(item)"
+                                       class="px-2 py-1 border border-slate-300 text-xs"
+                                       :placeholder="filterPlaceholder(item)"
+                                       :title="filterValueTitle(item)">
+                                <input x-model="item.value_end"
+                                       :type="filterInputType(item)"
+                                       class="px-2 py-1 border border-slate-300 text-xs col-span-2"
+                                       :placeholder="filterSecondPlaceholder(item)"
+                                       :title="filterSecondTitle(item)">
+                              </div>
+                            </template>
+                            <template x-if="columnType(item.field) !== 'datetime'">
+                              <input x-model="item.value"
+                                     :type="filterInputType(item)"
+                                     class="px-2 py-1 border border-slate-300 text-xs w-full"
+                                     :placeholder="filterPlaceholder(item)"
+                                     :title="filterValueTitle(item)">
+                            </template>
+                          </div>
                           <button type="button" @click="removeFilter(filterRoot, index)" class="border border-red-100 bg-white text-red-600 text-xs hover:bg-red-50" title="Remove filter" aria-label="Remove filter">×</button>
                         </div>
                       </template>
@@ -483,17 +535,56 @@
                           </div>
                           <template x-for="(child, childIndex) in item.items" :key="child.id">
                             <div class="grid grid-cols-[minmax(0,1fr)_110px_minmax(0,1fr)_32px] gap-1">
-                              <select x-model="child.field" class="px-2 py-1 border border-slate-300 bg-white text-xs">
+                              <select x-model="child.field" @change="setFilterField(child, $event.target.value)" class="px-2 py-1 border border-slate-300 bg-white text-xs">
                                 <template x-for="col in availableColumns" :key="col.key">
                                   <option :value="col.key" x-text="col.label"></option>
                                 </template>
                               </select>
-                              <select x-model="child.operator" class="px-2 py-1 border border-slate-300 bg-white text-xs">
-                                <template x-for="op in operators" :key="op">
+                              <select x-model="child.operator" @change="setFilterOperator(child, $event.target.value)" class="px-2 py-1 border border-slate-300 bg-white text-xs">
+                                <template x-for="op in filterOperatorsForField(child.field)" :key="op">
                                   <option :value="op" x-text="op"></option>
                                 </template>
                               </select>
-                              <input x-model="child.value" class="px-2 py-1 border border-slate-300 text-xs" placeholder="Value">
+                              <div class="min-w-0 space-y-1">
+                                <template x-if="columnType(child.field) === 'datetime' && child.operator !== 'between'">
+                                  <div class="flex items-center gap-1">
+                                    <select x-model="child.value_mode" @change="setFilterValueMode(child, $event.target.value)" class="px-2 py-1 border border-slate-300 bg-white text-xs">
+                                      <option value="relative">Relative</option>
+                                      <option value="absolute">Absolute</option>
+                                    </select>
+                                    <input x-model="child.value"
+                                           :type="filterInputType(child)"
+                                           class="min-w-0 flex-1 px-2 py-1 border border-slate-300 text-xs"
+                                           :placeholder="filterPlaceholder(child)"
+                                           :title="filterValueTitle(child)">
+                                  </div>
+                                </template>
+                                <template x-if="columnType(child.field) === 'datetime' && child.operator === 'between'">
+                                  <div class="grid grid-cols-2 gap-1">
+                                    <select x-model="child.value_mode" @change="setFilterValueMode(child, $event.target.value)" class="px-2 py-1 border border-slate-300 bg-white text-xs">
+                                      <option value="relative">Relative</option>
+                                      <option value="absolute">Absolute</option>
+                                    </select>
+                                    <input x-model="child.value"
+                                           :type="filterInputType(child)"
+                                           class="px-2 py-1 border border-slate-300 text-xs"
+                                           :placeholder="filterPlaceholder(child)"
+                                           :title="filterValueTitle(child)">
+                                    <input x-model="child.value_end"
+                                           :type="filterInputType(child)"
+                                           class="px-2 py-1 border border-slate-300 text-xs col-span-2"
+                                           :placeholder="filterSecondPlaceholder(child)"
+                                           :title="filterSecondTitle(child)">
+                                  </div>
+                                </template>
+                                <template x-if="columnType(child.field) !== 'datetime'">
+                                  <input x-model="child.value"
+                                         :type="filterInputType(child)"
+                                         class="px-2 py-1 border border-slate-300 text-xs w-full"
+                                         :placeholder="filterPlaceholder(child)"
+                                         :title="filterValueTitle(child)">
+                                </template>
+                              </div>
                               <button type="button" @click="removeFilter(item, childIndex)" class="border border-red-100 bg-white text-red-600 text-xs hover:bg-red-50" title="Remove filter" aria-label="Remove filter">×</button>
                             </div>
                           </template>
@@ -515,7 +606,15 @@
                   <thead class="sticky top-0 z-10 bg-slate-100 text-left text-slate-700 border-b border-slate-200">
                     <tr>
                       <template x-for="col in visibleColumns()" :key="col.key">
-                        <th class="px-2 py-2 whitespace-nowrap font-semibold" x-text="col.label"></th>
+                        <th class="px-2 py-2 whitespace-nowrap font-semibold">
+                          <button type="button"
+                                  class="inline-flex items-center gap-1 text-left hover:text-slate-950"
+                                  @click="toggleSort(col.key)"
+                                  :aria-label="sortAriaLabel(col.key)">
+                            <span x-text="col.label"></span>
+                            <span class="text-[10px] text-slate-500" x-text="sortIndicator(col.key)"></span>
+                          </button>
+                        </th>
                       </template>
                     </tr>
                   </thead>
@@ -925,6 +1024,8 @@
           defaultColumns: [],
           rawColumns: [],
           selectedColumns: [],
+          sortField: '',
+          sortDirection: 'asc',
           draggedColumnKey: '',
           columnSearch: '',
           operators: [],
@@ -974,14 +1075,17 @@
           discoveryAutoRefresh: true,
           discoveryPoller: null,
 
+          // Add all numeric items in an array, treating missing values as zero.
           sum(arr) { return (arr || []).reduce((a,b)=>a+(b||0), 0); },
 
           // ---------------- RUNS ----------------
+          // Fetch the runs summary payload and refresh both run charts.
           async loadRuns() {
             this.runsLoaded = false;
             const res = await fetch(`/api/data?days=${this.days}`);
             const data = await res.json();
 
+            // Copy the latest API payload into Alpine state used by the table and charts.
             this.labels = data.labels || [];
             this.inserted = data.inserted || [];
             this.updated = data.updated || [];
@@ -997,29 +1101,35 @@
             this.change_rate_ma7_pct = data.change_rate_ma7_pct || [];
             this.net_rate_ma7_pct = data.net_rate_ma7_pct || [];
 
+            // Rebuild charts after replacing the source arrays.
             this.renderCountsChart();
             this.renderRatesChart();
             this.runsLoaded = true;
           },
 
+          // Optionally hide test-mode runs from the recent runs table.
           filteredRuns() {
             const rows = this.recentRuns || [];
             if (!this.hideTestRuns) return rows;
             return rows.filter(row => String(row.mode || '').toLowerCase() !== 'test');
           },
 
+          // Return only the number of recent runs currently visible in the table.
           visibleRuns() {
             return this.filteredRuns().slice(0, this.runsVisibleLimit);
           },
 
+          // Decide whether the "Load more" button should be shown.
           canLoadMoreRuns() {
             return this.filteredRuns().length > this.runsVisibleLimit;
           },
 
+          // Increase the visible run count in fixed increments.
           loadMoreRuns() {
             this.runsVisibleLimit += 10;
           },
 
+          // Convert a stored timestamp into a local browser-friendly label.
           formatRunTime(value) {
             if (!value) return '-';
             const parsed = new Date(String(value).replace(' ', 'T'));
@@ -1033,9 +1143,11 @@
             });
           },
 
+          // Draw the stacked daily impact chart plus total-seen and net-change lines.
           renderCountsChart() {
             const ctx = document.getElementById('runsChart').getContext('2d');
 
+            // Build the stacked bar series first so impact categories share one stack.
             const barDatasets = [
               { label: 'Inserted', data: this.inserted, stack: 'impact', borderWidth: 1,
                 backgroundColor: 'rgba(16, 185, 129, 0.85)', borderColor: 'rgb(16, 185, 129)' },
@@ -1045,6 +1157,7 @@
                 backgroundColor: 'rgba(249, 115, 22, 0.9)', borderColor: 'rgb(249, 115, 22)' }
             ];
 
+            // Overlay the total seen line on top of the stacked bars.
             const totalDataset = {
               label: 'Total Seen',
               data: this.total_seen,
@@ -1057,6 +1170,7 @@
               borderWidth: 2,
             };
 
+            // Overlay net change so trend direction is visible without doing mental math.
             const netChangeDataset = {
               label: 'Net Change (Inserted - Missing)',
               data: this.net_change,
@@ -1069,6 +1183,7 @@
               borderWidth: 2,
             };
 
+            // Chart.js gets rebuilt from scratch so the datasets always match Alpine state.
             const config = {
               type: 'bar',
               data: { labels: this.labels, datasets: [...barDatasets, totalDataset, netChangeDataset] },
@@ -1082,12 +1197,15 @@
               },
             };
 
+            // Destroy the previous chart instance to avoid duplicate canvases and stale state.
             if (this.chartCounts) this.chartCounts.destroy();
             this.chartCounts = new Chart(ctx, config);
           },
 
+          // Draw the percentage trend chart and rolling averages for change and net rates.
           renderRatesChart() {
             const ctx = document.getElementById('runsRateChart').getContext('2d');
+            // Each line maps directly to one series from the API payload.
             const datasets = [
               { label: 'Change %', data: this.change_rate_pct,
                 borderColor: 'rgb(59, 130, 246)', backgroundColor: 'rgba(59, 130, 246, 0.1)',
@@ -1103,6 +1221,7 @@
                 backgroundColor: 'rgba(34, 197, 94, 0.05)', tension: 0.25, pointRadius: 0, borderWidth: 2 },
             ];
 
+            // Use one shared x-axis so matching days line up across all percentage series.
             const config = {
               type: 'line',
               data: { labels: this.labels, datasets },
@@ -1116,14 +1235,18 @@
               }
             };
 
+            // Replace any prior chart instance before drawing the refreshed series.
             if (this.chartRates) this.chartRates.destroy();
             this.chartRates = new Chart(ctx, config);
           },
 
           // ---------------- JOBS ----------------
+          // Build the Query Builder API payload from the current on-screen controls.
           queryPayload(limitOverride = null) {
             return {
+              // Fall back to defaults when the user temporarily clears the selected column list.
               columns: this.selectedColumns.length ? this.selectedColumns : this.defaultColumns,
+              // Allow exports to override the normal row limit without duplicating payload logic.
               limit: limitOverride || this.jobsLimit || 500,
               quick: {
                 hours: this.hours || 'all',
@@ -1131,10 +1254,12 @@
                 location_policy: this.locationPolicy || 'any',
                 text: this.q || ''
               },
-              filter: this.filterRoot
+              filter: this.filterRoot,
+              sort: this.querySort()
             };
           },
 
+          // Flatten an arbitrary API error payload into a readable string.
           responseDetailText(value) {
             if (!value) return '';
             if (typeof value === 'string') return value;
@@ -1143,6 +1268,7 @@
             return String(value);
           },
 
+          // Strip scripts, styles, and tags from unexpected HTML error pages.
           cleanResponseText(text) {
             return (text || '')
               .replace(/<script[\s\S]*?<\/script>/gi, ' ')
@@ -1153,6 +1279,7 @@
               .slice(0, 1000);
           },
 
+          // Read an HTTP response body and safely coerce it into JSON-like data.
           async readResponseBody(res) {
             const text = await res.text();
             if (!text) return {};
@@ -1163,6 +1290,7 @@
             }
           },
 
+          // Combine HTTP status and response details into one user-facing error string.
           formatQueryError(res, data) {
             const status = `${res.status || 'HTTP'} ${res.statusText || 'error'}`.trim();
             const detail = this.responseDetailText(data?.error || data?.details || data?.message);
@@ -1171,14 +1299,17 @@
               : `An error occurred (${status}).`;
           },
 
+          // Wait for a specified number of milliseconds during polling flows.
           sleep(ms) {
             return new Promise(resolve => window.setTimeout(resolve, ms));
           },
 
+          // Shorten the active query ID for compact status text.
           queryDebugId() {
             return this.activeQueryId ? this.activeQueryId.slice(0, 8) : '';
           },
 
+          // Build a concise query progress label while background polling is active.
           queryStatusText(data, fallback = 'Running query...') {
             const message = data?.message || fallback;
             const age = Number(data?.age_seconds);
@@ -1189,15 +1320,18 @@
             return parts.join(' ');
           },
 
+          // Poll the background query endpoint until it completes, fails, or times out.
           async pollQueryJob(queryId, pollAfterMs = 1000, runToken = this.queryRunToken, ttlSeconds = null) {
             let waitMs = Math.max(250, Number(pollAfterMs) || 1000);
             const startedAt = Date.now();
             let maxPollMs = ((Number(ttlSeconds) || 3600) * 1000) + 10000;
             let networkFailures = 0;
             while (true) {
+              // Stop immediately if a newer query replaced this one in the UI.
               if (runToken !== this.queryRunToken || queryId !== this.activeQueryId) {
                 return {stale: true};
               }
+              // Guard against polling forever if the server never reaches a terminal state.
               if (Date.now() - startedAt > maxPollMs) {
                 throw new Error(`Query ${String(queryId).slice(0, 8)} timed out while polling.`);
               }
@@ -1207,11 +1341,13 @@
               }
               let res;
               try {
+                // Poll the persisted query state rather than rerunning the SQL work.
                 res = await fetch(`/api/jobs/query/${encodeURIComponent(queryId)}`);
                 networkFailures = 0;
               } catch (err) {
                 networkFailures += 1;
                 if (networkFailures <= 3) {
+                  // Briefly retry transient connectivity issues before surfacing a hard error.
                   this.queryMessage = `Network issue while polling query ${String(queryId).slice(0, 8)}; retry ${networkFailures}/3...`;
                   await this.sleep(1000 * networkFailures);
                   continue;
@@ -1223,6 +1359,7 @@
                 return {stale: true};
               }
               if (res.status === 202 && data.status === 'running') {
+                // Honor the server's requested polling cadence and updated TTL.
                 waitMs = Math.max(250, Number(data.poll_after_ms) || waitMs);
                 if (data.ttl_seconds) maxPollMs = (Number(data.ttl_seconds) * 1000) + 10000;
                 this.queryPollTimeoutMs = maxPollMs;
@@ -1236,8 +1373,10 @@
             }
           },
 
+          // Start a query, optionally poll a background job, then update the result table.
           async loadJobs() {
             const runToken = this.queryRunToken + 1;
+            // Increment the token so any older in-flight request becomes stale.
             this.queryRunToken = runToken;
             this.activeQueryId = '';
             this.queryPollTimeoutMs = 0;
@@ -1246,6 +1385,7 @@
             this.queryError = false;
             this.queryMessage = 'Running query...';
             try {
+              // The backend immediately returns a background query job descriptor.
               const res = await fetch('/api/jobs/query?background=1', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
@@ -1254,6 +1394,7 @@
               let data = await this.readResponseBody(res);
               if (res.status === 202 && data.query_id) {
                 if (runToken !== this.queryRunToken) return;
+                // Persist the active query ID so the UI can poll and show a short debug token.
                 this.activeQueryId = data.query_id;
                 this.queryPollTimeoutMs = ((Number(data.ttl_seconds) || 3600) * 1000) + 10000;
                 this.queryMessage = this.queryStatusText(data, 'Query queued.');
@@ -1274,6 +1415,7 @@
               };
               this.jobs = data.jobs || [];
               if (Array.isArray(data.available_columns) && data.available_columns.length) {
+                // Some queries reveal new dynamic reference columns that were not known at page load.
                 this.mergeAvailableColumns(data.available_columns);
               }
               this.jobsLoaded = true;
@@ -1286,11 +1428,13 @@
               this.queryMessage = message.startsWith('An error occurred') ? message : `An error occurred. ${message}`;
             } finally {
               if (runToken === this.queryRunToken) {
+                // Only the most recent query is allowed to clear the loading overlay.
                 this.queryLoading = false;
               }
             }
           },
 
+          // Load column metadata and saved reports before the Query Builder is used.
           async loadQueryBuilderMetadata() {
             const [columnsRes, reportsRes] = await Promise.all([
               fetch('/api/jobs/columns'),
@@ -1304,9 +1448,11 @@
             this.operators = columnsData.operators || [];
             this.selectedColumns = [...this.defaultColumns];
             this.queryReports = reportsData.reports || [];
+            this.normalizeFilterGroup(this.filterRoot);
             this.reportSnapshot = this.reportConfigSnapshot();
           },
 
+          // Merge new column descriptors into the existing list without duplicates.
           mergeAvailableColumns(columns) {
             const seen = new Set(this.availableColumns.map(col => col.key));
             for (const col of columns || []) {
@@ -1317,6 +1463,7 @@
             }
           },
 
+          // Group columns by display section and apply the live search filter.
           columnGroups() {
             const q = (this.columnSearch || '').toLowerCase().trim();
             const groups = {};
@@ -1329,16 +1476,19 @@
             return Object.entries(groups).map(([name, columns]) => ({ name, columns }));
           },
 
+          // Convert the selected column key order into the visible table header list.
           visibleColumns() {
             const byKey = new Map((this.availableColumns || []).map(col => [col.key, col]));
             return (this.selectedColumns || []).map(key => byKey.get(key) || {key, label: key});
           },
 
+          // Resolve a display label for a column key.
           columnLabel(key) {
             const found = (this.availableColumns || []).find(col => col.key === key);
             return found?.label || key;
           },
 
+          // Add or remove a column from the selected output list.
           toggleColumn(key) {
             if (this.selectedColumns.includes(key)) {
               this.selectedColumns = this.selectedColumns.filter(item => item !== key);
@@ -1347,10 +1497,12 @@
             }
           },
 
+          // Remember which selected column drag operation just started.
           dragColumnStart(key) {
             this.draggedColumnKey = key;
           },
 
+          // Complete a drag/drop reorder by moving the source column to the target slot.
           dropColumn(targetKey) {
             const sourceKey = this.draggedColumnKey;
             this.draggedColumnKey = '';
@@ -1358,6 +1510,7 @@
             this.reorderColumn(sourceKey, targetKey);
           },
 
+          // Reorder the selected column list using source and target keys.
           reorderColumn(sourceKey, targetKey) {
             const columns = [...this.selectedColumns];
             const from = columns.indexOf(sourceKey);
@@ -1368,6 +1521,7 @@
             this.selectedColumns = columns;
           },
 
+          // Move one selected column up or down by one position.
           moveColumn(index, direction) {
             const to = index + direction;
             if (to < 0 || to >= this.selectedColumns.length) return;
@@ -1377,52 +1531,314 @@
             this.selectedColumns = columns;
           },
 
+          // Reset the selected columns back to the dashboard defaults.
           setDefaultColumns() {
             this.selectedColumns = [...this.defaultColumns];
           },
 
+          // Select every currently available query column.
           selectAllColumns() {
             this.selectedColumns = (this.availableColumns || []).map(col => col.key);
           },
 
+          // Clear the selected column list so the user can rebuild it from scratch.
           clearColumns() {
             this.selectedColumns = [];
           },
 
+          // Add the raw long-text fields on top of the default report columns.
           selectRawColumns() {
             this.selectedColumns = [...new Set([...this.defaultColumns, ...this.rawColumns])];
           },
 
+          // Decide whether a cell should use the taller multi-line display style.
           isLongCell(key) {
             return ['desc', 'keywords', 'ai_raw', 'ai_json', 'changes_json'].includes(key) || String(key || '').startsWith('reference.');
           },
 
+          // Read the backend-declared type for a column so the UI can pick the right controls.
+          columnType(key) {
+            const found = (this.availableColumns || []).find(col => col.key === key);
+            return found?.type || 'text';
+          },
+
+          // Restrict filter operators to the set that makes sense for the selected column type.
+          filterOperatorsForField(field) {
+            const type = this.columnType(field);
+            if (type === 'number') return ['equals', 'not_equals', 'gte', 'lte', 'between', 'is_empty', 'is_not_empty'];
+            if (type === 'boolean') return ['equals', 'not_equals', 'is_empty', 'is_not_empty'];
+            if (type === 'datetime') return ['equals', 'not_equals', 'gte', 'lte', 'between', 'is_empty', 'is_not_empty'];
+            return ['equals', 'not_equals', 'contains', 'not_contains', 'is_empty', 'is_not_empty'];
+          },
+
+          // Pick the first available column when creating a new filter row.
+          defaultFilterField() {
+            return (this.availableColumns[0] || {}).key || 'title';
+          },
+
+          // Choose a sensible default operator for a new filter based on field type.
+          defaultFilterOperator(field) {
+            const type = this.columnType(field);
+            if (type === 'number' || type === 'datetime') return 'gte';
+            if (type === 'boolean') return 'equals';
+            return 'contains';
+          },
+
+          // Return the active date filter mode so the template can switch input styles.
+          filterValueMode(item) {
+            return item?.value_mode || 'relative';
+          },
+
+          // Select the most appropriate HTML input type for the filter value editor.
+          filterInputType(item) {
+            const type = this.columnType(item?.field);
+            if (type === 'datetime' && this.filterValueMode(item) === 'absolute') return 'datetime-local';
+            if (type === 'number') return 'number';
+            return 'text';
+          },
+
+          // Show a contextual placeholder based on the current field type and operator.
+          filterPlaceholder(item) {
+            const type = this.columnType(item?.field);
+            if (type === 'datetime') {
+              if (String(item?.operator || '') === 'between') return 'Start';
+              return this.filterValueMode(item) === 'absolute' ? 'YYYY-MM-DD HH:MM' : '2w, 14d, 8h';
+            }
+            if (type === 'number') return 'Value';
+            if (type === 'boolean') return 'true / false';
+            return 'Value';
+          },
+
+          // Show the placeholder for the second half of a between filter.
+          filterSecondPlaceholder(item) {
+            const type = this.columnType(item?.field);
+            if (type === 'datetime' && String(item?.operator || '') === 'between') {
+              return this.filterValueMode(item) === 'absolute' ? 'End' : 'End offset';
+            }
+            return '';
+          },
+
+          // Explain the expected input format when the user hovers a filter control.
+          filterValueTitle(item) {
+            const type = this.columnType(item?.field);
+            if (type === 'datetime' && String(item?.operator || '') !== 'between') {
+              return this.filterValueMode(item) === 'absolute'
+                ? 'Enter an absolute date/time'
+                : 'Relative durations like 2w, 14d, or 8h';
+            }
+            if (type === 'boolean') return 'Use true, false, 1, 0, yes, or no';
+            return '';
+          },
+
+          // Explain the expected input format for the second between value.
+          filterSecondTitle(item) {
+            const type = this.columnType(item?.field);
+            if (type === 'datetime' && String(item?.operator || '') === 'between') {
+              return this.filterValueMode(item) === 'absolute'
+                ? 'Enter the ending date/time'
+                : 'Relative end offset';
+            }
+            return '';
+          },
+
+          // Keep one filter row internally consistent when its field or operator changes.
+          normalizeFilterItem(item) {
+            if (!item) return item;
+            const field = item.field || this.defaultFilterField();
+            const type = this.columnType(field);
+            item.field = field;
+            // Replace invalid operators with the default for the new field type.
+            if (!this.filterOperatorsForField(field).includes(item.operator)) {
+              item.operator = this.defaultFilterOperator(field);
+            }
+            if (type === 'datetime') {
+              // Date filters can switch between relative durations and absolute timestamps.
+              if (!item.value_mode) item.value_mode = 'relative';
+              if (item.operator !== 'between') {
+                if (item.value_end !== undefined) delete item.value_end;
+              } else if (item.value_end === undefined) {
+                item.value_end = '';
+              }
+            } else {
+              // Non-date fields do not need the extra mode or end-value properties.
+              if (item.value_mode !== undefined) delete item.value_mode;
+              if (item.value_end !== undefined) delete item.value_end;
+            }
+            // Ensure the template always has a concrete string to bind into the input.
+            if (item.value === undefined) item.value = '';
+            return item;
+          },
+
+          // Recursively normalize every filter in the AND/OR tree.
+          normalizeFilterGroup(group) {
+            if (!group || !Array.isArray(group.items)) return group;
+            group.items = group.items.map(item => {
+              if (item && Array.isArray(item.items)) {
+                // Nested groups only allow the two explicit boolean operators.
+                item.op = item.op === 'or' ? 'or' : 'and';
+                this.normalizeFilterGroup(item);
+                return item;
+              }
+              return this.normalizeFilterItem(item);
+            });
+            return group;
+          },
+
+          // Update the filter field and immediately realign the row state with that field type.
+          setFilterField(item, field) {
+            item.field = field;
+            this.normalizeFilterItem(item);
+          },
+
+          // Update the filter operator and prune any stale values that no longer apply.
+          setFilterOperator(item, operator) {
+            item.operator = operator;
+            this.normalizeFilterItem(item);
+          },
+
+          // Switch a date filter between relative and absolute input modes.
+          setFilterValueMode(item, mode) {
+            item.value_mode = mode === 'absolute' ? 'absolute' : 'relative';
+          },
+
+          // Update the active sort state and immediately reorder the loaded table rows.
+          toggleSort(field) {
+            if (this.sortField === field) {
+              this.sortDirection = this.sortDirection === 'asc' ? 'desc' : 'asc';
+              this.applyClientSort();
+              return;
+            }
+            this.sortField = field;
+            this.sortDirection = 'asc';
+            this.applyClientSort();
+          },
+
+          // Show the current direction arrow only on the active sort column.
+          sortIndicator(field) {
+            if (this.sortField !== field) return '';
+            return this.sortDirection === 'asc' ? '▲' : '▼';
+          },
+
+          // Build an accessible label that explains what the next header click will do.
+          sortAriaLabel(field) {
+            const label = this.columnLabel(field);
+            if (this.sortField !== field) return `Sort by ${label}`;
+            return this.sortDirection === 'asc' ? `Sort ${label} descending` : `Sort ${label} ascending`;
+          },
+
+          // Rank empty values so blank cells always sort after populated cells.
+          sortValueRank(value) {
+            return value === null || value === undefined || value === '' ? 1 : 0;
+          },
+
+          // Convert a value into a comparable number when numeric sorting is requested.
+          sortValueNumber(value) {
+            if (value === null || value === undefined || value === '') return null;
+            if (typeof value === 'number') return Number.isNaN(value) ? null : value;
+            const parsed = Number(String(value).replaceAll(',', '').trim());
+            return Number.isNaN(parsed) ? null : parsed;
+          },
+
+          // Convert a display value into a comparable timestamp for client-side date sorting.
+          sortValueDate(value) {
+            if (!value) return null;
+            const text = String(value).trim();
+            const normalized = text.replace(/\s+(CST|CDT)$/i, '').replace(' ', 'T');
+            const parsed = new Date(normalized);
+            return Number.isNaN(parsed.getTime()) ? null : parsed.getTime();
+          },
+
+          // Convert common truthy and falsy strings into comparable boolean numbers.
+          sortValueBool(value) {
+            if (value === null || value === undefined || value === '') return null;
+            if (typeof value === 'boolean') return value ? 1 : 0;
+            const text = String(value).trim().toLowerCase();
+            if (['true', '1', 'yes', 'y', 'on'].includes(text)) return 1;
+            if (['false', '0', 'no', 'n', 'off'].includes(text)) return 0;
+            return null;
+          },
+
+          // Compare two cell values using the active column type, then fall back to text.
+          compareSortedValues(left, right, type) {
+            const leftRank = this.sortValueRank(left);
+            const rightRank = this.sortValueRank(right);
+            if (leftRank !== rightRank) return leftRank - rightRank;
+            if (leftRank === 1) return 0;
+
+            if (type === 'number') {
+              // Numeric values compare arithmetically when both sides parse cleanly.
+              const a = this.sortValueNumber(left);
+              const b = this.sortValueNumber(right);
+              if (a !== null && b !== null && a !== b) return a - b;
+            } else if (type === 'datetime') {
+              // Date values compare by epoch milliseconds when both sides parse cleanly.
+              const a = this.sortValueDate(left);
+              const b = this.sortValueDate(right);
+              if (a !== null && b !== null && a !== b) return a - b;
+            } else if (type === 'boolean') {
+              // Boolean values compare as 0/1 when both sides map to a known boolean.
+              const a = this.sortValueBool(left);
+              const b = this.sortValueBool(right);
+              if (a !== null && b !== null && a !== b) return a - b;
+            }
+
+            // Text comparison remains the final fallback for mixed or unparsable values.
+            return this.cellText(left).localeCompare(this.cellText(right), undefined, { numeric: true, sensitivity: 'base' });
+          },
+
+          // Reorder the already-loaded rows in memory so header clicks update the table instantly.
+          applyClientSort() {
+            if (!this.sortField || !Array.isArray(this.jobs) || this.jobs.length < 2) return;
+            const field = this.sortField;
+            const direction = this.sortDirection === 'desc' ? -1 : 1;
+            const type = this.columnType(field);
+            this.jobs = [...this.jobs].sort((left, right) => {
+              // Sort by the active field first, then by ID for a stable tiebreaker.
+              const compared = this.compareSortedValues(left?.[field], right?.[field], type);
+              if (compared !== 0) return compared * direction;
+              return this.compareSortedValues(left?.id, right?.id, 'number');
+            });
+          },
+
+          // Create a new leaf filter using defaults that match the current column metadata.
           newFilter() {
+            const field = this.defaultFilterField();
             return {
               id: `${Date.now()}-${Math.random()}`,
-              field: (this.availableColumns[0] || {}).key || 'title',
-              operator: 'contains',
-              value: ''
+              field,
+              operator: this.defaultFilterOperator(field),
+              value: '',
+              value_mode: this.columnType(field) === 'datetime' ? 'relative' : undefined
             };
           },
 
+          // Append one new leaf filter to an existing filter group.
           addFilter(group) {
             if (!Array.isArray(group.items)) group.items = [];
             group.items.push(this.newFilter());
           },
 
+          // Append one nested AND group under the root filter builder.
           addGroup() {
             this.filterRoot.items.push({ id: `${Date.now()}-${Math.random()}`, op: 'and', items: [this.newFilter()] });
           },
 
+          // Remove one filter row or nested group from its parent group.
           removeFilter(group, index) {
             group.items.splice(index, 1);
           },
 
+          // Reset the entire filter tree back to one empty root group.
           clearFilters() {
             this.filterRoot = { op: 'and', items: [] };
           },
 
+          // Return the active sort payload in the same shape the backend expects.
+          querySort() {
+            return this.sortField ? { field: this.sortField, direction: this.sortDirection } : { field: '', direction: 'asc' };
+          },
+
+          // Convert a table cell value into plain text for display and tooltips.
           cellText(value) {
             if (value === null || value === undefined) return '';
             if (Array.isArray(value)) return value.map(item => typeof item === 'object' ? JSON.stringify(item) : String(item)).join(', ');
@@ -1442,7 +1858,8 @@
                 location_policy: this.locationPolicy,
                 text: this.q
               },
-              filter: this.filterRoot
+              filter: this.filterRoot,
+              sort: this.querySort()
             };
           },
 
@@ -1463,7 +1880,8 @@
                 location_policy: 'any',
                 text: ''
               },
-              filter: { op: 'and', items: [] }
+              filter: { op: 'and', items: [] },
+              sort: { field: '', direction: 'asc' }
             };
           },
 
@@ -1484,6 +1902,7 @@
             return (this.queryReports || []).find(item => String(item.id) === String(this.selectedReportId));
           },
 
+          // Provide a friendly fallback name when no saved report is selected.
           activeReportTitle() {
             return this.activeReport()?.title || 'this report';
           },
@@ -1495,6 +1914,7 @@
             return this.selectedReportId ? 'Saved' : 'Unsaved report';
           },
 
+          // Match the state label with a compact semantic color choice.
           reportStateClass() {
             if (this.reportBusy) return 'text-indigo-700';
             if (this.reportIsDirty()) return 'text-amber-700';
@@ -1511,6 +1931,14 @@
             this.locationPolicy = quick.location_policy || 'any';
             this.q = quick.text || '';
             this.filterRoot = this.cloneReportValue(config?.filter || { op: 'and', items: [] });
+            const sort = config?.sort || {};
+            this.sortField = '';
+            this.sortDirection = 'asc';
+            if (sort.field && this.columnLabel(sort.field)) {
+              this.sortField = String(sort.field);
+              this.sortDirection = String(sort.direction || 'asc').toLowerCase() === 'desc' ? 'desc' : 'asc';
+            }
+            this.normalizeFilterGroup(this.filterRoot);
           },
 
           // Load either a persisted report or a clean unsaved builder.
@@ -1737,10 +2165,12 @@
             }
           },
 
+          // Send the current builder query to the export endpoint and trigger a browser download.
           async exportJobs(format) {
             const res = await fetch(`/api/jobs/export?format=${encodeURIComponent(format)}`, {
               method: 'POST',
               headers: {'Content-Type': 'application/json'},
+              // Reuse the same payload shape as the on-screen query, but allow a larger export limit.
               body: JSON.stringify(this.queryPayload(5000))
             });
             if (!res.ok) {
@@ -1749,21 +2179,26 @@
               return;
             }
             const blob = await res.blob();
+            // Create a temporary object URL so the browser can download the generated file.
             const href = URL.createObjectURL(blob);
             const a = document.createElement('a');
             a.href = href;
             a.download = `query-builder-export.${format}`;
             document.body.appendChild(a);
+            // Programmatically click the link because the download is initiated from script.
             a.click();
             a.remove();
+            // Revoke the object URL after the click so the browser can release the blob memory.
             URL.revokeObjectURL(href);
             this.queryMessage = `Exported ${format.toUpperCase()}.`;
           },
 
+          // Search for jobs by free-form lookup text and focus the first match.
           async lookupJob() {
             const q = (this.lookupQ || '').trim();
             if (!q) return;
 
+            // Clear old results so the lookup panel reflects the active request.
             this.lookupLoading = true;
             this.lookupLoaded = false;
             this.lookupResults = [];
@@ -1772,15 +2207,18 @@
             const res = await fetch(`/api/job-lookup?q=${encodeURIComponent(q)}`);
             const data = await res.json();
             this.lookupResults = data.jobs || [];
+            // Auto-select the first row so the detail pane opens immediately when results exist.
             this.selectedJobId = this.lookupResults.length ? this.lookupResults[0].id : null;
             this.lookupLoaded = true;
             this.lookupLoading = false;
           },
 
+          // Jump from a table row into the lookup/detail view for one specific job ID.
           async openJobDetail(id) {
             const jobId = Number(id);
             if (!Number.isFinite(jobId) || jobId <= 0) return;
 
+            // Switch views first so the user lands directly on the detail experience.
             this.view = 'lookup';
             this.lookupQ = `ID ${jobId}`;
             this.lookupLoading = true;
@@ -1790,17 +2228,20 @@
 
             const res = await fetch(`/api/job-detail?id=${encodeURIComponent(jobId)}`);
             const data = await res.json();
+            // Normalize the single-job response into the same array shape used by general lookup.
             this.lookupResults = data.job ? [data.job] : [];
             this.selectedJobId = data.job ? data.job.id : null;
             this.lookupLoaded = true;
             this.lookupLoading = false;
           },
 
+          // Resolve the currently highlighted lookup row into the detail object shown on the right.
           selectedJob() {
             return (this.lookupResults || []).find(j => j.id === this.selectedJobId) || null;
           },
 
           // ---------------- DISCOVERY ----------------
+          // Load pending discovery suggestions and refresh the recent event feed in parallel.
           async loadDiscovery() {
             this.discoveryLoading = true;
             this.discoveryMessage = '';
@@ -1810,6 +2251,7 @@
             ]);
             const data = await suggestionsRes.json();
             this.discoverySuggestions = data.suggestions || [];
+            // Drop any stale checkbox selections that no longer exist or are no longer actionable.
             this.selectedDiscoveryIds = this.selectedDiscoveryIds.filter(id =>
               this.discoverySuggestions.some(item => item.id === id && ['pending','approved'].includes(item.state || 'pending'))
             );
@@ -1817,18 +2259,22 @@
             this.discoveryLoading = false;
           },
 
+          // Fetch the latest discovery event log used by the live activity panel.
           async loadDiscoveryEvents() {
             const res = await fetch('/api/discovery/events?limit=200');
             const data = await res.json();
             this.discoveryEvents = data.events || [];
             this.discoveryEventsLoaded = true;
+            // Store the refresh time so the UI can show when the event feed last updated.
             this.discoveryEventsLoadedAt = new Date().toLocaleTimeString();
           },
 
+          // Show newest discovery events first without mutating the stored server order.
           recentDiscoveryEvents() {
             return [...(this.discoveryEvents || [])].reverse();
           },
 
+          // Collapse less important event properties into a JSON detail block for inspection.
           eventDetails(event) {
             const skip = new Set(['timestamp', 'type', 'message', 'url']);
             const details = {};
@@ -1840,10 +2286,12 @@
             return Object.keys(details).length ? JSON.stringify(details, null, 2) : '';
           },
 
+          // Check whether one discovery suggestion is currently selected in the bulk-action list.
           isDiscoverySelected(id) {
             return this.selectedDiscoveryIds.includes(id);
           },
 
+          // Toggle one discovery checkbox in the local selected ID collection.
           toggleDiscovery(id) {
             if (this.isDiscoverySelected(id)) {
               this.selectedDiscoveryIds = this.selectedDiscoveryIds.filter(x => x !== id);
@@ -1852,6 +2300,7 @@
             }
           },
 
+          // Approve the selected discovery suggestions, then refresh the list from the server.
           async applyDiscoverySelected() {
             if (!this.selectedDiscoveryIds.length || this.discoverySaving) return;
             this.discoverySaving = true;
@@ -1866,6 +2315,7 @@
               if (!res.ok) throw new Error(data.error || 'Apply failed');
               this.discoveryMessage = `Applied ${data.applied.length} suggestion(s); skipped ${data.skipped.length}.`;
               this.selectedDiscoveryIds = [];
+              // Reload after writes so item state and counts reflect the authoritative backend view.
               await this.loadDiscovery();
             } catch (err) {
               this.discoveryMessage = err?.message || 'Apply failed.';
@@ -1874,6 +2324,7 @@
             }
           },
 
+          // Reject the selected discovery suggestions, then reload the remaining queue.
           async rejectDiscoverySelected() {
             if (!this.selectedDiscoveryIds.length || this.discoverySaving) return;
             this.discoverySaving = true;
@@ -1896,11 +2347,14 @@
             }
           },
 
+          // Bootstrap the dashboard: load static metadata first, then initial data views, then start polling.
           async init() {
             this.loadRuns();
             await this.loadQueryBuilderMetadata();
+            // Query metadata must exist before the builder can safely render and sort typed columns.
             this.loadJobs();
             this.discoveryPoller = setInterval(() => {
+              // Only poll while the discovery tab is visible and auto-refresh is still enabled.
               if (this.view === 'discovery' && this.discoveryAutoRefresh) {
                 this.loadDiscoveryEvents();
               }

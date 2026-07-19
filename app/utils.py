@@ -7,6 +7,11 @@ from collections import Counter
 from bs4 import BeautifulSoup
 import nltk
 
+from .compensation import (
+    choose_deterministic_compensation,
+    format_compensation_summary,
+)
+
 
 _NLTK_RESOURCES = [
     ("tokenizers/punkt", "punkt"),
@@ -196,33 +201,11 @@ def get_job_level(job_title: str) -> str:
 
 
 def scan_for_pay_range(text: str) -> list[str]:
-    currency = r"(\$|€|£|USD|EUR|GBP)?"
-    pay_num = r"\d[\d,]*(?:\.\d+)?"
-    num = rf"({pay_num})"
-    range_patterns = [rf"{currency}\s*{num}\s*(?:-|–|to)\s*{currency}\s*{num}"]
-    single_patterns = [
-        rf"{currency}\s*{num}\s*(?:per year|per annum|year|annum|annual)\b",
-        rf"{currency}\s*{num}\s*(?:per hour|hour|hr|hourly)\b",
-        rf"{currency}\s*{num}\b",
-    ]
-    for pattern in range_patterns:
-        hits = [
-            m.group(0).strip() for m in re.finditer(pattern, text or "", re.IGNORECASE)
-        ]
-        if hits:
-
-            def max_end(s: str) -> float:
-                nums = re.findall(pay_num, s)
-                return float(nums[-1].replace(",", "")) if nums else 0.0
-
-            return [sorted(hits, key=max_end, reverse=True)[0]]
-    singles = []
-    for pattern in single_patterns:
-        for m in re.finditer(pattern, text or "", re.IGNORECASE):
-            raw = m.group(0).strip()
-            if raw and raw not in singles:
-                singles.append(raw)
-    return singles
+    # Keep this compatibility helper, but delegate to the conservative parser
+    # so generic numbers, dates, and experience ranges cannot become Pay.
+    parsed = choose_deterministic_compensation(text or "", "")
+    summary = format_compensation_summary(parsed)
+    return [summary] if summary else []
 
 
 def remove_canned_text(jobs: list[dict]) -> list[dict]:

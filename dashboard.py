@@ -16,6 +16,8 @@ import time
 import uuid
 from collections import defaultdict, OrderedDict
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+import math
 from typing import Any, Dict, List, Optional
 
 from flask import Flask, Response, jsonify, render_template, request
@@ -65,7 +67,9 @@ from app.models import (  # type: ignore
     Job,
     engine,
     ensure_job_reference_fields_column,
+    ensure_job_compensation_columns,
 )
+from app.db import resolve_display_timezone, utc_now_naive
 
 OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 DEFAULT_EVENTS_PATH = os.path.join(OUTPUT_DIR, "job_board_discovery_events.jsonl")
@@ -215,7 +219,7 @@ except ImportError:
         )
         action = Column(String(16), nullable=False)
         created_at = Column(
-            DateTime(timezone=True), server_default=func.now(), nullable=False
+            DateTime(timezone=False), server_default=func.now(), nullable=False
         )
 
 
@@ -233,9 +237,9 @@ class DashboardQueryReport(Base):  # type: ignore
     id = Column(Integer, primary_key=True, autoincrement=True)
     title = Column(String(120), nullable=False)
     config_json = Column(Text, nullable=False)
-    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    created_at = Column(DateTime(timezone=False), server_default=func.now(), nullable=False)
     updated_at = Column(
-        DateTime(timezone=True),
+        DateTime(timezone=False),
         server_default=func.now(),
         onupdate=func.now(),
         nullable=False,
@@ -245,13 +249,39 @@ class DashboardQueryReport(Base):  # type: ignore
 # ----------------------------------------------------------------------
 # Helpers
 # ----------------------------------------------------------------------
-LOCAL_TZ = "America/Chicago"
+DEFAULT_LOCAL_TZ = "America/Chicago"
+
+
+def _get_local_tz_name() -> str:
+    configured = (resolve_display_timezone(BASE_DIR, default=DEFAULT_LOCAL_TZ) or "").strip()
+    if not configured:
+        return DEFAULT_LOCAL_TZ
+    if not ZoneInfo:
+        return DEFAULT_LOCAL_TZ
+    try:
+        ZoneInfo(configured)
+    except Exception:
+        return DEFAULT_LOCAL_TZ
+    return configured
 
 
 def _now_local() -> datetime:
     if ZoneInfo:
-        return datetime.now(ZoneInfo(LOCAL_TZ))
+        return datetime.now(ZoneInfo(_get_local_tz_name()))
     return datetime.now()
+
+
+def _as_utc(dt: datetime) -> datetime:
+    """Interpret naive database DATETIME values as UTC."""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _as_local(dt: datetime) -> datetime:
+    """Convert a stored UTC value to the dashboard's display timezone."""
+    target = ZoneInfo(_get_local_tz_name()) if ZoneInfo else timezone.utc
+    return _as_utc(dt).astimezone(target)
 
 
 def _to_int(x: Any) -> int:
@@ -269,7 +299,7 @@ def _run_status(started_at: Optional[datetime], finished_at: Optional[datetime])
     if not started_at:
         return "Running"
 
-    age = _now_local().replace(tzinfo=None) - started_at.replace(tzinfo=None)
+    age = utc_now_naive() - _as_utc(started_at).replace(tzinfo=None)
     if age > timedelta(hours=24):
         return "Incomplete"
     return "Running"
@@ -322,7 +352,9 @@ def _ensure_reference_fields_column() -> None:
     # Dashboard reads can happen before run.py initdb, so apply this one
     # additive column migration against whichever SessionLocal the app uses.
     with SessionLocal() as session:
-        ensure_job_reference_fields_column(session.get_bind())
+        bind = session.get_bind()
+        ensure_job_reference_fields_column(bind)
+        ensure_job_compensation_columns(bind)
     _REFERENCE_FIELDS_COLUMN_READY = True
 
 
@@ -865,9 +897,12 @@ def save_steps_editor_content(content: Any) -> Dict[str, Any]:
 def fetch_runs(days: int) -> Dict[str, List]:
     today = _now_local().date()
     since_date = today - timedelta(days=max(0, days - 1))
-    since_dt = datetime.combine(since_date, datetime.min.time())
+    since_local = datetime.combine(since_date, datetime.min.time())
     if ZoneInfo:
-        since_dt = since_dt.replace(tzinfo=ZoneInfo(LOCAL_TZ))
+        since_local = since_local.replace(tzinfo=ZoneInfo(_get_local_tz_name()))
+        since_dt = since_local.astimezone(timezone.utc).replace(tzinfo=None)
+    else:
+        since_dt = since_local
 
     with SessionLocal() as session:
         runs = (
@@ -886,7 +921,7 @@ def fetch_runs(days: int) -> Dict[str, List]:
         if started_at is None:
             continue
         try:
-            day_str = started_at.date().isoformat()
+            day_str = _as_local(started_at).date().isoformat()
         except Exception:
             continue
 
@@ -956,8 +991,8 @@ def fetch_runs(days: int) -> Dict[str, List]:
         recent_runs.append(
             {
                 "id": r.id,
-                "started_at": started_at.isoformat(sep=" ") if started_at else "",
-                "finished_at": finished_at.isoformat(sep=" ") if finished_at else "",
+                "started_at": _fmt_dt(started_at) or "",
+                "finished_at": _fmt_dt(finished_at) or "",
                 "user": getattr(r, "user", "") or "",
                 "mode": getattr(r, "mode", "") or "",
                 "total_seen": _to_int(getattr(r, "total_seen", 0)),
@@ -1031,7 +1066,8 @@ def _fmt_dt(dt: Any) -> Optional[str]:
     if not dt:
         return None
     try:
-        return dt.replace(tzinfo=None).isoformat(sep=" ")
+        local_dt = _as_local(dt)
+        return local_dt.strftime("%Y-%m-%d %H:%M:%S %Z")
     except Exception:
         try:
             return dt.isoformat(sep=" ")
@@ -1086,6 +1122,15 @@ DEFAULT_QUERY_COLUMNS = [
     "title",
     "level",
     "pay",
+    "base_pay_low",
+    "base_pay_high",
+    "pay_currency",
+    "pay_period",
+    "ote_low",
+    "ote_high",
+    "bonus_offered",
+    "equity_offered",
+    "commission_offered",
     "discovery_date",
     "is_active",
     "ai_match_percentage",
@@ -1103,41 +1148,57 @@ _QUERY_JOB_THREADS: Dict[str, threading.Thread] = {}
 _QUERY_JOB_THREADS_LOCK = threading.Lock()
 
 STATIC_QUERY_COLUMNS: List[Dict[str, str]] = [
-    {"key": "id", "label": "ID", "group": "Core"},
-    {"key": "site", "label": "Site", "group": "Core"},
-    {"key": "job_id", "label": "Job ID", "group": "Core"},
-    {"key": "title", "label": "Title", "group": "Core"},
-    {"key": "url", "label": "URL", "group": "Core"},
-    {"key": "level", "label": "Level", "group": "Core"},
-    {"key": "pay", "label": "Pay", "group": "Core"},
-    {"key": "discovery_date", "label": "Discovery", "group": "Core"},
-    {"key": "age_hours", "label": "Age Hours", "group": "Core"},
-    {"key": "is_active", "label": "Active", "group": "Core"},
-    {"key": "updated_at", "label": "Updated", "group": "Core"},
-    {"key": "content_hash", "label": "Content Hash", "group": "Core"},
-    {"key": "run_id", "label": "Run ID", "group": "Core"},
-    {"key": "first_seen_run_id", "label": "First Seen Run", "group": "Core"},
-    {"key": "last_seen_run_id", "label": "Last Seen Run", "group": "Core"},
-    {"key": "ai_match_percentage", "label": "AI Match %", "group": "AI"},
-    {"key": "ai_salary", "label": "AI Salary", "group": "AI"},
-    {"key": "ai_fit_summary", "label": "AI Fit Summary", "group": "AI"},
-    {"key": "ai_keywords_overlap", "label": "AI Keywords Overlap", "group": "AI"},
-    {"key": "ai_missing_keywords", "label": "AI Missing Keywords", "group": "AI"},
-    {"key": "ai_experience_match", "label": "AI Experience", "group": "AI"},
-    {"key": "ai_location_policy_match", "label": "AI Location", "group": "AI"},
-    {"key": "ai_analyzed_at", "label": "AI Analyzed", "group": "AI"},
-    {"key": "latest_change_type", "label": "Latest Change", "group": "Changes"},
-    {"key": "latest_change_source", "label": "Latest Change Source", "group": "Changes"},
-    {"key": "latest_change_at", "label": "Latest Change At", "group": "Changes"},
-    {"key": "latest_changed_fields", "label": "Latest Changed Fields", "group": "Changes"},
-    {"key": "desc", "label": "Description", "group": "Raw/Long Text"},
-    {"key": "keywords", "label": "Keywords", "group": "Raw/Long Text"},
-    {"key": "ai_raw", "label": "Raw AI Text", "group": "Raw/Long Text"},
-    {"key": "ai_json", "label": "AI JSON", "group": "Raw/Long Text"},
-    {"key": "changes_json", "label": "Changes JSON", "group": "Raw/Long Text"},
+    {"key": "id", "label": "ID", "group": "Core", "type": "number"},
+    {"key": "site", "label": "Site", "group": "Core", "type": "text"},
+    {"key": "job_id", "label": "Job ID", "group": "Core", "type": "text"},
+    {"key": "title", "label": "Title", "group": "Core", "type": "text"},
+    {"key": "url", "label": "URL", "group": "Core", "type": "text"},
+    {"key": "level", "label": "Level", "group": "Core", "type": "text"},
+    {"key": "pay", "label": "Pay", "group": "Core", "type": "text"},
+    {"key": "base_pay_low", "label": "Base Pay Low", "group": "Compensation", "type": "number"},
+    {"key": "base_pay_high", "label": "Base Pay High", "group": "Compensation", "type": "number"},
+    {"key": "pay_currency", "label": "Pay Currency", "group": "Compensation", "type": "text"},
+    {"key": "pay_period", "label": "Pay Period", "group": "Compensation", "type": "text"},
+    {"key": "ote_low", "label": "OTE Low", "group": "Compensation", "type": "number"},
+    {"key": "ote_high", "label": "OTE High", "group": "Compensation", "type": "number"},
+    {"key": "bonus_offered", "label": "Bonus", "group": "Compensation", "type": "boolean"},
+    {"key": "equity_offered", "label": "Equity", "group": "Compensation", "type": "boolean"},
+    {"key": "commission_offered", "label": "Commission", "group": "Compensation", "type": "boolean"},
+    {"key": "multiple_pay_ranges", "label": "Multiple Pay Ranges", "group": "Compensation", "type": "boolean"},
+    {"key": "compensation_text", "label": "Compensation Evidence", "group": "Compensation", "type": "text"},
+    {"key": "compensation_notes", "label": "Compensation Notes", "group": "Compensation", "type": "text"},
+    {"key": "compensation_source", "label": "Compensation Source", "group": "Compensation", "type": "text"},
+    {"key": "compensation_analyzed_at", "label": "Compensation Analyzed", "group": "Compensation", "type": "datetime"},
+    {"key": "compensation_schema_version", "label": "Compensation Version", "group": "Compensation", "type": "number"},
+    {"key": "discovery_date", "label": "Discovery", "group": "Core", "type": "datetime"},
+    {"key": "age_hours", "label": "Age Hours", "group": "Core", "type": "number"},
+    {"key": "is_active", "label": "Active", "group": "Core", "type": "boolean"},
+    {"key": "updated_at", "label": "Updated", "group": "Core", "type": "datetime"},
+    {"key": "content_hash", "label": "Content Hash", "group": "Core", "type": "text"},
+    {"key": "run_id", "label": "Run ID", "group": "Core", "type": "number"},
+    {"key": "first_seen_run_id", "label": "First Seen Run", "group": "Core", "type": "number"},
+    {"key": "last_seen_run_id", "label": "Last Seen Run", "group": "Core", "type": "number"},
+    {"key": "ai_match_percentage", "label": "AI Match %", "group": "AI", "type": "number"},
+    {"key": "ai_salary", "label": "AI Salary", "group": "AI", "type": "text"},
+    {"key": "ai_fit_summary", "label": "AI Fit Summary", "group": "AI", "type": "text"},
+    {"key": "ai_keywords_overlap", "label": "AI Keywords Overlap", "group": "AI", "type": "text"},
+    {"key": "ai_missing_keywords", "label": "AI Missing Keywords", "group": "AI", "type": "text"},
+    {"key": "ai_experience_match", "label": "AI Experience", "group": "AI", "type": "text"},
+    {"key": "ai_location_policy_match", "label": "AI Location", "group": "AI", "type": "text"},
+    {"key": "ai_analyzed_at", "label": "AI Analyzed", "group": "AI", "type": "datetime"},
+    {"key": "latest_change_type", "label": "Latest Change", "group": "Changes", "type": "text"},
+    {"key": "latest_change_source", "label": "Latest Change Source", "group": "Changes", "type": "text"},
+    {"key": "latest_change_at", "label": "Latest Change At", "group": "Changes", "type": "datetime"},
+    {"key": "latest_changed_fields", "label": "Latest Changed Fields", "group": "Changes", "type": "text"},
+    {"key": "desc", "label": "Description", "group": "Raw/Long Text", "type": "text"},
+    {"key": "keywords", "label": "Keywords", "group": "Raw/Long Text", "type": "text"},
+    {"key": "ai_raw", "label": "Raw AI Text", "group": "Raw/Long Text", "type": "text"},
+    {"key": "ai_json", "label": "AI JSON", "group": "Raw/Long Text", "type": "text"},
+    {"key": "changes_json", "label": "Changes JSON", "group": "Raw/Long Text", "type": "text"},
 ]
 
 STATIC_QUERY_COLUMN_MAP = {item["key"]: item for item in STATIC_QUERY_COLUMNS}
+STATIC_QUERY_COLUMN_TYPES = {item["key"]: item.get("type", "text") for item in STATIC_QUERY_COLUMNS}
 QUERY_OPERATORS = {
     "equals",
     "not_equals",
@@ -1163,6 +1224,12 @@ def _query_column_group(key: str) -> str:
     return STATIC_QUERY_COLUMN_MAP.get(key, {}).get("group", "Core")
 
 
+def _query_column_type(key: str) -> str:
+    if key.startswith("reference."):
+        return "text"
+    return STATIC_QUERY_COLUMN_TYPES.get(key, "text")
+
+
 def _normalize_selected_columns(columns: Any) -> List[str]:
     selected: List[str] = []
     for key in columns if isinstance(columns, list) else DEFAULT_QUERY_COLUMNS:
@@ -1186,10 +1253,183 @@ def _query_value_text(value: Any) -> str:
 def _query_to_number(value: Any) -> Optional[float]:
     if value is None or value == "":
         return None
-    try:
+    if isinstance(value, bool):
+        return float(int(value))
+    if isinstance(value, Decimal):
         return float(value)
+    if isinstance(value, (int, float)):
+        if isinstance(value, float) and math.isnan(value):
+            return None
+        return float(value)
+    try:
+        text = str(value).strip().replace(",", "")
+        if not text:
+            return None
+        return float(text)
     except Exception:
         return None
+
+
+def _query_to_bool(value: Any) -> Optional[bool]:
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return None
+
+
+def _query_parse_relative_duration(value: Any) -> Optional[timedelta]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        hours = float(value)
+        if hours >= 0:
+            return timedelta(hours=hours)
+        return None
+    text = str(value).strip().lower()
+    if not text:
+        return None
+    if text == "all":
+        return None
+    compact = text.replace(" ", "")
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)([smhdwy]?)", compact)
+    if match:
+        amount = float(match.group(1))
+        unit = match.group(2) or "h"
+        if amount < 0:
+            return None
+        if unit == "s":
+            return timedelta(seconds=amount)
+        if unit == "m":
+            return timedelta(minutes=amount)
+        if unit == "h":
+            return timedelta(hours=amount)
+        if unit == "d":
+            return timedelta(days=amount)
+        if unit == "w":
+            return timedelta(weeks=amount)
+        if unit == "y":
+            return timedelta(days=amount * 365)
+    named = re.fullmatch(r"(\d+(?:\.\d+)?)\s*(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|year|years)", text)
+    if not named:
+        return None
+    amount = float(named.group(1))
+    if amount < 0:
+        return None
+    unit = named.group(2)
+    if unit.startswith("second"):
+        return timedelta(seconds=amount)
+    if unit.startswith("minute"):
+        return timedelta(minutes=amount)
+    if unit.startswith("hour"):
+        return timedelta(hours=amount)
+    if unit.startswith("day"):
+        return timedelta(days=amount)
+    if unit.startswith("week"):
+        return timedelta(weeks=amount)
+    return timedelta(days=amount * 365)
+
+
+def _query_to_datetime(value: Any) -> Optional[datetime]:
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.lower() == "all":
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except Exception:
+        parsed = None
+    if parsed is None:
+        for fmt in (
+            "%Y-%m-%d",
+            "%Y-%m-%d %H:%M",
+            "%Y-%m-%d %H:%M:%S",
+            "%m/%d/%Y",
+            "%m/%d/%Y %H:%M",
+            "%m/%d/%Y %H:%M:%S",
+        ):
+            try:
+                parsed = datetime.strptime(text, fmt)
+                break
+            except Exception:
+                continue
+    if parsed is None:
+        return None
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    elif ZoneInfo:
+        parsed = parsed.replace(tzinfo=ZoneInfo(_get_local_tz_name())).astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
+
+
+def _query_value_is_empty(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, (list, dict, tuple, set)):
+        return len(value) == 0
+    return False
+
+
+def _query_value_for_field(row: Dict[str, Any], field: str) -> Any:
+    raw = row.get("__raw")
+    if isinstance(raw, dict) and field in raw:
+        return raw.get(field)
+    return row.get(field)
+
+
+def _query_sort_key(row: Dict[str, Any], field: str) -> tuple[int, Any, Any]:
+    value = _query_value_for_field(row, field)
+    if _query_value_is_empty(value):
+        return (1, None, row.get("id", 0))
+    field_type = _query_column_type(field)
+    if field_type == "number":
+        parsed = _query_to_number(value)
+        if parsed is not None:
+            return (0, parsed, row.get("id", 0))
+        return (0, _query_value_text(value).lower(), row.get("id", 0))
+    if field_type == "boolean":
+        parsed = _query_to_bool(value)
+        if parsed is not None:
+            return (0, int(parsed), row.get("id", 0))
+        return (0, _query_value_text(value).lower(), row.get("id", 0))
+    if field_type == "datetime":
+        parsed = _query_to_datetime(value)
+        if parsed is not None:
+            return (0, parsed, row.get("id", 0))
+        return (0, _query_value_text(value).lower(), row.get("id", 0))
+    text = _query_value_text(value).lower()
+    return (0, text, row.get("id", 0))
+
+
+def _query_reference_type(values: List[Any]) -> str:
+    non_empty = [value for value in values if not _query_value_is_empty(value)]
+    if not non_empty:
+        return "text"
+    if all(_query_to_bool(value) is not None for value in non_empty):
+        return "boolean"
+    if all(_query_to_number(value) is not None for value in non_empty):
+        return "number"
+    if all(_query_to_datetime(value) is not None for value in non_empty):
+        return "datetime"
+    return "text"
 
 
 def _query_to_int(value: Any, default: int) -> int:
@@ -1214,40 +1454,103 @@ def _query_rule_matches(row: Dict[str, Any], rule: Dict[str, Any]) -> bool:
     if operator not in QUERY_OPERATORS:
         raise ValueError(f"unsupported query operator: {operator}")
 
-    actual = row.get(field)
-    actual_text = _query_value_text(actual).lower()
+    field_type = _query_column_type(field)
+    actual = _query_value_for_field(row, field)
     expected = rule.get("value")
+    value_end = rule.get("value_end")
+    if value_end in {None, ""}:
+        value_end = rule.get("end")
+    actual_text = _query_value_text(actual).lower()
     expected_text = _query_value_text(expected).lower()
 
     if operator == "is_empty":
-        return actual_text.strip() == ""
+        return _query_value_is_empty(actual)
     if operator == "is_not_empty":
-        return actual_text.strip() != ""
+        return not _query_value_is_empty(actual)
     if operator == "contains":
         return expected_text in actual_text
     if operator == "not_contains":
         return expected_text not in actual_text
     if operator == "equals":
+        if field_type == "boolean":
+            actual_bool = _query_to_bool(actual)
+            expected_bool = _query_to_bool(expected)
+            return actual_bool is not None and expected_bool is not None and actual_bool == expected_bool
+        if field_type == "datetime":
+            actual_dt = _query_to_datetime(actual)
+            expected_dt = _query_to_datetime(expected)
+            if actual_dt is None or expected_dt is None:
+                return False
+            return actual_dt == expected_dt
         return actual_text == expected_text
     if operator == "not_equals":
+        if field_type == "boolean":
+            actual_bool = _query_to_bool(actual)
+            expected_bool = _query_to_bool(expected)
+            return actual_bool is not None and expected_bool is not None and actual_bool != expected_bool
+        if field_type == "datetime":
+            actual_dt = _query_to_datetime(actual)
+            expected_dt = _query_to_datetime(expected)
+            if actual_dt is None or expected_dt is None:
+                return False
+            return actual_dt != expected_dt
         return actual_text != expected_text
 
-    actual_num = _query_to_number(actual)
-    if actual_num is None:
-        return False
-    if operator == "gte":
-        expected_num = _query_to_number(expected)
-        return expected_num is not None and actual_num >= expected_num
-    if operator == "lte":
-        expected_num = _query_to_number(expected)
-        return expected_num is not None and actual_num <= expected_num
-    if operator == "between":
-        bounds = expected if isinstance(expected, list) else []
-        if len(bounds) != 2:
+    if field_type == "datetime":
+        actual_dt = _query_to_datetime(actual)
+        if actual_dt is None:
             return False
-        low = _query_to_number(bounds[0])
-        high = _query_to_number(bounds[1])
-        return low is not None and high is not None and low <= actual_num <= high
+        if operator in {"gte", "lte"}:
+            expected_dt = _query_to_datetime(expected)
+            if expected_dt is None:
+                duration = _query_parse_relative_duration(expected)
+                if duration is None:
+                    return False
+                expected_dt = utc_now_naive() - duration
+            return actual_dt >= expected_dt if operator == "gte" else actual_dt <= expected_dt
+        if operator == "between":
+            bounds: Any = expected
+            if isinstance(bounds, dict):
+                bounds = [bounds.get("start"), bounds.get("end")]
+            elif isinstance(bounds, str) and value_end not in {None, ""}:
+                bounds = [bounds, value_end]
+            elif isinstance(bounds, str):
+                parts = [part.strip() for part in re.split(r"\s*(?:\.\.|,|to)\s*", bounds) if part.strip()]
+                bounds = parts
+            if not isinstance(bounds, list) or len(bounds) != 2:
+                return False
+            low = _query_to_datetime(bounds[0])
+            high = _query_to_datetime(bounds[1])
+            if low is None:
+                duration = _query_parse_relative_duration(bounds[0])
+                if duration is not None:
+                    low = utc_now_naive() - duration
+            if high is None:
+                duration = _query_parse_relative_duration(bounds[1])
+                if duration is not None:
+                    high = utc_now_naive() - duration
+            if low is not None and high is not None and low > high:
+                low, high = high, low
+            return low is not None and high is not None and low <= actual_dt <= high
+    if field_type == "number":
+        actual_num = _query_to_number(actual)
+        if actual_num is None:
+            return False
+        if operator == "gte":
+            expected_num = _query_to_number(expected)
+            return expected_num is not None and actual_num >= expected_num
+        if operator == "lte":
+            expected_num = _query_to_number(expected)
+            return expected_num is not None and actual_num <= expected_num
+        if operator == "between":
+            bounds = expected if isinstance(expected, list) else []
+            if len(bounds) != 2:
+                return False
+            low = _query_to_number(bounds[0])
+            high = _query_to_number(bounds[1])
+            if low is not None and high is not None and low > high:
+                low, high = high, low
+            return low is not None and high is not None and low <= actual_num <= high
     return False
 
 
@@ -1333,6 +1636,40 @@ def _validate_query_group(group: Any) -> None:
         if operator not in QUERY_OPERATORS:
             raise ValueError(f"unsupported query operator: {operator}")
 
+    # Numeric compensation values are meaningful only inside one currency and
+    # period. Require those equality filters in the same AND group.
+    rules = [item for item in items if isinstance(item, dict) and "items" not in item]
+    numeric_fields = {"base_pay_low", "base_pay_high", "ote_low", "ote_high"}
+    has_numeric_rule = any(
+        str(rule.get("field") or "") in numeric_fields
+        and str(rule.get("operator") or "") in {"gte", "lte", "between"}
+        for rule in rules
+    )
+    if has_numeric_rule and op != "and":
+        raise ValueError("numeric compensation filters must be placed in an AND group")
+    if has_numeric_rule:
+        equality_fields = {
+            str(rule.get("field") or "")
+            for rule in rules
+            if str(rule.get("operator") or "") == "equals"
+            and str(rule.get("value") or "").strip()
+        }
+        if has_numeric_rule and not {"pay_currency", "pay_period"}.issubset(equality_fields):
+            raise ValueError(
+                "numeric compensation filters require pay_currency and pay_period equals filters in the same AND group"
+            )
+
+
+def _normalize_query_sort(payload: Any) -> Dict[str, str]:
+    sort = payload if isinstance(payload, dict) else {}
+    field = str(sort.get("field") or "").strip()
+    direction = str(sort.get("direction") or "asc").strip().lower()
+    if field and not _is_allowed_query_field(field):
+        field = ""
+    if direction not in {"asc", "desc"}:
+        direction = "asc"
+    return {"field": field, "direction": direction}
+
 
 def _is_allowed_query_field(field: str) -> bool:
     return field in STATIC_QUERY_COLUMN_MAP or field.startswith("reference.")
@@ -1392,6 +1729,53 @@ def _serialize_query_row(
     ai_obj = _safe_json_loads(ai_raw)
     refs = _job_reference_map(j)
     latest = changes[0] if changes else None
+    raw: Dict[str, Any] = {
+        "id": j.id,
+        "site": j.site or "",
+        "job_id": j.job_id or "",
+        "title": j.title or "",
+        "url": j.url or "",
+        "desc": j.desc or "",
+        "keywords": j.keywords or "",
+        "level": j.level or "",
+        "pay": j.pay or "",
+        "base_pay_low": float(j.base_pay_low) if j.base_pay_low is not None else "",
+        "base_pay_high": float(j.base_pay_high) if j.base_pay_high is not None else "",
+        "pay_currency": j.pay_currency or "",
+        "pay_period": j.pay_period or "",
+        "ote_low": float(j.ote_low) if j.ote_low is not None else "",
+        "ote_high": float(j.ote_high) if j.ote_high is not None else "",
+        "bonus_offered": j.bonus_offered,
+        "equity_offered": j.equity_offered,
+        "commission_offered": j.commission_offered,
+        "multiple_pay_ranges": bool(j.multiple_pay_ranges),
+        "compensation_text": j.compensation_text or "",
+        "compensation_notes": j.compensation_notes or "",
+        "compensation_source": j.compensation_source or "",
+        "compensation_analyzed_at": j.compensation_analyzed_at,
+        "compensation_schema_version": j.compensation_schema_version,
+        "discovery_date": dt_q,
+        "age_hours": round((now_q - dt_q).total_seconds() / 3600.0, 2) if dt_q else "",
+        "is_active": bool(j.is_active),
+        "updated_at": j.updated_at,
+        "content_hash": j.content_hash or "",
+        "run_id": j.run_id,
+        "first_seen_run_id": j.first_seen_run_id,
+        "last_seen_run_id": j.last_seen_run_id,
+        "ai_match_percentage": j.ai_match_percentage,
+        "ai_salary": j.ai_salary or "",
+        "ai_fit_summary": j.ai_fit_summary or "",
+        "ai_keywords_overlap": _safe_json_list(j.ai_keywords_overlap),
+        "ai_missing_keywords": _safe_json_list(j.ai_missing_keywords),
+        "ai_experience_match": j.ai_experience_match or "",
+        "ai_location_policy_match": j.ai_location_policy_match or "",
+        "ai_analyzed_at": j.ai_analyzed_at,
+        "latest_change_type": getattr(latest, "change_type", "") if latest else "",
+        "latest_change_source": (getattr(latest, "change_source", None) or "site") if latest else "",
+        "latest_change_at": getattr(latest, "created_at", None) if latest else None,
+        "latest_changed_fields": getattr(latest, "changed_fields", "") if latest else "",
+    }
+    raw.update({f"reference.{label}": value for label, value in refs.items()})
 
     row: Dict[str, Any] = {
         "id": j.id,
@@ -1403,7 +1787,22 @@ def _serialize_query_row(
         "keywords": (j.keywords or "").strip(),
         "level": (j.level or "").strip(),
         "pay": (j.pay or "").strip(),
-        "discovery_date": dt_q.isoformat(sep=" ") if dt_q else "",
+        "base_pay_low": float(j.base_pay_low) if j.base_pay_low is not None else "",
+        "base_pay_high": float(j.base_pay_high) if j.base_pay_high is not None else "",
+        "pay_currency": j.pay_currency or "",
+        "pay_period": j.pay_period or "",
+        "ote_low": float(j.ote_low) if j.ote_low is not None else "",
+        "ote_high": float(j.ote_high) if j.ote_high is not None else "",
+        "bonus_offered": j.bonus_offered,
+        "equity_offered": j.equity_offered,
+        "commission_offered": j.commission_offered,
+        "multiple_pay_ranges": bool(j.multiple_pay_ranges),
+        "compensation_text": j.compensation_text or "",
+        "compensation_notes": j.compensation_notes or "",
+        "compensation_source": j.compensation_source or "",
+        "compensation_analyzed_at": _fmt_dt(j.compensation_analyzed_at) or "",
+        "compensation_schema_version": j.compensation_schema_version,
+        "discovery_date": _fmt_dt(dt_q) or "",
         "age_hours": round((now_q - dt_q).total_seconds() / 3600.0, 2) if dt_q else "",
         "is_active": bool(j.is_active),
         "updated_at": _fmt_dt(j.updated_at) or "",
@@ -1438,6 +1837,7 @@ def _serialize_query_row(
     }
     for label, value in refs.items():
         row[f"reference.{label}"] = value
+    row["__raw"] = raw
     return row
 
 
@@ -1455,6 +1855,7 @@ def _extract_query_payload(data: Optional[Dict[str, Any]], export: bool = False)
     if location_policy not in {"any", "remote", "hybrid", "onsite", "unknown", "non_hybrid"}:
         location_policy = "any"
     text_query = str(quick.get("text", payload.get("text", "")) or "").strip()
+    sort = _normalize_query_sort(payload.get("sort"))
     return {
         "hours": hours,
         "limit": limit,
@@ -1463,6 +1864,7 @@ def _extract_query_payload(data: Optional[Dict[str, Any]], export: bool = False)
         "text": text_query,
         "columns": _normalize_selected_columns(payload.get("columns")),
         "filter": payload.get("filter") if isinstance(payload.get("filter"), dict) else {"op": "and", "items": []},
+        "sort": sort,
     }
 
 
@@ -1471,13 +1873,15 @@ def _query_jobs(payload: Optional[Dict[str, Any]], export: bool = False) -> Dict
     columns = _normalize_selected_columns(query["columns"])
     has_row_filter = _query_group_has_rules(query["filter"])
     needs_changes = _query_needs_changes(columns, query["filter"])
-    db_limit = MAX_EXPORT_LIMIT if has_row_filter else query["limit"]
+    sort_field = str(query.get("sort", {}).get("field") or "").strip()
+    sort_active = bool(sort_field)
+    db_limit = MAX_EXPORT_LIMIT if (has_row_filter or sort_active or export) else query["limit"]
     all_time = query["hours"] <= 0
     hours = 0 if all_time else max(1, min(query["hours"], 24 * 30))
-    now = _now_local()
-    now_q = now.replace(tzinfo=None)
-    cutoff = now - timedelta(hours=hours) if not all_time else None
-    cutoff_q = cutoff.replace(tzinfo=None) if cutoff else None
+    # Stored DATETIME values are naive UTC, so database comparisons and age
+    # calculations must stay in UTC. Conversion happens only during display.
+    now_q = utc_now_naive()
+    cutoff_q = now_q - timedelta(hours=hours) if not all_time else None
 
     _ensure_reference_fields_column()
     _validate_query_group(query["filter"])
@@ -1507,6 +1911,8 @@ def _query_jobs(payload: Optional[Dict[str, Any]], export: bool = False) -> Dict
                     func.lower(Job.title).like(like_q),
                     func.lower(Job.level).like(like_q),
                     func.lower(Job.pay).like(like_q),
+                    func.lower(Job.ai_salary).like(like_q),
+                    func.lower(Job.compensation_notes).like(like_q),
                 )
             )
 
@@ -1520,29 +1926,47 @@ def _query_jobs(payload: Optional[Dict[str, Any]], export: bool = False) -> Dict
 
         rows: List[Dict[str, Any]] = []
         reference_keys = set()
+        reference_values: Dict[str, List[Any]] = defaultdict(list)
         changes_by_job = _changes_by_job(session, jobs) if needs_changes else {}
         for job in jobs:
             changes = changes_by_job.get(((job.site or ""), (job.job_id or "")), [])
             row = _serialize_query_row(job, changes, now_q)
             reference_keys.update(key for key in row if key.startswith("reference."))
+            raw_values = row.get("__raw") if isinstance(row.get("__raw"), dict) else {}
+            for key in reference_keys:
+                if key.startswith("reference.") and key in raw_values and raw_values.get(key) not in {None, ""}:
+                    reference_values[key].append(raw_values.get(key))
             if not _query_group_matches(row, query["filter"]):
                 continue
             rows.append(row)
-            if len(rows) >= query["limit"]:
-                break
+        if sort_active:
+            rows = sorted(
+                rows,
+                key=lambda item: _query_sort_key(item, sort_field),
+                reverse=str(query["sort"].get("direction") or "asc") == "desc",
+            )
+            empty_rows = [row for row in rows if _query_value_is_empty(_query_value_for_field(row, sort_field))]
+            non_empty_rows = [row for row in rows if not _query_value_is_empty(_query_value_for_field(row, sort_field))]
+            rows = non_empty_rows + empty_rows
+        if len(rows) > query["limit"]:
+            rows = rows[: query["limit"]]
 
     selected_rows = [
         {key: row.get(key, "") for key in columns}
         for row in rows
     ]
     available_columns = get_query_columns(sorted(reference_keys))
+    for column in available_columns:
+        if column["key"].startswith("reference."):
+            column["type"] = _query_reference_type(reference_values.get(column["key"], []))
     return {
         "hours": hours,
         "limit": query["limit"],
         "min_match": query["min_match"],
         "location_policy": query["location_policy"],
         "text": query["text"],
-        "cutoff_iso": cutoff_q.isoformat() if cutoff_q else "all",
+        "cutoff_iso": f"{cutoff_q.isoformat()}Z" if cutoff_q else "all",
+        "sort": query["sort"],
         "returned": len(selected_rows),
         "columns": columns,
         "available_columns": available_columns,
@@ -1560,7 +1984,7 @@ def get_query_columns(reference_keys: Optional[List[str]] = None) -> List[Dict[s
 
 def fetch_query_columns() -> Dict[str, Any]:
     _ensure_reference_fields_column()
-    reference_keys = set()
+    reference_values: Dict[str, List[Any]] = defaultdict(list)
     with SessionLocal() as session:
         jobs = (
             session.execute(
@@ -1577,9 +2001,13 @@ def fetch_query_columns() -> Dict[str, Any]:
         if isinstance(refs, dict):
             for key, value in refs.items():
                 if value not in {None, ""}:
-                    reference_keys.add(f"reference.{key}")
+                    reference_values[f"reference.{key}"].append(value)
+    columns = get_query_columns(sorted(reference_values))
+    for column in columns:
+        if column["key"].startswith("reference."):
+            column["type"] = _query_reference_type(reference_values.get(column["key"], []))
     return {
-        "columns": get_query_columns(sorted(reference_keys)),
+        "columns": columns,
         "default_columns": DEFAULT_QUERY_COLUMNS,
         "raw_columns": RAW_QUERY_COLUMNS,
         "operators": sorted(QUERY_OPERATORS),

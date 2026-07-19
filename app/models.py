@@ -1,9 +1,9 @@
 from __future__ import annotations
-from datetime import datetime, timezone
 from dotenv import load_dotenv
 from sqlalchemy import (
     Column,
     Integer,
+    Numeric,
     DateTime,
     String,
     Text,
@@ -19,7 +19,7 @@ from sqlalchemy.orm import relationship
 
 # Base, engine, and session setup live in app.db so every entry point resolves DB
 # configuration the same way.
-from .db import Base, make_engine, make_session_factory, resolve_db_url
+from .db import Base, make_engine, make_session_factory, resolve_db_url, utc_now_naive
 
 load_dotenv()
 
@@ -35,9 +35,9 @@ class IntegrationRun(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     started_at = Column(
-        DateTime(timezone=True), server_default=func.now(), nullable=False
+        DateTime(timezone=False), server_default=func.now(), nullable=False
     )
-    finished_at = Column(DateTime(timezone=True), nullable=True)
+    finished_at = Column(DateTime(timezone=False), nullable=True)
 
     user = Column(String(255), nullable=False)
     mode = Column(String(64), nullable=False)
@@ -78,8 +78,8 @@ class Job(Base):
     # like Location, JobSummary, OpenDate, and CloseDate are not discarded.
     reference_fields = Column(LONGTEXT().with_variant(Text, "sqlite"), nullable=True)
     discovery_date = Column(
-        DateTime(timezone=True),
-        default=lambda: datetime.now(timezone.utc),
+        DateTime(timezone=False),
+        default=utc_now_naive,
         nullable=False,
     )
 
@@ -91,7 +91,25 @@ class Job(Base):
     ai_missing_keywords = Column(Text, nullable=True)
     ai_experience_match = Column(String(32), nullable=True)
     ai_location_policy_match = Column(String(32), nullable=True)
-    ai_analyzed_at = Column(DateTime(timezone=True), nullable=True)
+    ai_analyzed_at = Column(DateTime(timezone=False), nullable=True)
+
+    # Structured compensation remains separate from the legacy Pay/AI Salary
+    # strings so numeric filtering never depends on display formatting.
+    base_pay_low = Column(Numeric(14, 2), nullable=True)
+    base_pay_high = Column(Numeric(14, 2), nullable=True)
+    pay_currency = Column(String(3), nullable=True)
+    pay_period = Column(String(16), nullable=True)
+    ote_low = Column(Numeric(14, 2), nullable=True)
+    ote_high = Column(Numeric(14, 2), nullable=True)
+    bonus_offered = Column(Boolean, nullable=True)
+    equity_offered = Column(Boolean, nullable=True)
+    commission_offered = Column(Boolean, nullable=True)
+    multiple_pay_ranges = Column(Boolean, nullable=False, server_default="0")
+    compensation_text = Column(Text, nullable=True)
+    compensation_notes = Column(Text, nullable=True)
+    compensation_source = Column(String(32), nullable=True)
+    compensation_analyzed_at = Column(DateTime(timezone=False), nullable=True)
+    compensation_schema_version = Column(Integer, nullable=True)
 
     # Delta tracking on the job itself
     content_hash = Column(String(64))  # sha256 of canonical fields
@@ -99,7 +117,7 @@ class Job(Base):
     first_seen_run_id = Column(Integer)
     last_seen_run_id = Column(Integer)
     updated_at = Column(
-        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+        DateTime(timezone=False), server_default=func.now(), onupdate=func.now()
     )
 
     run_id = Column(
@@ -125,7 +143,7 @@ class JobSwipe(Base):
     job_pk = Column(Integer, ForeignKey("jobs.id", ondelete="CASCADE"), nullable=False)
     action = Column(String(16), nullable=False)
     created_at = Column(
-        DateTime(timezone=True), server_default=func.now(), nullable=False
+        DateTime(timezone=False), server_default=func.now(), nullable=False
     )
 
     job = relationship("Job", back_populates="swipe")
@@ -149,7 +167,7 @@ class JobChange(Base):
     new_hash = Column(String(64))
     changed_fields = Column(Text)  # comma-separated list or JSON
     created_at = Column(
-        DateTime(timezone=True), server_default=func.now(), nullable=False
+        DateTime(timezone=False), server_default=func.now(), nullable=False
     )
 
     run = relationship("IntegrationRun", back_populates="changes")
@@ -180,7 +198,39 @@ def ensure_job_reference_fields_column(bind=None) -> None:
         conn.execute(text(f"ALTER TABLE jobs ADD COLUMN reference_fields {column_type}"))
 
 
+def ensure_job_compensation_columns(bind=None) -> None:
+    """Add structured compensation columns to existing databases."""
+    target = bind or engine
+    inspector = sa_inspect(target)
+    if "jobs" not in inspector.get_table_names():
+        return
+    existing = {col["name"] for col in inspector.get_columns("jobs")}
+    text_type = "LONGTEXT" if target.dialect.name == "mysql" else "TEXT"
+    definitions = {
+        "base_pay_low": "DECIMAL(14,2)",
+        "base_pay_high": "DECIMAL(14,2)",
+        "pay_currency": "VARCHAR(3)",
+        "pay_period": "VARCHAR(16)",
+        "ote_low": "DECIMAL(14,2)",
+        "ote_high": "DECIMAL(14,2)",
+        "bonus_offered": "BOOLEAN",
+        "equity_offered": "BOOLEAN",
+        "commission_offered": "BOOLEAN",
+        "multiple_pay_ranges": "BOOLEAN NOT NULL DEFAULT 0",
+        "compensation_text": text_type,
+        "compensation_notes": text_type,
+        "compensation_source": "VARCHAR(32)",
+        "compensation_analyzed_at": "DATETIME",
+        "compensation_schema_version": "INTEGER",
+    }
+    with target.begin() as conn:
+        for name, column_type in definitions.items():
+            if name not in existing:
+                conn.execute(text(f"ALTER TABLE jobs ADD COLUMN {name} {column_type}"))
+
+
 def init_db() -> None:
     """Create tables and apply the small additive runtime schema updates."""
     Base.metadata.create_all(bind=engine)
     ensure_job_reference_fields_column(engine)
+    ensure_job_compensation_columns(engine)
