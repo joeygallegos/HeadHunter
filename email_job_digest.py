@@ -10,12 +10,14 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, time, timedelta, timezone
 from typing import Any, Callable, List, Optional, Sequence, Tuple
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from sqlalchemy import desc, select
+from sqlalchemy import asc, desc, select
 from sqlalchemy.orm import Session
 
+from app.db import resolve_display_timezone
 from app.models import IntegrationRun, Job, SessionLocal
 
 
@@ -32,9 +34,20 @@ class MailgunConfig:
     base_url: str = DEFAULT_MAILGUN_BASE_URL
 
 
+@dataclass(frozen=True)
+class DigestContext:
+    runs: Sequence[IntegrationRun]
+    label: str
+    date_label: str
+    window_start_local: Optional[datetime] = None
+    window_end_local: Optional[datetime] = None
+    timezone_name: str = ""
+    is_single_run: bool = False
+
+
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Email a Mailgun digest of newly discovered jobs from the latest completed run."
+        description="Email a Mailgun digest of newly discovered jobs from yesterday's completed steps runs."
     )
     parser.add_argument(
         "--dry-run",
@@ -52,11 +65,6 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default=DEFAULT_TOP_N,
         help=f"Number of ranked jobs to include. Default: {DEFAULT_TOP_N}.",
     )
-    parser.add_argument(
-        "--include-test-runs",
-        action="store_true",
-        help="Allow test-mode runs. By default only mode='steps' runs are used.",
-    )
     return parser.parse_args(argv)
 
 
@@ -66,6 +74,42 @@ def _fmt_dt(dt: Any) -> str:
     if isinstance(dt, datetime):
         return dt.replace(tzinfo=None).isoformat(sep=" ", timespec="seconds")
     return str(dt)
+
+
+def _fmt_date(dt: datetime) -> str:
+    return dt.strftime("%m/%d/%Y")
+
+
+def _fmt_window_dt(dt: datetime) -> str:
+    return dt.strftime("%m/%d/%Y %H:%M:%S %Z")
+
+
+def _display_timezone() -> ZoneInfo:
+    tz_name = (resolve_display_timezone() or "America/Chicago").strip()
+    try:
+        return ZoneInfo(tz_name)
+    except ZoneInfoNotFoundError:
+        return ZoneInfo("America/Chicago")
+
+
+def previous_local_day_window(
+    now_utc: Optional[datetime] = None,
+) -> Tuple[datetime, datetime, str, ZoneInfo]:
+    tz = _display_timezone()
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+    elif now_utc.tzinfo is None:
+        now_utc = now_utc.replace(tzinfo=timezone.utc)
+
+    local_now = now_utc.astimezone(tz)
+    target_date = local_now.date() - timedelta(days=1)
+    start_local = datetime.combine(target_date, time.min, tzinfo=tz)
+    end_local = start_local + timedelta(days=1)
+    return start_local, end_local, _fmt_date(start_local), tz
+
+
+def _as_utc_naive(dt: datetime) -> datetime:
+    return dt.astimezone(timezone.utc).replace(tzinfo=None)
 
 
 def _clean_text(value: Any, default: str = "") -> str:
@@ -107,23 +151,36 @@ def fit_summary(job: Job) -> str:
     )
 
 
-def get_completed_run(
-    session: Session, run_id: Optional[int] = None, include_test_runs: bool = False
-) -> Optional[IntegrationRun]:
-    stmt = select(IntegrationRun).where(IntegrationRun.finished_at.is_not(None))
-    if not include_test_runs:
-        stmt = stmt.where(IntegrationRun.mode == "steps")
-    if run_id is not None:
-        stmt = stmt.where(IntegrationRun.id == run_id)
-    else:
-        stmt = stmt.order_by(desc(IntegrationRun.finished_at), desc(IntegrationRun.id))
+def get_completed_run(session: Session, run_id: int) -> Optional[IntegrationRun]:
+    stmt = (
+        select(IntegrationRun)
+        .where(IntegrationRun.finished_at.is_not(None))
+        .where(IntegrationRun.mode == "steps")
+        .where(IntegrationRun.id == run_id)
+    )
     return session.execute(stmt.limit(1)).scalar_one_or_none()
 
 
-def get_newly_discovered_jobs(session: Session, run_id: int) -> List[Job]:
+def get_completed_runs_for_window(
+    session: Session, window_start_utc: datetime, window_end_utc: datetime
+) -> List[IntegrationRun]:
+    stmt = (
+        select(IntegrationRun)
+        .where(IntegrationRun.finished_at.is_not(None))
+        .where(IntegrationRun.mode == "steps")
+        .where(IntegrationRun.finished_at >= window_start_utc)
+        .where(IntegrationRun.finished_at < window_end_utc)
+        .order_by(asc(IntegrationRun.finished_at), asc(IntegrationRun.id))
+    )
+    return list(session.execute(stmt).scalars())
+
+
+def get_newly_discovered_jobs(session: Session, run_ids: Sequence[int]) -> List[Job]:
+    if not run_ids:
+        return []
     stmt = (
         select(Job)
-        .where(Job.first_seen_run_id == run_id)
+        .where(Job.first_seen_run_id.in_(run_ids))
         .order_by(
             Job.ai_match_percentage.is_(None),
             desc(Job.ai_match_percentage),
@@ -133,6 +190,14 @@ def get_newly_discovered_jobs(session: Session, run_id: int) -> List[Job]:
         )
     )
     return list(session.execute(stmt).scalars())
+
+
+def run_ids_label(runs: Sequence[IntegrationRun]) -> str:
+    return ", ".join(str(run.id) for run in runs)
+
+
+def _sum_run_attr(runs: Sequence[IntegrationRun], attr: str) -> int:
+    return sum(int(getattr(run, attr, 0) or 0) for run in runs)
 
 
 def digest_counts(jobs: Sequence[Job]) -> Tuple[int, int, Optional[int]]:
@@ -146,28 +211,38 @@ def digest_counts(jobs: Sequence[Job]) -> Tuple[int, int, Optional[int]]:
     return analyzed, unanalyzed, max(scores) if scores else None
 
 
-def build_subject(run: IntegrationRun, total_new: int, top_n: int) -> str:
-    return f"Job digest: {total_new} new jobs from run {run.id} - top {top_n}"
+def build_subject(context: DigestContext, total_new: int, top_n: int) -> str:
+    return f"Job digest: {total_new} new jobs from {context.label} - top {top_n}"
 
 
-def render_text_digest(run: IntegrationRun, jobs: Sequence[Job], top_n: int) -> str:
+def render_text_digest(context: DigestContext, jobs: Sequence[Job], top_n: int) -> str:
     top_jobs = list(jobs[:top_n])
     analyzed, unanalyzed, highest_score = digest_counts(jobs)
     highest_label = f"{highest_score}%" if highest_score is not None else "Not analyzed"
+    runs = list(context.runs)
+    window_lines = [
+        f"Digest date: {context.date_label}",
+        f"Runs included: {run_ids_label(runs)}",
+    ]
+    if context.window_start_local and context.window_end_local:
+        window_lines.append(
+            "Window: "
+            f"{_fmt_window_dt(context.window_start_local)} to "
+            f"{_fmt_window_dt(context.window_end_local)}"
+        )
 
     lines = [
         "Job Digest",
         "",
-        f"Run: {run.id}",
-        f"Finished: {_fmt_dt(run.finished_at)}",
-        f"Mode: {_clean_text(run.mode, 'Unknown')}",
+        *window_lines,
         "",
         "Run summary",
-        f"- Total seen: {run.total_seen}",
+        f"- Total seen: {_sum_run_attr(runs, 'total_seen')}",
         f"- Newly discovered: {len(jobs)}",
-        f"- Updated: {run.updated_count}",
-        f"- Missing: {run.missing_count}",
-        f"- Errors: {run.error_count}",
+        f"- Inserted: {_sum_run_attr(runs, 'inserted_count')}",
+        f"- Updated: {_sum_run_attr(runs, 'updated_count')}",
+        f"- Missing: {_sum_run_attr(runs, 'missing_count')}",
+        f"- Errors: {_sum_run_attr(runs, 'error_count')}",
         "",
         "Digest summary",
         f"- Analyzed jobs: {analyzed}",
@@ -178,7 +253,7 @@ def render_text_digest(run: IntegrationRun, jobs: Sequence[Job], top_n: int) -> 
     ]
 
     if not top_jobs:
-        lines.extend(["", "No newly discovered jobs were found for this run."])
+        lines.extend(["", "No newly discovered jobs were found for this digest window."])
         return "\n".join(lines)
 
     for index, job in enumerate(top_jobs, start=1):
@@ -238,10 +313,11 @@ def _keyword_row(label: str, values: Sequence[str], bg: str) -> str:
     )
 
 
-def render_html_digest(run: IntegrationRun, jobs: Sequence[Job], top_n: int) -> str:
+def render_html_digest(context: DigestContext, jobs: Sequence[Job], top_n: int) -> str:
     top_jobs = list(jobs[:top_n])
     analyzed, unanalyzed, highest_score = digest_counts(jobs)
     highest_label = f"{highest_score}%" if highest_score is not None else "Not analyzed"
+    runs = list(context.runs)
     score_badge = (
         "<span style=\"display:inline-block;padding:6px 10px;border-radius:999px;"
         "background:#dcfce7;color:#166534;font-weight:700;font-size:13px\">"
@@ -252,7 +328,7 @@ def render_html_digest(run: IntegrationRun, jobs: Sequence[Job], top_n: int) -> 
         ("New", len(jobs)),
         ("Analyzed", analyzed),
         ("Unanalyzed", unanalyzed),
-        ("Errors", getattr(run, "error_count", 0)),
+        ("Errors", _sum_run_attr(runs, "error_count")),
     ]
     summary_html = "".join(
         "<td style=\"width:25%;padding:10px 6px;text-align:center\">"
@@ -267,7 +343,7 @@ def render_html_digest(run: IntegrationRun, jobs: Sequence[Job], top_n: int) -> 
     if not top_jobs:
         jobs_html = (
             "<div style=\"padding:18px;border:1px solid #e5e7eb;border-radius:10px;"
-            "background:#ffffff;color:#374151\">No newly discovered jobs were found for this run.</div>"
+            "background:#ffffff;color:#374151\">No newly discovered jobs were found for this digest window.</div>"
         )
     else:
         cards = []
@@ -311,6 +387,14 @@ def render_html_digest(run: IntegrationRun, jobs: Sequence[Job], top_n: int) -> 
             )
         jobs_html = "".join(cards)
 
+    window_label = f"Runs {_e(run_ids_label(runs))}"
+    if context.window_start_local and context.window_end_local:
+        window_label = (
+            f"{window_label} · "
+            f"{_e(_fmt_window_dt(context.window_start_local))} to "
+            f"{_e(_fmt_window_dt(context.window_end_local))}"
+        )
+
     return (
         "<!doctype html><html><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
         "<meta http-equiv=\"Content-Type\" content=\"text/html; charset=utf-8\"></head>"
@@ -325,7 +409,7 @@ def render_html_digest(run: IntegrationRun, jobs: Sequence[Job], top_n: int) -> 
         "<tr><td style=\"padding:22px 18px;border-radius:12px 12px 0 0;background:#111827;color:#ffffff\">"
         "<div style=\"font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:#c7d2fe;font-weight:800\">Job Digest</div>"
         f"<h1 style=\"margin:6px 0 8px 0;font-size:24px;line-height:1.2;color:#ffffff\">Top {len(top_jobs)} jobs to apply for</h1>"
-        f"<div style=\"font-size:14px;line-height:1.45;color:#d1d5db\">Run {_e(run.id)} finished {_e(_fmt_dt(run.finished_at))} · Highest score {score_badge}</div>"
+        f"<div style=\"font-size:14px;line-height:1.45;color:#d1d5db\">{_e(context.label)} · {window_label} · Highest score {score_badge}</div>"
         "</td></tr>"
         "<tr><td style=\"background:#ffffff;border-left:1px solid #e5e7eb;border-right:1px solid #e5e7eb\">"
         "<table role=\"presentation\" width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" style=\"border-collapse:collapse\">"
@@ -335,7 +419,7 @@ def render_html_digest(run: IntegrationRun, jobs: Sequence[Job], top_n: int) -> 
         f"{jobs_html}"
         "</td></tr>"
         "<tr><td style=\"padding:14px 6px 24px 6px;font-size:12px;line-height:1.4;color:#6b7280;text-align:center\">"
-        f"Run summary: total seen {_e(getattr(run, 'total_seen', 0))}, updated {_e(getattr(run, 'updated_count', 0))}, missing {_e(getattr(run, 'missing_count', 0))}."
+        f"Run summary: total seen {_e(_sum_run_attr(runs, 'total_seen'))}, inserted {_e(_sum_run_attr(runs, 'inserted_count'))}, updated {_e(_sum_run_attr(runs, 'updated_count'))}, missing {_e(_sum_run_attr(runs, 'missing_count'))}."
         "</td></tr>"
         "</table></td></tr></table></body></html>"
     )
@@ -410,35 +494,53 @@ def send_mailgun_digest(
 def build_digest(
     session: Session,
     run_id: Optional[int],
-    include_test_runs: bool,
     top_n: int,
-) -> Tuple[IntegrationRun, List[Job], str, str, str]:
+    now_utc: Optional[datetime] = None,
+) -> Tuple[DigestContext, List[Job], str, str, str]:
     if top_n <= 0:
         raise RuntimeError("--top-n must be greater than 0")
 
-    run = get_completed_run(
-        session, run_id=run_id, include_test_runs=include_test_runs
-    )
-    if run is None:
-        qualifier = f"run {run_id}" if run_id is not None else "a completed run"
-        if include_test_runs:
-            raise RuntimeError(f"Could not find {qualifier}.")
-        raise RuntimeError(f"Could not find {qualifier} with mode='steps'.")
+    if run_id is not None:
+        run = get_completed_run(session, run_id=run_id)
+        if run is None:
+            raise RuntimeError(f"Could not find completed run {run_id} with mode='steps'.")
+        context = DigestContext(
+            runs=[run],
+            label=f"run {run.id}",
+            date_label=f"run {run.id}",
+            is_single_run=True,
+        )
+    else:
+        start_local, end_local, date_label, tz = previous_local_day_window(now_utc)
+        runs = get_completed_runs_for_window(
+            session,
+            window_start_utc=_as_utc_naive(start_local),
+            window_end_utc=_as_utc_naive(end_local),
+        )
+        if not runs:
+            raise RuntimeError(f"Could not find completed steps runs for {date_label}.")
+        context = DigestContext(
+            runs=runs,
+            label=date_label,
+            date_label=date_label,
+            window_start_local=start_local,
+            window_end_local=end_local,
+            timezone_name=str(tz.key),
+        )
 
-    jobs = get_newly_discovered_jobs(session, run.id)
-    subject = build_subject(run, len(jobs), top_n)
-    text_body = render_text_digest(run, jobs, top_n)
-    html_body = render_html_digest(run, jobs, top_n)
-    return run, jobs, subject, text_body, html_body
+    jobs = get_newly_discovered_jobs(session, [run.id for run in context.runs])
+    subject = build_subject(context, len(jobs), top_n)
+    text_body = render_text_digest(context, jobs, top_n)
+    html_body = render_html_digest(context, jobs, top_n)
+    return context, jobs, subject, text_body, html_body
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
     with SessionLocal() as session:
-        run, jobs, subject, text_body, html_body = build_digest(
+        context, jobs, subject, text_body, html_body = build_digest(
             session=session,
             run_id=args.run_id,
-            include_test_runs=args.include_test_runs,
             top_n=args.top_n,
         )
 
@@ -450,7 +552,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     config = load_mailgun_config()
     send_mailgun_digest(config, subject, text_body, html_body)
-    print(f"Sent job digest for run {run.id} with {len(jobs)} newly discovered jobs.")
+    print(f"Sent job digest for {context.label} with {len(jobs)} newly discovered jobs.")
     return 0
 
 
