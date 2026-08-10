@@ -892,94 +892,19 @@ def save_steps_editor_content(content: Any) -> Dict[str, Any]:
 
 
 # ----------------------------------------------------------------------
-# Data access: Integration Runs (existing)
+# Data access: Integration Runs
 # ----------------------------------------------------------------------
-def fetch_runs(days: int) -> Dict[str, List]:
+def _runs_since_dt(days: int) -> datetime:
     today = _now_local().date()
     since_date = today - timedelta(days=max(0, days - 1))
     since_local = datetime.combine(since_date, datetime.min.time())
     if ZoneInfo:
         since_local = since_local.replace(tzinfo=ZoneInfo(_get_local_tz_name()))
-        since_dt = since_local.astimezone(timezone.utc).replace(tzinfo=None)
-    else:
-        since_dt = since_local
+        return since_local.astimezone(timezone.utc).replace(tzinfo=None)
+    return since_local
 
-    with SessionLocal() as session:
-        runs = (
-            session.execute(
-                select(IntegrationRun)
-                .where(IntegrationRun.started_at >= since_dt)
-                .order_by(IntegrationRun.started_at.asc())
-            )
-            .scalars()
-            .all()
-        )
 
-    per_day: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(float))
-    for r in runs:
-        started_at = r.started_at
-        if started_at is None:
-            continue
-        try:
-            day_str = _as_local(started_at).date().isoformat()
-        except Exception:
-            continue
-
-        per_day[day_str]["inserted"] += _to_int(getattr(r, "inserted_count", 0))
-        per_day[day_str]["updated"] += _to_int(getattr(r, "updated_count", 0))
-        per_day[day_str]["missing"] += _to_int(getattr(r, "missing_count", 0))
-        per_day[day_str]["unchanged"] += _to_int(getattr(r, "unchanged_count", 0))
-        per_day[day_str]["error"] += _to_int(getattr(r, "error_count", 0))
-        per_day[day_str]["total_seen"] += _to_int(getattr(r, "total_seen", 0))
-
-    ordered = OrderedDict(sorted(per_day.items(), key=lambda kv: kv[0]))
-    labels = list(ordered.keys())
-
-    inserted: List[int] = []
-    updated: List[int] = []
-    missing: List[int] = []
-    unchanged: List[int] = []
-    error: List[int] = []
-    total_seen: List[int] = []
-    net_change: List[int] = []
-    change_rate: List[float] = []
-    net_rate: List[float] = []
-
-    for d in labels:
-        day = ordered[d]
-        ins = _to_int(day.get("inserted"))
-        upd = _to_int(day.get("updated"))
-        miss = _to_int(day.get("missing"))
-        unch = _to_int(day.get("unchanged"))
-        err = _to_int(day.get("error"))
-        tot = _to_int(day.get("total_seen"))
-
-        inserted.append(ins)
-        updated.append(upd)
-        missing.append(miss)
-        unchanged.append(unch)
-        error.append(err)
-        total_seen.append(tot)
-
-        net = ins - miss
-        net_change.append(net)
-
-        if tot > 0:
-            ch = (ins + upd + miss) / tot
-            nr = net / tot
-        else:
-            ch = 0.0
-            nr = 0.0
-
-        change_rate.append(ch)
-        net_rate.append(nr)
-
-    change_rate_ma7 = _rolling_mean(change_rate, 7)
-    net_rate_ma7 = _rolling_mean(net_rate, 7)
-
-    def to_pct(xs: List[float]) -> List[float]:
-        return [round(x * 100.0, 2) for x in xs]
-
+def _serialize_recent_runs(runs: List[IntegrationRun]) -> List[Dict[str, Any]]:
     recent_runs: List[Dict[str, Any]] = []
     for r in sorted(
         runs,
@@ -1004,21 +929,171 @@ def fetch_runs(days: int) -> Dict[str, List]:
                 "status": _run_status(started_at, finished_at),
             }
         )
+    return recent_runs
+
+
+def _classify_daily_job_changes(changes: List[JobChange]) -> Dict[str, Dict[Any, str]]:
+    per_day_job: Dict[str, Dict[Any, Dict[str, Any]]] = defaultdict(dict)
+    for change in changes:
+        created_at = getattr(change, "created_at", None)
+        if created_at is None:
+            continue
+        try:
+            day_str = _as_local(created_at).date().isoformat()
+        except Exception:
+            continue
+
+        job_key = (
+            str(getattr(change, "site", "") or ""),
+            str(getattr(change, "job_id_text", "") or ""),
+        )
+        if not job_key[0] or not job_key[1]:
+            continue
+
+        record = per_day_job[day_str].setdefault(
+            job_key,
+            {"has_insert": False, "last_type": "", "last_sort": (datetime.min, 0)},
+        )
+        change_type = str(getattr(change, "change_type", "") or "").lower()
+        if change_type == "insert":
+            record["has_insert"] = True
+
+        sort_key = (created_at, _to_int(getattr(change, "id", 0)))
+        if sort_key >= record["last_sort"]:
+            record["last_type"] = change_type
+            record["last_sort"] = sort_key
+
+    classified: Dict[str, Dict[Any, str]] = defaultdict(dict)
+    for day_str, jobs in per_day_job.items():
+        for job_key, record in jobs.items():
+            if record["has_insert"]:
+                category = "inserted"
+            elif record["last_type"] == "missing":
+                category = "missing"
+            else:
+                category = "updated"
+            classified[day_str][job_key] = category
+    return classified
+
+
+def fetch_runs_summary(days: int) -> Dict[str, Any]:
+    days = max(1, min(int(days or 30), 365))
+    since_dt = _runs_since_dt(days)
+
+    with SessionLocal() as session:
+        runs = (
+            session.execute(
+                select(IntegrationRun)
+                .where(IntegrationRun.started_at >= since_dt)
+                .order_by(IntegrationRun.started_at.asc())
+            )
+            .scalars()
+            .all()
+        )
+        changes = (
+            session.execute(
+                select(JobChange)
+                .where(JobChange.created_at >= since_dt)
+                .order_by(JobChange.created_at.asc(), JobChange.id.asc())
+            )
+            .scalars()
+            .all()
+        )
+
+    per_day: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    for r in runs:
+        started_at = r.started_at
+        if started_at is None:
+            continue
+        try:
+            day_str = _as_local(started_at).date().isoformat()
+        except Exception:
+            continue
+
+        per_day[day_str]["baseline_total_seen"] = max(
+            _to_int(per_day[day_str].get("baseline_total_seen")),
+            _to_int(getattr(r, "total_seen", 0)),
+        )
+        per_day[day_str]["error"] += _to_int(getattr(r, "error_count", 0))
+
+    for day_str, jobs in _classify_daily_job_changes(changes).items():
+        for category in jobs.values():
+            per_day[day_str][category] += 1
+
+    change_rate: List[float] = []
+    net_rate: List[float] = []
+    daily: List[Dict[str, Any]] = []
+
+    for d, day in OrderedDict(sorted(per_day.items(), key=lambda kv: kv[0])).items():
+        ins = _to_int(day.get("inserted"))
+        upd = _to_int(day.get("updated"))
+        miss = _to_int(day.get("missing"))
+        err = _to_int(day.get("error"))
+        baseline = _to_int(day.get("baseline_total_seen"))
+
+        net = ins - miss
+        if baseline > 0:
+            ch = (ins + upd + miss) / baseline
+            nr = net / baseline
+        else:
+            ch = 0.0
+            nr = 0.0
+
+        change_rate.append(ch)
+        net_rate.append(nr)
+        daily.append(
+            {
+                "date": d,
+                "baseline_total_seen": baseline,
+                "inserted": ins,
+                "updated": upd,
+                "missing": miss,
+                "unchanged": max(0, baseline - ins - upd - miss),
+                "error": err,
+                "net_change": net,
+                "change_rate_pct": round(ch * 100.0, 2),
+                "net_rate_pct": round(nr * 100.0, 2),
+            }
+        )
+
+    change_rate_ma7 = _rolling_mean(change_rate, 7)
+    net_rate_ma7 = _rolling_mean(net_rate, 7)
+    for idx, day in enumerate(daily):
+        day["change_rate_ma7_pct"] = round(change_rate_ma7[idx] * 100.0, 2)
+        day["net_rate_ma7_pct"] = round(net_rate_ma7[idx] * 100.0, 2)
 
     return {
-        "labels": labels,
-        "inserted": inserted,
-        "updated": updated,
-        "missing": missing,
-        "unchanged": unchanged,
-        "error": error,
-        "total_seen": total_seen,
-        "net_change": net_change,
-        "change_rate_pct": to_pct(change_rate),
-        "net_rate_pct": to_pct(net_rate),
-        "change_rate_ma7_pct": to_pct(change_rate_ma7),
-        "net_rate_ma7_pct": to_pct(net_rate_ma7),
-        "recent_runs": recent_runs,
+        "days": days,
+        "timezone": _get_local_tz_name(),
+        "metrics_definition": {
+            "daily_counts": "unique daily job impact",
+            "baseline": "max run total_seen for the day",
+            "change_rate": "(inserted + updated + missing) / baseline",
+            "net_rate": "(inserted - missing) / baseline",
+        },
+        "daily": daily,
+        "recent_runs": _serialize_recent_runs(runs),
+    }
+
+
+def fetch_runs(days: int) -> Dict[str, List]:
+    summary = fetch_runs_summary(days)
+    daily = summary.get("daily") or []
+
+    return {
+        "labels": [row.get("date") for row in daily],
+        "inserted": [_to_int(row.get("inserted")) for row in daily],
+        "updated": [_to_int(row.get("updated")) for row in daily],
+        "missing": [_to_int(row.get("missing")) for row in daily],
+        "unchanged": [_to_int(row.get("unchanged")) for row in daily],
+        "error": [_to_int(row.get("error")) for row in daily],
+        "total_seen": [_to_int(row.get("baseline_total_seen")) for row in daily],
+        "net_change": [_to_int(row.get("net_change")) for row in daily],
+        "change_rate_pct": [row.get("change_rate_pct", 0.0) for row in daily],
+        "net_rate_pct": [row.get("net_rate_pct", 0.0) for row in daily],
+        "change_rate_ma7_pct": [row.get("change_rate_ma7_pct", 0.0) for row in daily],
+        "net_rate_ma7_pct": [row.get("net_rate_ma7_pct", 0.0) for row in daily],
+        "recent_runs": summary.get("recent_runs") or [],
     }
 
 
@@ -2490,6 +2565,16 @@ def api_data():
     except Exception:
         days = 30
     return jsonify(fetch_runs(days))
+
+
+@app.route("/api/runs/summary")
+def api_runs_summary():
+    try:
+        days = int(request.args.get("days", "30"))
+        days = max(1, min(days, 365))
+    except Exception:
+        days = 30
+    return jsonify(fetch_runs_summary(days))
 
 
 @app.route("/api/jobs")

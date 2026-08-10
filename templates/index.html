@@ -74,7 +74,7 @@
               <span class="ml-2">Updated: <span class="font-semibold" x-text="sum(updated)"></span></span>
               <span class="ml-2">Missing: <span class="font-semibold" x-text="sum(missing)"></span></span>
               <span class="ml-2">Errors: <span class="font-semibold" x-text="sum(error)"></span></span>
-              <span class="ml-2">Total Seen: <span class="font-semibold" x-text="sum(total_seen)"></span></span>
+              <span class="ml-2">Baseline Seen: <span class="font-semibold" x-text="sum(total_seen)"></span></span>
               <span class="ml-2">Net Δ: <span class="font-semibold" x-text="sum(net_change)"></span></span>
             </div>
           </section>
@@ -138,7 +138,7 @@
 
           <section class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4">
             
-            <h2 class="text-sm font-semibold text-slate-800 mb-2">Daily counts</h2>
+            <h2 class="text-sm font-semibold text-slate-800 mb-2">Unique daily impact</h2>
             <div class="h-80">
               <canvas id="runsChart"></canvas>
             </div>
@@ -150,7 +150,8 @@
               <canvas id="runsRateChart"></canvas>
             </div>
             <p class="mt-2 text-xs text-slate-500">
-              Change % = (Inserted + Updated + Missing) / Total Seen · 100. Net % = (Inserted − Missing) / Total Seen · 100.
+              Daily counts deduplicate repeated runs by job. Baseline seen is the largest run total for the day.
+              Change % = (Inserted + Updated + Missing) / Baseline Seen · 100. Net % = (Inserted − Missing) / Baseline Seen · 100.
               Dashed lines show 7-day rolling averages.
             </p>
           </section>
@@ -806,22 +807,62 @@
                         <th class="py-2 pr-4">Source</th>
                         <th class="py-2 pr-4">Type</th>
                         <th class="py-2 pr-4">Fields</th>
+                        <th class="py-2 pr-4 text-right">Details</th>
                       </tr>
                     </thead>
-                    <tbody>
-                      <template x-for="change in (selectedJob().changes || [])" :key="change.id">
-                        <tr class="border-b">
-                          <td class="py-2 pr-4" x-text="change.created_at || '-'"></td>
-                          <td class="py-2 pr-4">
-                            <span class="inline-flex rounded px-2 py-0.5 text-xs font-medium"
-                                  :class="(change.change_source || 'site') === 'ai' ? 'bg-violet-100 text-violet-700' : 'bg-slate-100 text-slate-700'"
-                                  x-text="change.change_source || 'site'"></span>
-                          </td>
-                          <td class="py-2 pr-4" x-text="change.change_type || '-'"></td>
-                          <td class="py-2 pr-4" x-text="change.changed_fields || '-'"></td>
-                        </tr>
-                      </template>
-                    </tbody>
+                    <template x-for="change in (selectedJob().changes || [])" :key="change.id">
+                        <tbody>
+                          <tr class="border-b">
+                            <td class="py-2 pr-4" x-text="change.created_at || '-'"></td>
+                            <td class="py-2 pr-4">
+                              <span class="inline-flex rounded px-2 py-0.5 text-xs font-medium"
+                                    :class="(change.change_source || 'site') === 'ai' ? 'bg-violet-100 text-violet-700' : 'bg-slate-100 text-slate-700'"
+                                    x-text="change.change_source || 'site'"></span>
+                            </td>
+                            <td class="py-2 pr-4" x-text="change.change_type || '-'"></td>
+                            <td class="py-2 pr-4" x-text="(change.fields || []).length ? change.fields.join(', ') : (change.changed_fields || '-')"></td>
+                            <td class="py-2 pr-4 text-right">
+                              <button type="button"
+                                      @click="toggleChangeDetails(change.id)"
+                                      class="px-2 py-1 border border-slate-300 bg-white text-xs text-slate-700 hover:bg-slate-50">
+                                <span x-text="changeExpanded(change.id) ? 'Hide' : 'Details'"></span>
+                              </button>
+                            </td>
+                          </tr>
+                          <tr class="border-b bg-slate-50" x-show="changeExpanded(change.id)">
+                            <td colspan="5" class="p-3">
+                              <template x-if="change.has_detail && (change.diffs || []).length">
+                                <div class="space-y-3">
+                                  <template x-for="diff in change.diffs" :key="`${change.id}-${diff.field}`">
+                                    <div class="border border-slate-200 bg-white">
+                                      <div class="px-3 py-2 text-xs font-semibold text-slate-700 border-b border-slate-200" x-text="diff.field"></div>
+                                      <template x-if="diff.lines && diff.lines.length">
+                                        <div class="text-xs overflow-auto max-h-96 font-mono">
+                                          <template x-for="(line, lineIdx) in diff.lines" :key="`${change.id}-${diff.field}-${lineIdx}`">
+                                            <div class="grid grid-cols-[2rem_1fr] px-2" :class="changeDiffLineClass(line)">
+                                              <span class="select-none text-slate-500" x-text="line.marker"></span>
+                                              <span class="whitespace-pre-wrap break-words" x-text="line.text"></span>
+                                            </div>
+                                          </template>
+                                        </div>
+                                      </template>
+                                      <template x-if="!(diff.lines && diff.lines.length)">
+                                        <div class="grid grid-cols-1 md:grid-cols-2 gap-2 p-3 text-xs">
+                                          <pre class="whitespace-pre-wrap break-words bg-red-50 text-red-950 p-2 max-h-64 overflow-auto" x-show="diff.before" x-text="diff.before"></pre>
+                                          <pre class="whitespace-pre-wrap break-words bg-green-50 text-green-950 p-2 max-h-64 overflow-auto" x-show="diff.after" x-text="diff.after"></pre>
+                                        </div>
+                                      </template>
+                                    </div>
+                                  </template>
+                                </div>
+                              </template>
+                              <template x-if="!change.has_detail">
+                                <div class="text-sm text-slate-500">Detailed content changes were not stored for this legacy change row.</div>
+                              </template>
+                            </td>
+                          </tr>
+                        </tbody>
+                    </template>
                   </table>
                   <div class="text-sm text-slate-500 py-3" x-show="!(selectedJob().changes || []).length">
                     No change records found.
@@ -991,6 +1032,7 @@
           // Runs state
           days: 30,
           runsLoaded: false,
+          dailyMetrics: [],
           labels: [],
           inserted: [],
           updated: [],
@@ -1061,6 +1103,7 @@
           lookupLoading: false,
           lookupResults: [],
           selectedJobId: null,
+          expandedChangeIds: [],
 
           // Discovery state
           discoveryLoaded: false,
@@ -1079,27 +1122,29 @@
           sum(arr) { return (arr || []).reduce((a,b)=>a+(b||0), 0); },
 
           // ---------------- RUNS ----------------
-          // Fetch the runs summary payload and refresh both run charts.
+          // Fetch the REST summary payload and refresh both run charts.
           async loadRuns() {
             this.runsLoaded = false;
-            const res = await fetch(`/api/data?days=${this.days}`);
+            const res = await fetch(`/api/runs/summary?days=${this.days}`);
             const data = await res.json();
+            const daily = data.daily || [];
 
-            // Copy the latest API payload into Alpine state used by the table and charts.
-            this.labels = data.labels || [];
-            this.inserted = data.inserted || [];
-            this.updated = data.updated || [];
-            this.missing = data.missing || [];
-            this.unchanged = data.unchanged || [];
-            this.error = data.error || [];
-            this.total_seen = data.total_seen || [];
-            this.net_change = data.net_change || [];
+            // Keep the frontend hydrated from domain rows, then derive chart series locally.
+            this.dailyMetrics = daily;
+            this.labels = daily.map(row => row.date);
+            this.inserted = daily.map(row => row.inserted || 0);
+            this.updated = daily.map(row => row.updated || 0);
+            this.missing = daily.map(row => row.missing || 0);
+            this.unchanged = daily.map(row => row.unchanged || 0);
+            this.error = daily.map(row => row.error || 0);
+            this.total_seen = daily.map(row => row.baseline_total_seen || 0);
+            this.net_change = daily.map(row => row.net_change || 0);
             this.recentRuns = data.recent_runs || [];
             this.runsVisibleLimit = 10;
-            this.change_rate_pct = data.change_rate_pct || [];
-            this.net_rate_pct = data.net_rate_pct || [];
-            this.change_rate_ma7_pct = data.change_rate_ma7_pct || [];
-            this.net_rate_ma7_pct = data.net_rate_ma7_pct || [];
+            this.change_rate_pct = daily.map(row => row.change_rate_pct || 0);
+            this.net_rate_pct = daily.map(row => row.net_rate_pct || 0);
+            this.change_rate_ma7_pct = daily.map(row => row.change_rate_ma7_pct || 0);
+            this.net_rate_ma7_pct = daily.map(row => row.net_rate_ma7_pct || 0);
 
             // Rebuild charts after replacing the source arrays.
             this.renderCountsChart();
@@ -1159,7 +1204,7 @@
 
             // Overlay the total seen line on top of the stacked bars.
             const totalDataset = {
-              label: 'Total Seen',
+              label: 'Baseline Seen',
               data: this.total_seen,
               type: 'line',
               yAxisID: 'y',
@@ -2203,6 +2248,7 @@
             this.lookupLoaded = false;
             this.lookupResults = [];
             this.selectedJobId = null;
+            this.expandedChangeIds = [];
 
             const res = await fetch(`/api/job-lookup?q=${encodeURIComponent(q)}`);
             const data = await res.json();
@@ -2225,6 +2271,7 @@
             this.lookupLoaded = false;
             this.lookupResults = [];
             this.selectedJobId = null;
+            this.expandedChangeIds = [];
 
             const res = await fetch(`/api/job-detail?id=${encodeURIComponent(jobId)}`);
             const data = await res.json();
@@ -2238,6 +2285,29 @@
           // Resolve the currently highlighted lookup row into the detail object shown on the right.
           selectedJob() {
             return (this.lookupResults || []).find(j => j.id === this.selectedJobId) || null;
+          },
+
+          toggleChangeDetails(id) {
+            if (this.expandedChangeIds.includes(id)) {
+              this.expandedChangeIds = this.expandedChangeIds.filter(item => item !== id);
+            } else {
+              this.expandedChangeIds = [...this.expandedChangeIds, id];
+            }
+          },
+
+          changeExpanded(id) {
+            return this.expandedChangeIds.includes(id);
+          },
+
+          changeDiffLineClass(line) {
+            const classes = {
+              file: 'bg-slate-100 text-slate-700 font-semibold',
+              hunk: 'bg-indigo-50 text-indigo-700',
+              add: 'bg-green-50 text-green-950',
+              remove: 'bg-red-50 text-red-950',
+              context: 'bg-white text-slate-800'
+            };
+            return classes[line?.type] || classes.context;
           },
 
           // ---------------- DISCOVERY ----------------
