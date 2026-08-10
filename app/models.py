@@ -166,6 +166,7 @@ class JobChange(Base):
     old_hash = Column(String(64))
     new_hash = Column(String(64))
     changed_fields = Column(Text)  # comma-separated list or JSON
+    change_details = Column(LONGTEXT().with_variant(Text, "sqlite"), nullable=True)
     created_at = Column(
         DateTime(timezone=False), server_default=func.now(), nullable=False
     )
@@ -229,8 +230,24 @@ def ensure_job_compensation_columns(bind=None) -> None:
                 conn.execute(text(f"ALTER TABLE jobs ADD COLUMN {name} {column_type}"))
 
 
+def ensure_job_change_details_column(bind=None) -> None:
+    """Add rich change details for future dashboard diffs."""
+    target = bind or engine
+    inspector = sa_inspect(target)
+    if "job_changes" not in inspector.get_table_names():
+        return
+    columns = {col["name"] for col in inspector.get_columns("job_changes")}
+    if "change_details" in columns:
+        return
+
+    column_type = "LONGTEXT" if target.dialect.name == "mysql" else "TEXT"
+    with target.begin() as conn:
+        conn.execute(text(f"ALTER TABLE job_changes ADD COLUMN change_details {column_type}"))
+
+
 def init_db() -> None:
     """Create tables and apply the small additive runtime schema updates."""
     Base.metadata.create_all(bind=engine)
     ensure_job_reference_fields_column(engine)
     ensure_job_compensation_columns(engine)
+    ensure_job_change_details_column(engine)

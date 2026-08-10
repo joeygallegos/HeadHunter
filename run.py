@@ -1,7 +1,7 @@
 # /run.py
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime
 import getpass
 import hashlib
 import json
@@ -33,7 +33,12 @@ from app.utils import (
     scan_for_pay_range,
     remove_canned_text,
 )
+from app.compensation import (
+    choose_deterministic_compensation,
+    format_compensation_summary,
+)
 from app.models import SessionLocal, init_db, IntegrationRun, Job, JobChange
+from app.db import utc_now_naive
 
 OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 
@@ -331,6 +336,29 @@ def _changed_fields(old: Job, new: Job) -> List[str]:
     return [f for f in fields if (getattr(old, f) or "") != (getattr(new, f) or "")]
 
 
+JOB_CHANGE_DETAIL_FIELDS = ["title", "url", "desc", "keywords", "level", "pay", "reference_fields"]
+
+
+def _job_change_snapshot(job: Job, fields: List[str]) -> Dict[str, str]:
+    """Capture string values before an update overwrites the ORM row."""
+    return {field: str(getattr(job, field) or "") for field in fields}
+
+
+def _job_change_details(
+    fields: List[str],
+    *,
+    before: Dict[str, Any] | None = None,
+    after: Dict[str, Any] | None = None,
+) -> str:
+    payload = {
+        "schema_version": 1,
+        "fields": fields,
+        "before": before or {},
+        "after": after or {},
+    }
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
 def _normalize_job(site: str, run_id: int, job_data: Dict[str, Any]) -> Job | None:
     job_id = _norm_text(str(job_data.get("JobID", "")))
     job_id = job_id.strip()
@@ -351,14 +379,22 @@ def _normalize_job(site: str, run_id: int, job_data: Dict[str, Any]) -> Job | No
 
     # Prefer source-provided pay fields; description scanning is only a fallback.
     explicit_pay = _norm_text(str(job_data.get("JobPay", "")))
-    pay_hits = scan_for_pay_range(explicit_pay) or scan_for_pay_range(desc) or []
-    pay = pay_hits[0] if pay_hits else "Unknown"
+    reference_pay_values = [
+        _norm_text(str(value))
+        for key, value in job_data.items()
+        if key not in {"JobPay", "JobDesc"}
+        and any(part in str(key).lower() for part in ("salary", "pay", "compensation"))
+    ]
+    compensation = choose_deterministic_compensation(
+        explicit_pay, desc, reference_pay_values
+    )
+    pay = format_compensation_summary(compensation) or "Unknown"
 
     reference_fields = _serialize_reference_fields(job_data)
 
     # NOTE: Keep setting discovery_date here for inserts,
     # but DO NOT copy it onto existing rows during updates.
-    discovery_date = datetime.now(timezone.utc)
+    discovery_date = utc_now_naive()
 
     job = Job(
         job_id=job_id,
@@ -528,6 +564,10 @@ def _process_site(
                     old_hash=None,
                     new_hash=job_obj.content_hash,
                     changed_fields="title,url,desc,keywords,level,pay,reference_fields",
+                    change_details=_job_change_details(
+                        JOB_CHANGE_DETAIL_FIELDS,
+                        after=_job_change_snapshot(job_obj, JOB_CHANGE_DETAIL_FIELDS),
+                    ),
                 )
             )
             counters["inserted_count"] += 1
@@ -537,6 +577,8 @@ def _process_site(
         def _update_existing(target: Job):
             old_hash = target.content_hash
             changed = _changed_fields(target, job_obj)
+            before = _job_change_snapshot(target, changed)
+            after = _job_change_snapshot(job_obj, changed)
 
             target.title = job_obj.title
             target.url = job_obj.url
@@ -545,6 +587,10 @@ def _process_site(
             target.level = job_obj.level
             target.pay = job_obj.pay
             target.reference_fields = job_obj.reference_fields
+            if any(field in changed for field in ("desc", "pay", "reference_fields")):
+                # Preserve the last AI result for audit/display, but mark it stale
+                # so the resumable compensation command will revisit this job.
+                target.compensation_schema_version = None
 
             # CRITICAL FIX: never overwrite discovery_date on update
             # target.discovery_date stays as first-seen timestamp
@@ -564,6 +610,11 @@ def _process_site(
                     old_hash=old_hash,
                     new_hash=job_obj.content_hash,
                     changed_fields=",".join(changed),
+                    change_details=_job_change_details(
+                        changed,
+                        before=before,
+                        after=after,
+                    ),
                 )
             )
             counters["updated_count"] += 1
@@ -634,6 +685,14 @@ def _process_site(
                             old_hash=r.content_hash,
                             new_hash=None,
                             changed_fields="",
+                            change_details=_job_change_details(
+                                ["is_active", *JOB_CHANGE_DETAIL_FIELDS],
+                                before={
+                                    "is_active": "true",
+                                    **_job_change_snapshot(r, JOB_CHANGE_DETAIL_FIELDS),
+                                },
+                                after={"is_active": "false"},
+                            ),
                         )
                     )
                     counters["missing_count"] += 1
