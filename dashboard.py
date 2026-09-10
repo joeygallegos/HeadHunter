@@ -61,6 +61,9 @@ load_dotenv()
 
 # NOTE: app/models.py currently prints DATABASE_URL on import. Remove that print.
 from app.models import (  # type: ignore
+    APPLICATION_PREP_DEFAULT_MIN_MATCH,
+    ApplicationPrepSettings,
+    ResponsibilitiesInventory,
     Base,
     JobChange,
     JobFitBrief,
@@ -73,6 +76,8 @@ from app.models import (  # type: ignore
     ensure_job_compensation_columns,
     ensure_job_fit_briefs_table,
     ensure_job_application_preps_table,
+    ensure_application_prep_settings_table,
+    ensure_responsibilities_inventory_table,
 )
 from app.db import resolve_display_timezone, utc_now_naive
 
@@ -82,7 +87,10 @@ DEFAULT_STEPS_PATH = os.path.join(BASE_DIR, "steps.json")
 DEFAULT_SUGGESTIONS_PATH = os.path.join(OUTPUT_DIR, "steps_suggestions.json")
 RESUME_PATH = os.getenv("RESUME_PATH", os.path.join(BASE_DIR, "resume.txt"))
 DASH_FIT_BRIEF_MIN_MATCH = int(os.getenv("AI_FIT_BRIEF_MIN_MATCH", "75"))
-APPLICATION_PREP_SCHEMA_VERSION = 1
+APPLICATION_PREP_SCHEMA_VERSION = 2
+APPLICATION_PREP_INVENTORY_MAX_TOKENS = max(
+    0, int(os.getenv("APPLICATION_PREP_INVENTORY_MAX_TOKENS", "1200"))
+)
 
 
 def read_json_file(path: str, default: Any) -> Any:
@@ -418,6 +426,8 @@ def _ensure_reference_fields_column() -> None:
         ensure_job_compensation_columns(bind)
         ensure_job_fit_briefs_table(bind)
         ensure_job_application_preps_table(bind)
+        ensure_application_prep_settings_table(bind)
+        ensure_responsibilities_inventory_table(bind)
     _REFERENCE_FIELDS_COLUMN_READY = True
 
 
@@ -767,11 +777,21 @@ def record_swipe(job: Dict[str, Any], action: str) -> Dict[str, Any]:
             session.add(JobSwipe(job_pk=db_job.id, action=action))
         session.commit()
     prep = None
+    queued = False
+    eligible = None
     if action == "like" and saved_job_pk:
         prep_result = queue_application_prep_for_job(saved_job_pk)
         prep = prep_result.get("application_prep")
-        _start_application_prep_worker()
-    return {"success": True, "application_prep": prep}
+        queued = bool(prep_result.get("queued"))
+        eligible = prep_result.get("eligible")
+        if queued:
+            _start_application_prep_worker()
+    return {
+        "success": True,
+        "application_prep": prep,
+        "application_prep_eligible": eligible,
+        "application_prep_queued": queued,
+    }
 
 
 def queue_application_prep_for_job(job_pk: int, *, force: bool = False) -> Dict[str, Any]:
@@ -785,6 +805,8 @@ def queue_application_prep_for_job(job_pk: int, *, force: bool = False) -> Dict[
         if job is None:
             return {"found": False, "application_prep": None}
 
+        context = _application_prep_context(session)
+        eligibility = _application_prep_eligibility(job, context)
         prep = (
             session.execute(
                 select(JobApplicationPrep).where(JobApplicationPrep.job_pk == job.id)
@@ -792,11 +814,23 @@ def queue_application_prep_for_job(job_pk: int, *, force: bool = False) -> Dict[
             .scalars()
             .one_or_none()
         )
+        if not eligibility["eligible"]:
+            return {
+                "found": True,
+                "eligible": False,
+                "queued": False,
+                "reason": eligibility["reason"],
+                "threshold": eligibility["minimum_match_percentage"],
+                "application_prep": _serialize_application_prep(job, context),
+            }
+
         now = utc_now_naive()
+        queued = False
         if prep is None:
             prep = JobApplicationPrep(job_pk=job.id)
             session.add(prep)
-        current_status = _application_prep_status(job, prep)
+            queued = True
+        current_status = _application_prep_status(job, prep, context)
         if force or current_status in {"none", "queued", "failed", "stale"}:
             prep.status = "queued"
             prep.queued_at = now
@@ -804,16 +838,22 @@ def queue_application_prep_for_job(job_pk: int, *, force: bool = False) -> Dict[
             prep.error_text = None
             if force:
                 prep.generated_at = None
+            queued = True
         session.commit()
         return {
             "found": True,
-            "application_prep": _serialize_application_prep(job),
+            "eligible": True,
+            "queued": queued,
+            "reason": "",
+            "threshold": eligibility["minimum_match_percentage"],
+            "application_prep": _serialize_application_prep(job, context),
         }
 
 
 def fetch_application_prep_deck() -> Dict[str, Any]:
     _ensure_reference_fields_column()
     with SessionLocal() as session:
+        context = _application_prep_context(session)
         rows = (
             session.execute(
                 select(Job)
@@ -827,7 +867,7 @@ def fetch_application_prep_deck() -> Dict[str, Any]:
         )
         jobs = []
         for job in rows:
-            prep = _serialize_application_prep(job)
+            prep = _serialize_application_prep(job, context)
             jobs.append(
                 {
                     "id": job.id,
@@ -845,7 +885,61 @@ def fetch_application_prep_deck() -> Dict[str, Any]:
                     "application_prep": prep,
                 }
             )
-    return {"returned": len(jobs), "jobs": jobs}
+    return {
+        "returned": len(jobs),
+        "jobs": jobs,
+        "minimum_match_percentage": context["minimum_match_percentage"],
+    }
+
+
+def fetch_application_prep_settings() -> Dict[str, Any]:
+    """Return the editable threshold and active Markdown evidence inventory."""
+    _ensure_reference_fields_column()
+    with SessionLocal() as session:
+        context = _application_prep_context(session)
+    return {
+        "minimum_match_percentage": context["minimum_match_percentage"],
+        "inventory_markdown": context["inventory_markdown"],
+        "inventory_updated_at": _fmt_dt(context["inventory_updated_at"]) or "",
+        "inventory_max_tokens": APPLICATION_PREP_INVENTORY_MAX_TOKENS,
+    }
+
+
+def save_application_prep_settings(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Persist the only Application Prep setting and its grounded evidence source."""
+    raw_minimum = data.get("minimum_match_percentage")
+    if isinstance(raw_minimum, bool):
+        raise ValueError("minimum_match_percentage must be an integer from 0 to 100")
+    try:
+        minimum_match_percentage = int(raw_minimum)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("minimum_match_percentage must be an integer from 0 to 100") from exc
+    if not 0 <= minimum_match_percentage <= 100:
+        raise ValueError("minimum_match_percentage must be an integer from 0 to 100")
+
+    markdown = data.get("inventory_markdown")
+    if not isinstance(markdown, str):
+        raise ValueError("inventory_markdown must be text")
+    if len(markdown) > 120000:
+        raise ValueError("inventory_markdown must be 120,000 characters or fewer")
+
+    _ensure_reference_fields_column()
+    with SessionLocal() as session:
+        settings = session.get(ApplicationPrepSettings, 1)
+        if settings is None:
+            settings = ApplicationPrepSettings(id=1)
+            session.add(settings)
+        settings.minimum_match_percentage = minimum_match_percentage
+
+        inventory = session.get(ResponsibilitiesInventory, 1)
+        if inventory is None:
+            inventory = ResponsibilitiesInventory(id=1)
+            session.add(inventory)
+        inventory.markdown = markdown
+        inventory.content_hash = _stable_text_hash(markdown)
+        inventory.updated_at = utc_now_naive()
+        session.commit()
+    return fetch_application_prep_settings()
 
 
 # ----------------------------------------------------------------------
@@ -1467,6 +1561,48 @@ def _current_resume_hash() -> str:
         return ""
 
 
+def _application_prep_context(session) -> Dict[str, Any]:
+    """Read the shared eligibility setting and active evidence inventory once."""
+    settings = session.get(ApplicationPrepSettings, 1)
+    raw_minimum = getattr(
+        settings, "minimum_match_percentage", APPLICATION_PREP_DEFAULT_MIN_MATCH
+    )
+    try:
+        minimum_match_percentage = int(raw_minimum)
+    except (TypeError, ValueError):
+        minimum_match_percentage = APPLICATION_PREP_DEFAULT_MIN_MATCH
+    minimum_match_percentage = max(0, min(100, minimum_match_percentage))
+
+    inventory = session.get(ResponsibilitiesInventory, 1)
+    markdown = str(getattr(inventory, "markdown", "") or "")
+    return {
+        "minimum_match_percentage": minimum_match_percentage,
+        "inventory_markdown": markdown,
+        "inventory_hash": str(getattr(inventory, "content_hash", "") or ""),
+        "inventory_updated_at": getattr(inventory, "updated_at", None),
+    }
+
+
+def _application_prep_eligibility(j: Job, context: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep all dashboard Application Prep entry points on one score rule."""
+    minimum = int(context["minimum_match_percentage"])
+    score = getattr(j, "ai_match_percentage", None)
+    if not bool(j.is_active):
+        reason = "This job is no longer active."
+    elif score is None:
+        reason = "This job has no final AI match score yet."
+    elif score < minimum:
+        reason = f"Application Prep requires a match score of at least {minimum}% (this job is {score}%)."
+    else:
+        reason = ""
+    return {
+        "eligible": not reason,
+        "minimum_match_percentage": minimum,
+        "match_percentage": score,
+        "reason": reason,
+    }
+
+
 def _fit_brief_job_hash(j: Job) -> str:
     return j.content_hash or _stable_text_hash(
         "|".join([j.title or "", j.desc or "", j.ai_analysis or ""])
@@ -1509,15 +1645,20 @@ def _serialize_fit_brief(j: Job) -> Dict[str, Any]:
     }
 
 
-def _application_prep_status(j: Job, prep: Optional[JobApplicationPrep]) -> str:
+def _application_prep_status(
+    j: Job, prep: Optional[JobApplicationPrep], context: Dict[str, Any]
+) -> str:
     if prep is None:
         return "none"
+    if not _application_prep_eligibility(j, context)["eligible"]:
+        return "ineligible"
     status = (prep.status or "queued").strip().lower()
     if status in {"queued", "running", "failed"}:
         return status
     current_resume_hash = _current_resume_hash()
     if (
         (current_resume_hash and prep.resume_hash != current_resume_hash)
+        or (prep.responsibilities_hash or "") != context["inventory_hash"]
         or prep.job_content_hash != _application_prep_job_hash(j)
         or prep.schema_version != APPLICATION_PREP_SCHEMA_VERSION
     ):
@@ -1525,7 +1666,13 @@ def _application_prep_status(j: Job, prep: Optional[JobApplicationPrep]) -> str:
     return "done" if status == "done" else status
 
 
-def _serialize_application_prep(j: Job) -> Dict[str, Any]:
+def _serialize_application_prep(
+    j: Job, context: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    context = context or {
+        "minimum_match_percentage": APPLICATION_PREP_DEFAULT_MIN_MATCH,
+        "inventory_hash": "",
+    }
     prep = getattr(j, "application_prep", None)
     if prep is None:
         return {
@@ -1541,7 +1688,7 @@ def _serialize_application_prep(j: Job) -> Dict[str, Any]:
     payload = _safe_json_loads(getattr(prep, "prep_json", None)) or {}
     return {
         "available": bool(isinstance(payload, dict) and payload),
-        "status": _application_prep_status(j, prep),
+        "status": _application_prep_status(j, prep, context),
         "queued_at": _fmt_dt(getattr(prep, "queued_at", None)) or "",
         "started_at": _fmt_dt(getattr(prep, "started_at", None)) or "",
         "generated_at": _fmt_dt(getattr(prep, "generated_at", None)) or "",
@@ -1551,7 +1698,13 @@ def _serialize_application_prep(j: Job) -> Dict[str, Any]:
     }
 
 
-def _serialize_job_detail(j: Job, changes: List[JobChange]) -> Dict[str, Any]:
+def _serialize_job_detail(
+    j: Job, changes: List[JobChange], context: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    context = context or {
+        "minimum_match_percentage": APPLICATION_PREP_DEFAULT_MIN_MATCH,
+        "inventory_hash": "",
+    }
     ai_raw = (getattr(j, "ai_analysis", None) or "").strip()
     ai_obj = _safe_json_loads(ai_raw)
     ai_row = _job_ai_columns(j)
@@ -1577,7 +1730,9 @@ def _serialize_job_detail(j: Job, changes: List[JobChange]) -> Dict[str, Any]:
         "ai_row": ai_row,
         "ai_raw": ai_raw if not ai_obj else "",
         "fit_brief": _serialize_fit_brief(j),
-        "application_prep": _serialize_application_prep(j),
+        "swipe_action": getattr(getattr(j, "swipe", None), "action", None) or "",
+        "application_prep_eligibility": _application_prep_eligibility(j, context),
+        "application_prep": _serialize_application_prep(j, context),
         "changes": [_serialize_change(c) for c in changes],
     }
 
@@ -2799,6 +2954,7 @@ def fetch_job_lookup(query: str, limit: int = 25) -> Dict[str, Any]:
 
     _ensure_reference_fields_column()
     with SessionLocal() as session:
+        context = _application_prep_context(session)
         exact_jobs = (
             session.execute(
                 select(Job)
@@ -2842,7 +2998,7 @@ def fetch_job_lookup(query: str, limit: int = 25) -> Dict[str, Any]:
                 .scalars()
                 .all()
             )
-            out.append(_serialize_job_detail(job, changes))
+            out.append(_serialize_job_detail(job, changes, context))
 
     return {"query": q, "returned": len(out), "exact": bool(exact_jobs), "jobs": out}
 
@@ -2854,6 +3010,7 @@ def fetch_job_detail_by_id(job_pk: int) -> Dict[str, Any]:
 
     _ensure_reference_fields_column()
     with SessionLocal() as session:
+        context = _application_prep_context(session)
         job = session.get(Job, job_pk)
         if job is None:
             return {"id": job_pk, "found": False, "job": None}
@@ -2869,7 +3026,11 @@ def fetch_job_detail_by_id(job_pk: int) -> Dict[str, Any]:
             .scalars()
             .all()
         )
-        return {"id": job_pk, "found": True, "job": _serialize_job_detail(job, changes)}
+        return {
+            "id": job_pk,
+            "found": True,
+            "job": _serialize_job_detail(job, changes, context),
+        }
 
 
 def fetch_job_detail_by_identity(site: str, job_id: str) -> Dict[str, Any]:
@@ -2881,6 +3042,7 @@ def fetch_job_detail_by_identity(site: str, job_id: str) -> Dict[str, Any]:
 
     _ensure_reference_fields_column()
     with SessionLocal() as session:
+        context = _application_prep_context(session)
         job = session.execute(
             select(Job)
             .where(Job.site == site)
@@ -2905,7 +3067,7 @@ def fetch_job_detail_by_identity(site: str, job_id: str) -> Dict[str, Any]:
             "site": site,
             "job_id": job_id,
             "found": True,
-            "job": _serialize_job_detail(job, changes),
+            "job": _serialize_job_detail(job, changes, context),
         }
 
 
@@ -2924,13 +3086,19 @@ app = Flask(__name__)
 # ----------------------------------------------------------------------
 @app.route("/")
 def index():
-    # Job Lookup is addressable for the standalone detail page's return link.
-    initial_view = "lookup" if request.args.get("view") == "lookup" else "runs"
+    # Keep dashboard sections addressable so Application Prep can open one job directly.
+    requested_view = (request.args.get("view") or "").strip()
+    initial_view = requested_view if requested_view in {"lookup", "applicationPrep", "settings"} else "runs"
+    try:
+        initial_application_prep_job_id = max(0, int(request.args.get("job", "0")))
+    except ValueError:
+        initial_application_prep_job_id = 0
     return render_template(
         "index.html",
         initial_view=initial_view,
         job_detail_page=False,
         initial_job=None,
+        initial_application_prep_job_id=initial_application_prep_job_id,
     )
 
 
@@ -2942,6 +3110,7 @@ def report_page():
         initial_view="jobs",
         job_detail_page=False,
         initial_job=None,
+        initial_application_prep_job_id=0,
     )
 
 
@@ -2959,6 +3128,7 @@ def job_detail_page(site: str, job_id: str):
         initial_view="lookup",
         job_detail_page=True,
         initial_job=job,
+        initial_application_prep_job_id=0,
         page_title=f"{page_label} | Job Detail",
     )
 
@@ -2994,6 +3164,19 @@ def swipe_api():
         result = record_swipe(job, action)
         if not result.get("success"):
             return jsonify(error="job not found in database"), 404
+        return jsonify(result)
+    except Exception as exc:
+        return jsonify(error=str(exc)), 500
+
+
+@app.route("/api/jobs/<int:job_pk>/move-forward", methods=["POST"])
+def api_job_move_forward(job_pk: int):
+    """Move a standalone detail-page job forward through the shared swipe path."""
+    try:
+        result = record_swipe({"id": job_pk}, "like")
+        if not result.get("success"):
+            return jsonify(error="job not found in database"), 404
+        result["application_prep_url"] = f"/?view=applicationPrep&job={job_pk}"
         return jsonify(result)
     except Exception as exc:
         return jsonify(error=str(exc)), 500
@@ -3199,6 +3382,18 @@ def api_application_prep_jobs():
         return jsonify(error=str(exc), jobs=[]), 500
 
 
+@app.route("/api/application-prep/settings", methods=["GET", "PUT"])
+def api_application_prep_settings():
+    try:
+        if request.method == "GET":
+            return jsonify(fetch_application_prep_settings())
+        return jsonify(save_application_prep_settings(request.get_json(silent=True) or {}))
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
+    except Exception as exc:
+        return jsonify(error=str(exc)), 500
+
+
 @app.route("/api/application-prep/jobs/<int:job_pk>")
 def api_application_prep_job(job_pk: int):
     try:
@@ -3213,7 +3408,10 @@ def api_application_prep_queue(job_pk: int):
         result = queue_application_prep_for_job(job_pk, force=True)
         if not result.get("found"):
             return jsonify(error="job not found in database"), 404
-        _start_application_prep_worker()
+        if not result.get("eligible"):
+            return jsonify(error=result.get("reason") or "job is not eligible for Application Prep"), 409
+        if result.get("queued"):
+            _start_application_prep_worker()
         return jsonify(result)
     except Exception as exc:
         return jsonify(error=str(exc)), 500

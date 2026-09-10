@@ -79,6 +79,9 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from sqlalchemy import inspect as sa_inspect, or_, select, text as sa_text
 from sqlalchemy.orm import Session
 from app.models import (
+    APPLICATION_PREP_DEFAULT_MIN_MATCH,
+    ApplicationPrepSettings,
+    ResponsibilitiesInventory,
     SessionLocal,
     Job,
     JobSwipe,
@@ -206,7 +209,7 @@ COMPENSATION_SYSTEM_PROMPT_PATH = os.getenv(
 )
 COMPENSATION_SCHEMA_VERSION = 1
 FIT_BRIEF_SCHEMA_VERSION = 1
-APPLICATION_PREP_SCHEMA_VERSION = 1
+APPLICATION_PREP_SCHEMA_VERSION = 2
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "deepseek-r1:8b")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
 ONLY_EMPTY = os.getenv("ONLY_EMPTY", "true").lower() == "true"
@@ -276,6 +279,9 @@ def parse_ollama_think(value: str) -> Any:
 
 OLLAMA_THINK = parse_ollama_think(os.getenv("OLLAMA_THINK", "false"))
 APPLICATION_PREP_THINK = parse_ollama_think(os.getenv("APPLICATION_PREP_THINK", "false"))
+APPLICATION_PREP_INVENTORY_MAX_TOKENS = max(
+    0, int(os.getenv("APPLICATION_PREP_INVENTORY_MAX_TOKENS", "1200"))
+)
 
 REQUIRED_KEYS = {
     "match_percentage",
@@ -357,6 +363,8 @@ class ApplicationPrepTask:
     ai_analysis: str
     ai_match_percentage: Optional[int]
     content_hash: Optional[str]
+    responsibilities_text: str = ""
+    responsibilities_hash: str = ""
 
 
 class OllamaEmptyContentError(RuntimeError):
@@ -1172,10 +1180,12 @@ APPLICATION_PREP_REQUIRED_KEYS = {
 }
 APPLICATION_PREP_BULLET_KEYS = {
     "bullet",
-    "source_resume_evidence",
+    "evidence_sources",
     "job_requirement",
     "confidence",
 }
+APPLICATION_PREP_SOURCE_KEYS = {"source", "evidence"}
+APPLICATION_PREP_EVIDENCE_SOURCE_TYPES = {"resume", "responsibilities_inventory"}
 APPLICATION_PREP_EVIDENCE_KEYS = {
     "draft_bullet",
     "note",
@@ -1248,6 +1258,9 @@ def build_application_prep_messages(resume_text: str, task: ApplicationPrepTask)
         "<resume>\n"
         f"{clean_text(resume_text)}\n"
         "</resume>\n\n"
+        "<responsibilities_inventory>\n"
+        f"{clean_text(task.responsibilities_text)}\n"
+        "</responsibilities_inventory>\n\n"
         "<job_title>\n"
         f"{clean_text(task.title)}\n"
         "</job_title>\n\n"
@@ -1271,7 +1284,9 @@ def _normalize_short_str_list(value: Any, limit: int = 8) -> Optional[List[str]]
     return [item[:500].strip() for item in items if item.strip()][:limit]
 
 
-def validate_application_prep_schema(payload: Any, resume_text: str) -> Tuple[bool, str]:
+def validate_application_prep_schema(
+    payload: Any, resume_text: str, responsibilities_text: str = ""
+) -> Tuple[bool, str]:
     """Validate and normalize Application Prep JSON before persistence."""
     if not isinstance(payload, dict):
         return False, "payload not an object"
@@ -1292,24 +1307,40 @@ def validate_application_prep_schema(payload: Any, resume_text: str) -> Tuple[bo
     bullets = payload.get("draft_resume_bullets")
     if not isinstance(bullets, list):
         return False, "draft_resume_bullets must be a list"
-    normalized_bullets: List[Dict[str, str]] = []
+    normalized_bullets: List[Dict[str, Any]] = []
     for item in bullets[:8]:
         if not isinstance(item, dict) or set(item.keys()) != APPLICATION_PREP_BULLET_KEYS:
             return False, "draft_resume_bullets entries must exactly match schema"
         bullet = str(item.get("bullet") or "").strip()
-        source = str(item.get("source_resume_evidence") or "").strip()
+        source_items = item.get("evidence_sources")
         requirement = str(item.get("job_requirement") or "").strip()
         confidence = str(item.get("confidence") or "").strip().lower()
-        if not bullet or not source or not requirement:
-            return False, "draft bullet, source evidence, and job requirement must be non-empty"
-        if source not in resume_text:
-            return False, "source_resume_evidence must be exact text from resume"
+        if not bullet or not requirement:
+            return False, "draft bullet and job requirement must be non-empty"
+        if not isinstance(source_items, list) or not source_items or len(source_items) > 2:
+            return False, "evidence_sources must contain one or two sources"
+        normalized_sources: List[Dict[str, str]] = []
+        seen_sources: Set[str] = set()
+        for source_item in source_items:
+            if not isinstance(source_item, dict) or set(source_item.keys()) != APPLICATION_PREP_SOURCE_KEYS:
+                return False, "evidence_sources entries must exactly match schema"
+            source_type = str(source_item.get("source") or "").strip()
+            evidence_text = str(source_item.get("evidence") or "").strip()
+            if source_type not in APPLICATION_PREP_EVIDENCE_SOURCE_TYPES or not evidence_text:
+                return False, "evidence source and text must be valid and non-empty"
+            if source_type in seen_sources:
+                return False, "evidence_sources cannot repeat a source"
+            source_document = resume_text if source_type == "resume" else responsibilities_text
+            if evidence_text not in source_document:
+                return False, f"evidence must be exact text from {source_type}"
+            seen_sources.add(source_type)
+            normalized_sources.append({"source": source_type, "evidence": evidence_text[:1500]})
         if confidence not in FIT_BRIEF_CONFIDENCE:
             return False, f"confidence must be one of {sorted(FIT_BRIEF_CONFIDENCE)}"
         normalized_bullets.append(
             {
                 "bullet": bullet[:1000],
-                "source_resume_evidence": source[:1500],
+                "evidence_sources": normalized_sources,
                 "job_requirement": requirement[:1000],
                 "confidence": confidence,
             }
@@ -1402,8 +1433,9 @@ def application_prep_repair_prompt(raw: str) -> str:
         "Your previous Application Prep response was invalid. Return ONLY one JSON object "
         "with exactly these keys: resume_improvements, draft_resume_bullets, "
         "evidence_notes, fit_gaps, positioning_summary. draft_resume_bullets entries "
-        "must have exactly bullet, source_resume_evidence, job_requirement, confidence. "
-        "source_resume_evidence must be exact text copied from the resume. evidence_notes "
+        "must have exactly bullet, evidence_sources, job_requirement, confidence. "
+        "evidence_sources must be a list of exact source/evidence objects copied from "
+        "the resume or responsibilities inventory. evidence_notes "
         "entries must have exactly draft_bullet and note, and draft_bullet must match one "
         "generated bullet exactly. No markdown or extra text.\n\n"
         f"Invalid previous reply:\n{raw[:1500]}"
@@ -1436,7 +1468,9 @@ def analyze_application_prep_worker(
             )
             took += time.time() - t0
             parsed = parse_json_strict(raw) or {}
-            ok, why = validate_application_prep_schema(parsed, resume_text)
+            ok, why = validate_application_prep_schema(
+                parsed, resume_text, task.responsibilities_text
+            )
             if ok:
                 payload = parsed
                 break
@@ -1485,6 +1519,7 @@ def analyze_application_prep_worker(
     update_params = {
         "prep_json": payload_json,
         "resume_hash": stable_text_hash(resume_text),
+        "responsibilities_hash": task.responsibilities_hash,
         "job_content_hash": application_prep_job_hash(task),
         "generated_at": utc_now_naive(),
         "schema_version": APPLICATION_PREP_SCHEMA_VERSION,
@@ -2301,7 +2336,12 @@ def run_fit_brief_generation(
 
 
 def select_application_prep_jobs(
-    session: Session, resume_text: str, *, force: bool = False
+    session: Session,
+    resume_text: str,
+    *,
+    responsibilities_hash: str = "",
+    minimum_match_percentage: int = APPLICATION_PREP_DEFAULT_MIN_MATCH,
+    force: bool = False,
 ) -> List[Tuple[Job, JobApplicationPrep]]:
     """Select liked move-forward jobs that need application-prep generation."""
     resume_hash = stable_text_hash(resume_text)
@@ -2311,26 +2351,26 @@ def select_application_prep_jobs(
             .join(JobApplicationPrep, JobApplicationPrep.job_pk == Job.id)
             .join(JobSwipe, JobSwipe.job_pk == Job.id)
             .where(JobSwipe.action == "like")
+            .where(Job.ai_match_percentage.is_not(None))
+            .where(Job.ai_match_percentage >= minimum_match_percentage)
             .where(or_(Job.title != "", Job.desc != ""))
             .order_by(JobApplicationPrep.queued_at.desc(), Job.id.desc())
         ).all()
     )
-    if force:
-        return rows
-
     selected: List[Tuple[Job, JobApplicationPrep]] = []
     for job, prep in rows:
         current_job_hash = job.content_hash or stable_text_hash(
             "|".join([job.title or "", job.desc or "", job.ai_analysis or ""])
         )
         status = (prep.status or "queued").strip().lower()
-        if status in {"queued", "stale"}:
+        if force or status in {"queued", "stale"}:
             selected.append((job, prep))
             continue
         if (
             status == "done"
             and (
                 prep.resume_hash != resume_hash
+                or (prep.responsibilities_hash or "") != responsibilities_hash
                 or prep.job_content_hash != current_job_hash
                 or prep.schema_version != APPLICATION_PREP_SCHEMA_VERSION
             )
@@ -2365,7 +2405,26 @@ def run_application_prep_generation(
         "unsubmitted": 0,
     }
     with SessionLocal() as session:
-        rows = select_application_prep_jobs(session, resume_text, force=force)
+        settings = session.get(ApplicationPrepSettings, 1)
+        minimum_match_percentage = (
+            int(getattr(settings, "minimum_match_percentage", APPLICATION_PREP_DEFAULT_MIN_MATCH))
+            if settings is not None
+            else APPLICATION_PREP_DEFAULT_MIN_MATCH
+        )
+        minimum_match_percentage = max(0, min(100, minimum_match_percentage))
+        inventory = session.get(ResponsibilitiesInventory, 1)
+        inventory_text = str(getattr(inventory, "markdown", "") or "")
+        inventory_hash = str(getattr(inventory, "content_hash", "") or "")
+        bounded_inventory_text, inventory_tokens, inventory_truncated = truncate_to_token_budget(
+            inventory_text, APPLICATION_PREP_INVENTORY_MAX_TOKENS
+        )
+        rows = select_application_prep_jobs(
+            session,
+            resume_text,
+            responsibilities_hash=inventory_hash,
+            minimum_match_percentage=minimum_match_percentage,
+            force=force,
+        )
         tasks: List[ApplicationPrepTask] = []
         now = utc_now_naive()
         for job, prep in rows:
@@ -2383,13 +2442,17 @@ def run_application_prep_generation(
                     ai_analysis=job.ai_analysis or "",
                     ai_match_percentage=job.ai_match_percentage,
                     content_hash=job.content_hash,
+                    responsibilities_text=bounded_inventory_text,
+                    responsibilities_hash=inventory_hash,
                 )
             )
         if tasks:
             session.commit()
 
         log(
-            f"Application Prep jobs={len(tasks)} force={force} "
+            f"Application Prep jobs={len(tasks)} min_match={minimum_match_percentage} "
+            f"inventory={token_budget_label(APPLICATION_PREP_INVENTORY_MAX_TOKENS)} "
+            f"inventory_tokens={inventory_tokens} truncated={inventory_truncated} force={force} "
             f"schema_version={APPLICATION_PREP_SCHEMA_VERSION}"
         )
         if not tasks:
@@ -2499,6 +2562,7 @@ def run_application_prep_generation(
 
                     prep.prep_json = result.update_params["prep_json"]
                     prep.resume_hash = result.update_params["resume_hash"]
+                    prep.responsibilities_hash = result.update_params["responsibilities_hash"]
                     prep.job_content_hash = result.update_params["job_content_hash"]
                     prep.generated_at = result.update_params["generated_at"]
                     prep.schema_version = result.update_params["schema_version"]

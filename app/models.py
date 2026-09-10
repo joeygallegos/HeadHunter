@@ -217,6 +217,8 @@ class JobApplicationPrep(Base):
     status = Column(String(16), nullable=False, server_default="queued")
     prep_json = Column(LONGTEXT().with_variant(Text, "sqlite"), nullable=True)
     resume_hash = Column(String(64), nullable=True)
+    # The responsibilities inventory is a second, user-maintained evidence source.
+    responsibilities_hash = Column(String(64), nullable=True)
     job_content_hash = Column(String(64), nullable=True)
     schema_version = Column(Integer, nullable=True)
     queued_at = Column(DateTime(timezone=False), nullable=False, default=utc_now_naive)
@@ -228,6 +230,38 @@ class JobApplicationPrep(Base):
         "Job",
         primaryjoin=lambda: foreign(JobApplicationPrep.job_pk) == Job.id,
         back_populates="application_prep",
+    )
+
+
+APPLICATION_PREP_DEFAULT_MIN_MATCH = 75
+
+
+class ApplicationPrepSettings(Base):
+    """Single persisted settings row for the optional Application Prep workflow."""
+
+    __tablename__ = "application_prep_settings"
+    __table_args__ = {"mysql_charset": "utf8mb4", "mysql_collate": "utf8mb4_unicode_ci"}
+
+    id = Column(Integer, primary_key=True)
+    minimum_match_percentage = Column(
+        Integer, nullable=False, default=APPLICATION_PREP_DEFAULT_MIN_MATCH
+    )
+    updated_at = Column(
+        DateTime(timezone=False), nullable=False, default=utc_now_naive, onupdate=utc_now_naive
+    )
+
+
+class ResponsibilitiesInventory(Base):
+    """One active Markdown inventory used as grounded Application Prep evidence."""
+
+    __tablename__ = "responsibilities_inventory"
+    __table_args__ = {"mysql_charset": "utf8mb4", "mysql_collate": "utf8mb4_unicode_ci"}
+
+    id = Column(Integer, primary_key=True)
+    markdown = Column(LONGTEXT().with_variant(Text, "sqlite"), nullable=False, default="")
+    content_hash = Column(String(64), nullable=False, default="")
+    updated_at = Column(
+        DateTime(timezone=False), nullable=False, default=utc_now_naive, onupdate=utc_now_naive
     )
 
 
@@ -332,6 +366,7 @@ def ensure_job_application_preps_table(bind=None) -> None:
         "status": "VARCHAR(16) NOT NULL DEFAULT 'queued'",
         "prep_json": text_type,
         "resume_hash": "VARCHAR(64)",
+        "responsibilities_hash": "VARCHAR(64)",
         "job_content_hash": "VARCHAR(64)",
         "schema_version": "INTEGER",
         "queued_at": "DATETIME",
@@ -345,6 +380,18 @@ def ensure_job_application_preps_table(bind=None) -> None:
                 conn.execute(text(f"ALTER TABLE job_application_preps ADD COLUMN {name} {column_type}"))
 
 
+def ensure_application_prep_settings_table(bind=None) -> None:
+    """Create the small dashboard-owned Application Prep settings table."""
+    target = bind or engine
+    Base.metadata.tables["application_prep_settings"].create(bind=target, checkfirst=True)
+
+
+def ensure_responsibilities_inventory_table(bind=None) -> None:
+    """Create the one-row responsibilities inventory table when first needed."""
+    target = bind or engine
+    Base.metadata.tables["responsibilities_inventory"].create(bind=target, checkfirst=True)
+
+
 def init_db() -> None:
     """Create tables and apply the small additive runtime schema updates."""
     Base.metadata.create_all(bind=engine)
@@ -353,3 +400,5 @@ def init_db() -> None:
     ensure_job_change_details_column(engine)
     ensure_job_fit_briefs_table(engine)
     ensure_job_application_preps_table(engine)
+    ensure_application_prep_settings_table(engine)
+    ensure_responsibilities_inventory_table(engine)
