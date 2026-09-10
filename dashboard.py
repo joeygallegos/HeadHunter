@@ -431,36 +431,6 @@ def _ensure_reference_fields_column() -> None:
     _REFERENCE_FIELDS_COLUMN_READY = True
 
 
-_APP_PREP_WORKER_THREAD: Optional[threading.Thread] = None
-_APP_PREP_WORKER_LOCK = threading.Lock()
-
-
-def _start_application_prep_worker() -> None:
-    """Start one best-effort dashboard worker for newly queued prep jobs."""
-    global _APP_PREP_WORKER_THREAD
-    with _APP_PREP_WORKER_LOCK:
-        if _APP_PREP_WORKER_THREAD and _APP_PREP_WORKER_THREAD.is_alive():
-            return
-
-        def _run() -> None:
-            try:
-                import analyze_jobs_ollama as analyzer
-
-                analyzer.run_application_prep_generation(preflight=True)
-            except SystemExit:
-                return
-            except Exception:
-                # The analyzer writes its own detailed log; keep request handling isolated.
-                return
-
-        _APP_PREP_WORKER_THREAD = threading.Thread(
-            target=_run,
-            name="application-prep-worker",
-            daemon=True,
-        )
-        _APP_PREP_WORKER_THREAD.start()
-
-
 def _job_reference_fields(j: Job) -> List[Dict[str, str]]:
     raw_refs = _safe_json_loads(getattr(j, "reference_fields", None))
     if not isinstance(raw_refs, dict):
@@ -784,8 +754,6 @@ def record_swipe(job: Dict[str, Any], action: str) -> Dict[str, Any]:
         prep = prep_result.get("application_prep")
         queued = bool(prep_result.get("queued"))
         eligible = prep_result.get("eligible")
-        if queued:
-            _start_application_prep_worker()
     return {
         "success": True,
         "application_prep": prep,
@@ -3410,8 +3378,6 @@ def api_application_prep_queue(job_pk: int):
             return jsonify(error="job not found in database"), 404
         if not result.get("eligible"):
             return jsonify(error=result.get("reason") or "job is not eligible for Application Prep"), 409
-        if result.get("queued"):
-            _start_application_prep_worker()
         return jsonify(result)
     except Exception as exc:
         return jsonify(error=str(exc)), 500

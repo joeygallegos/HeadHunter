@@ -34,7 +34,7 @@ python run.py test
 - `analyze_jobs_ollama.py` now runs as a three-stage AI pipeline. Stage 1 performs the initial resume/job match analysis and structured compensation extraction. Stage 2 reviews successful Stage 1 JSON and stores only the final reviewed result in the existing `jobs` AI fields; by default it reviews every successful result, and `AI_REVIEW_MIN_MATCH` / `AI_REVIEW_MAX_MATCH` can limit review to a score range. Stage 3 creates applicant-facing Fit Briefs for active jobs with final `ai_match_percentage >= 75` (`AI_FIT_BRIEF_MIN_MATCH`) and stores them in `job_fit_briefs`.
 - Fit Briefs are generated from `prompts/fit_brief_system.txt` and contain score explanation, strongest matches, gaps, risk flags, interview angle, and exact mapped bullets from `resume.txt`. The dashboard presents each map as existing resume evidence paired with the job requirement it supports; it does not create rewritten bullets. Tailored draft bullets remain in Application Prep. Fit Briefs intentionally do not include `resume_keywords_to_emphasize`, because keyword overlap and missing keywords are handled by the main analysis fields. A mapped `resume_bullet` must be exact text from `resume.txt`; validation rejects invented or rewritten bullets.
 - Fit Brief freshness is controlled by the stored resume hash, job content hash, and Fit Brief schema version. Re-run `python .\analyze_jobs_ollama.py --fit-briefs-only` to fill missing or stale briefs for already analyzed eligible jobs, or add `--force` to regenerate existing briefs. The default `python .\analyze_jobs_ollama.py` flow runs Stage 1, Stage 2, and then Stage 3 for eligible reviewed matches. `--compensation-only` keeps its existing compensation cleanup behavior and does not run Fit Brief generation.
-- Liking a job in Swipe now means `Move forward`: it records the normal `job_swipes` row and queues a separate Application Prep artifact in `job_application_preps` only when the job meets the configurable Application Prep minimum match score (75% by default). The `Interesting` swipe action saves a job for later review without queuing Application Prep. Application Prep uses `prompts/application_prep_system.txt`, runs before lower-priority AI backlog work, processes queued jobs newest-first, and returns grounded resume improvements plus draft resume bullets backed by exact resume or Responsibilities & Value inventory evidence.
+- Liking a job in Swipe now means `Move forward`: it records the normal `job_swipes` row and queues a separate Application Prep artifact in `job_application_preps` only when the job meets the configurable Application Prep minimum match score (75% by default). The dashboard is queue-only and never starts Ollama; the separate Ollama-capable processor runs the queued work. The `Interesting` swipe action saves a job for later review without queuing Application Prep. Application Prep uses `prompts/application_prep_system.txt`, runs before lower-priority AI backlog work, processes queued jobs newest-first, and returns grounded resume improvements plus draft resume bullets backed by exact resume or Responsibilities & Value inventory evidence.
 - Application Prep has its own Ollama generation settings because it must produce complete JSON rather than a short classification result: `APPLICATION_PREP_THINK=false`, `APPLICATION_PREP_NUM_PREDICT=4096`, and `APPLICATION_PREP_RETRY_NUM_PREDICT` defaults high enough to retry truncation without changing the main analyzer's `OLLAMA_THINK`.
 
 ### Timestamp data migration
@@ -445,7 +445,7 @@ Important details:
 - `job_swipes.job_pk` points at `jobs.id` and is unique, so each job has one current review action.
 - The review action is stored as `dislike`, `interesting`, or `like`; `Move forward` stores `like`.
 - `interesting` is for jobs worth revisiting later when you are not ready to apply, and does not queue Application Prep.
-- A `like` creates or refreshes one `job_application_preps` row for that job and starts a best-effort dashboard worker. The normal analyzer also prioritizes queued Application Prep work before lower-priority backlog jobs.
+- A `like` creates or refreshes one eligible `job_application_preps` row for that job. The dashboard only writes the queue row; run the analyzer on the separate Ollama-capable processor, where queued Application Prep work is prioritized before lower-priority backlog jobs.
 - The swipe page shows AI keyword matches and missing keywords from the analyzer. It does not show the local NLTK keyword extraction, which is kept for historical job metadata and broader dashboard use.
 - The swipe page no longer reads `SHEET_ID`, `SHEET_NAME`, or `GOOGLE_CREDENTIALS_PATH`.
 - If you deploy with an existing database user, it must have permission to create the missing `job_swipes` table the first time `/swipe` or `/api/swipe/jobs` is opened.
@@ -468,6 +468,8 @@ Important details:
 ```powershell
 python .\analyze_jobs_ollama.py --application-prep-only
 ```
+
+Run that command on the PC that has Ollama, the Application Prep prompt files, and access to the same database as the dashboard. The dashboard host must not need Ollama installed or on `PATH`.
 
 - Add `--force` to regenerate existing move-forward prep rows. Selection is LIFO by `queued_at`, so the most recently moved-forward job is processed first.
 
