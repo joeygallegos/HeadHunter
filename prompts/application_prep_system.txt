@@ -12,7 +12,7 @@ Rules:
   ["bullet","evidence_sources","job_requirement","confidence"]
 - bullet must be a rewrite-ready resume bullet for a job-specific resume version.
 - evidence_sources must contain one or two objects with EXACTLY these keys: ["source","evidence"].
-- source must be "resume" or "responsibilities_inventory". evidence must be exact text copied from that named source. Do not paraphrase, combine, or invent source evidence.
+- source must be "resume" or "responsibilities_inventory". evidence must be one contiguous, verbatim excerpt copied from that named source. Do not paraphrase, shorten, combine, or invent source evidence.
 - job_requirement must be a matching requirement or responsibility from the posting.
 - confidence must be one of ["high","medium","low"].
 - evidence_notes: array of objects with EXACTLY these keys:

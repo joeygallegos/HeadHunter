@@ -209,7 +209,7 @@ COMPENSATION_SYSTEM_PROMPT_PATH = os.getenv(
 )
 COMPENSATION_SCHEMA_VERSION = 1
 FIT_BRIEF_SCHEMA_VERSION = 1
-APPLICATION_PREP_SCHEMA_VERSION = 2
+APPLICATION_PREP_SCHEMA_VERSION = 3
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "deepseek-r1:8b")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
 ONLY_EMPTY = os.getenv("ONLY_EMPTY", "true").lower() == "true"
@@ -1192,6 +1192,11 @@ APPLICATION_PREP_EVIDENCE_KEYS = {
 }
 
 
+def _is_exact_prompt_evidence(evidence_text: str, source_document: str) -> bool:
+    """Validate against the same whitespace-normalized text the model received."""
+    return bool(evidence_text) and clean_text(evidence_text) in clean_text(source_document)
+
+
 def stable_text_hash(text_value: str) -> str:
     """Return a stable sha256 for source text used by generated AI artifacts."""
     return hashlib.sha256((text_value or "").encode("utf-8", "ignore")).hexdigest()
@@ -1331,10 +1336,14 @@ def validate_application_prep_schema(
             if source_type in seen_sources:
                 return False, "evidence_sources cannot repeat a source"
             source_document = resume_text if source_type == "resume" else responsibilities_text
-            if evidence_text not in source_document:
+            if not _is_exact_prompt_evidence(evidence_text, source_document):
                 return False, f"evidence must be exact text from {source_type}"
             seen_sources.add(source_type)
-            normalized_sources.append({"source": source_type, "evidence": evidence_text[:1500]})
+            # Persist the canonical prompt-visible excerpt so the reviewer sees
+            # exactly what the model was allowed to cite, independent of file line endings.
+            normalized_sources.append(
+                {"source": source_type, "evidence": clean_text(evidence_text)[:1500]}
+            )
         if confidence not in FIT_BRIEF_CONFIDENCE:
             return False, f"confidence must be one of {sorted(FIT_BRIEF_CONFIDENCE)}"
         normalized_bullets.append(
@@ -1427,17 +1436,24 @@ def fit_brief_repair_prompt(raw: str) -> str:
     )
 
 
-def application_prep_repair_prompt(raw: str) -> str:
+def application_prep_repair_prompt(raw: str, validation_error: str = "") -> str:
     """Build the repair prompt for invalid Application Prep JSON."""
+    validation_note = (
+        f"Validation failure: {validation_error}.\n"
+        if validation_error
+        else ""
+    )
     return (
         "Your previous Application Prep response was invalid. Return ONLY one JSON object "
         "with exactly these keys: resume_improvements, draft_resume_bullets, "
         "evidence_notes, fit_gaps, positioning_summary. draft_resume_bullets entries "
         "must have exactly bullet, evidence_sources, job_requirement, confidence. "
-        "evidence_sources must be a list of exact source/evidence objects copied from "
-        "the resume or responsibilities inventory. evidence_notes "
+        "evidence_sources must be a list of exact source/evidence objects copied as a "
+        "contiguous, verbatim excerpt from the resume or responsibilities inventory. "
+        "Do not summarize, shorten, or combine evidence. evidence_notes "
         "entries must have exactly draft_bullet and note, and draft_bullet must match one "
         "generated bullet exactly. No markdown or extra text.\n\n"
+        f"{validation_note}"
         f"Invalid previous reply:\n{raw[:1500]}"
     )
 
@@ -1475,7 +1491,9 @@ def analyze_application_prep_worker(
                 payload = parsed
                 break
             attempts.append(f"attempt {attempt}: {why}; {_payload_debug(parsed, raw)}")
-            current_msgs = msgs + [HumanMessage(content=application_prep_repair_prompt(raw))]
+            current_msgs = msgs + [
+                HumanMessage(content=application_prep_repair_prompt(raw, why))
+            ]
         except OllamaEmptyContentError as exc:
             took += time.time() - t0
             detail = f"attempt {attempt}: {exc}"
