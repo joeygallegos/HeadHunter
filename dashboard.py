@@ -2887,8 +2887,14 @@ app = Flask(__name__)
 # ----------------------------------------------------------------------
 @app.route("/")
 def index():
-    # Keep route behavior unchanged while serving the extracted dashboard markup.
-    return render_template("index.html")
+    # The main dashboard always opens on its integration-runs overview.
+    return render_template("index.html", initial_view="runs")
+
+
+@app.route("/report")
+def report_page():
+    # Query Builder has a stable URL so reports can be opened directly.
+    return render_template("index.html", initial_view="jobs")
 
 
 @app.route("/swipe")

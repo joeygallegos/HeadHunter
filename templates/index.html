@@ -4,7 +4,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width,initial-scale=1" />
-    <title>Jobs Dashboard</title>
+    <title>{% if initial_view == 'jobs' %}Query Builder | {% endif %}Jobs Dashboard</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
@@ -26,11 +26,11 @@
                   class="dashboard-tab px-3 py-2 rounded-lg border border-slate-200 text-sm">
             Integration Runs
           </button>
-          <button @click="view='jobs'"
+          <a href="/report"
                   :class="view==='jobs' ? 'bg-indigo-600 text-white' : 'bg-white text-slate-700'"
                   class="dashboard-tab px-3 py-2 rounded-lg border border-slate-200 text-sm">
             Query Builder
-          </button>
+          </a>
           <button @click="view='lookup'"
                   :class="view==='lookup' ? 'bg-indigo-600 text-white' : 'bg-white text-slate-700'"
                   class="dashboard-tab px-3 py-2 rounded-lg border border-slate-200 text-sm">
@@ -1457,7 +1457,8 @@
     <script>
       function dashboard() {
         return {
-          view: 'runs',
+          // Flask supplies the page's initial view so /report can be bookmarked.
+          view: {{ initial_view|tojson }},
 
           // Runs state
           days: 30,
@@ -2434,7 +2435,7 @@
           },
 
           // Load either a persisted report or a clean unsaved builder.
-          loadReportById(reportId) {
+          async loadReportById(reportId) {
             const nextId = String(reportId || '');
             if (!nextId) {
               this.applyReportConfig(this.defaultUnsavedReportConfig());
@@ -2455,10 +2456,13 @@
             this.reportPickerId = nextId;
             this.reportSnapshot = this.reportConfigSnapshot();
             this.setReportMessage(`Loaded “${report.title}”.`);
+            // A saved report represents a complete query configuration, so show
+            // its data immediately instead of requiring a second Run query click.
+            await this.loadJobs();
           },
 
           // Intercept picker changes before they can replace unsaved builder edits.
-          requestReportSelection(reportId) {
+          async requestReportSelection(reportId) {
             const nextId = String(reportId || '');
             if (nextId === String(this.selectedReportId || '')) return;
             if (this.reportIsDirty()) {
@@ -2467,7 +2471,7 @@
               this.$refs.discardReportDialog.showModal();
               return;
             }
-            this.loadReportById(nextId);
+            await this.loadReportById(nextId);
           },
 
           // Restore the picker to the report that is still loaded.
@@ -2478,11 +2482,11 @@
           },
 
           // Capture the pending ID before closing because the dialog close handler clears it.
-          discardChangesAndLoadReport() {
+          async discardChangesAndLoadReport() {
             const nextId = this.pendingReportId;
             this.pendingReportId = '';
             this.$refs.discardReportDialog.close();
-            this.loadReportById(nextId);
+            await this.loadReportById(nextId);
           },
 
           // Centralize accessible success/error feedback for every report action.
@@ -3021,12 +3025,15 @@
             }
           },
 
-          // Bootstrap the dashboard: load static metadata first, then initial data views, then start polling.
+          // Bootstrap only the data needed by the page's initial view.
           async init() {
-            this.loadRuns();
-            await this.loadQueryBuilderMetadata();
-            // Query metadata must exist before the builder can safely render and sort typed columns.
-            this.loadJobs();
+            if (this.view === 'runs') {
+              this.loadRuns();
+            } else if (this.view === 'jobs') {
+              // Query metadata must exist before the builder can safely render and sort typed columns.
+              await this.loadQueryBuilderMetadata();
+              this.loadJobs();
+            }
             this.discoveryPoller = setInterval(() => {
               // Only poll while the discovery tab is visible and auto-refresh is still enabled.
               if (this.view === 'discovery' && this.discoveryAutoRefresh) {

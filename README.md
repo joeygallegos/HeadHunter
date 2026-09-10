@@ -380,7 +380,7 @@ The run dashboard visuals hydrate from `GET /api/runs/summary?days=<1-365>`. The
 
 #### Query Builder
 
-The Query Builder searches and filters stored jobs through `/api/jobs/query`.
+Open the Query Builder at `/report`. It searches and filters stored jobs through `/api/jobs/query`.
 
 - Quick filters cover recency, AI match score, location policy, and text.
 - AND/OR filter groups use an allowlisted field and operator set.
@@ -399,6 +399,7 @@ Report presets are stored in the dashboard-owned `dashboard_query_reports` table
 - A loaded report shows `Unsaved changes` when its filters, limits, text, or column layout differ from the stored version.
 - Saved reports also persist the current sort field and direction.
 - Switching reports with unsaved edits requires confirmation.
+- Selecting a saved report immediately runs its stored query and displays the results.
 - `Save changes` updates the loaded report; `Save as new` creates a separate preset with a unique name.
 - Renaming changes only the stored name and does not save unrelated builder edits.
 - Existing API clients can continue using `POST /api/query-reports` as an upsert. The UI sends `create_only: true` for Save as new so duplicate names return a validation error instead of overwriting a report.
