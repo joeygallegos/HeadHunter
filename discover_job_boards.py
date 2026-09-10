@@ -11,18 +11,22 @@ import argparse
 import json
 import os
 import re
-import shutil
 import string
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from bs4 import BeautifulSoup
+
+from app.event_log import append_event, read_event_log, reset_event_log
+from app.file_utils import read_json_file, read_text, write_json
+from app.steps_suggestions import merge_steps_suggestions
 
 try:
     from dotenv import load_dotenv
@@ -39,7 +43,19 @@ DEFAULT_RESUME_PATH = os.path.join(BASE_DIR, "resume.txt")
 DEFAULT_SEEDS_PATH = os.path.join(BASE_DIR, "config", "job_discovery_seeds.json")
 DEFAULT_SUGGESTIONS_PATH = os.path.join(OUTPUT_DIR, "steps_suggestions.json")
 DEFAULT_DISCOVERY_PATH = os.path.join(OUTPUT_DIR, "job_board_discovery.json")
+DEFAULT_EVENTS_PATH = os.path.join(OUTPUT_DIR, "job_board_discovery_events.jsonl")
 DEFAULT_STEPS_PATH = os.path.join(BASE_DIR, "steps.json")
+
+DEFAULT_SEARCH_TEMPLATES = [
+    "{role} remote careers",
+    "{role} {location} careers",
+    "{role} {location} jobs",
+    "{role} jobs greenhouse",
+    "{role} jobs lever",
+    "{role} jobs workday",
+    "{skill} remote jobs",
+    "{skill} {location} careers",
+]
 
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "deepseek-r1:8b")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
@@ -74,6 +90,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--seeds", default=DEFAULT_SEEDS_PATH)
     parser.add_argument("--max-pages", type=int, default=None)
     parser.add_argument("--max-depth", type=int, default=None)
+    parser.add_argument("--max-search-queries", type=int, default=None)
+    parser.add_argument("--max-search-results", type=int, default=None)
+    parser.add_argument("--events", default=DEFAULT_EVENTS_PATH)
+    parser.add_argument("--no-events", action="store_true")
+    parser.add_argument("--no-search", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args(argv)
 
@@ -81,25 +102,6 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 def log(msg: str) -> None:
     ts = datetime.now().strftime("%H:%M:%S")
     print(f"[{ts}] {msg}")
-
-
-def read_text(path: str) -> str:
-    with open(path, "r", encoding="utf-8", errors="ignore") as f:
-        return f.read()
-
-
-def write_json(path: str, payload: Any) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-        f.write("\n")
-
-
-def read_json_file(path: str, default: Any) -> Any:
-    if not os.path.exists(path):
-        return default
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
 
 
 def load_prompt(name: str) -> str:
@@ -269,6 +271,210 @@ def is_excluded_url(url: str, excluded_domains: Iterable[str]) -> bool:
         if domain == item or domain.endswith(f".{item}"):
             return True
     return False
+
+
+def criteria_location_text(criteria: Dict[str, Any]) -> str:
+    city = str(criteria.get("location_city") or "").strip()
+    region = str(criteria.get("location_region") or "").strip()
+    return " ".join(part for part in [city, region] if part).strip()
+
+
+def build_search_queries(criteria: Dict[str, Any], config: Dict[str, Any]) -> List[str]:
+    templates = config.get("search_templates") or DEFAULT_SEARCH_TEMPLATES
+    if not isinstance(templates, list):
+        templates = DEFAULT_SEARCH_TEMPLATES
+
+    max_queries = max(0, int(config.get("max_search_queries") or 12))
+    roles = normalize_str_list(criteria.get("target_roles"), 6) or ["security engineer"]
+    skills = normalize_str_list(criteria.get("skills"), 8) or roles
+    location = criteria_location_text(criteria) or "remote"
+
+    queries: List[str] = []
+    seen = set()
+    formatter = string.Formatter()
+    for template in templates:
+        template_text = str(template or "").strip()
+        if not template_text:
+            continue
+        fields = {field for _, field, _, _ in formatter.parse(template_text) if field}
+        role_values = roles if "role" in fields else [roles[0]]
+        skill_values = skills if "skill" in fields else [skills[0]]
+        for role in role_values:
+            for skill in skill_values:
+                try:
+                    query = template_text.format(
+                        role=role,
+                        skill=skill,
+                        location=location,
+                        remote_preference=criteria.get("remote_preference") or "",
+                        seniority=criteria.get("seniority") or "",
+                    )
+                except KeyError:
+                    continue
+                query = re.sub(r"\s+", " ", query).strip()
+                key = query.lower()
+                if not query or key in seen:
+                    continue
+                seen.add(key)
+                queries.append(query)
+                if len(queries) >= max_queries:
+                    return queries
+    return queries
+
+
+def _xml_local_name(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+
+
+def _xml_child_text(element: ET.Element, name: str) -> str:
+    for child in element:
+        if _xml_local_name(child.tag) == name:
+            return "".join(child.itertext()).strip()
+    return ""
+
+
+def parse_bing_rss_results(xml_text: str, limit: int) -> List[Dict[str, str]]:
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return []
+
+    results: List[Dict[str, str]] = []
+    for item in root.iter():
+        if _xml_local_name(item.tag) != "item":
+            continue
+        title = _xml_child_text(item, "title")
+        link = _xml_child_text(item, "link")
+        description = _xml_child_text(item, "description")
+        url = normalize_url("", link)
+        if not url:
+            continue
+        results.append(
+            {
+                "title": title,
+                "url": url,
+                "description": re.sub(r"\s+", " ", description).strip()[:500],
+            }
+        )
+        if len(results) >= limit:
+            break
+    return results
+
+
+def fetch_bing_rss_results(query: str, limit: int) -> List[Dict[str, str]]:
+    params = urllib.parse.urlencode({"format": "rss", "q": query})
+    url = f"https://www.bing.com/search?{params}"
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT_SEC) as resp:
+        raw = resp.read(500_000)
+    return parse_bing_rss_results(raw.decode("utf-8", "replace"), limit=limit)
+
+
+def discover_search_urls(
+    criteria: Dict[str, Any],
+    config: Dict[str, Any],
+    events_path: Optional[str] = None,
+) -> Tuple[List[str], List[Dict[str, Any]]]:
+    if not bool(config.get("enable_search", True)):
+        append_event(
+            events_path,
+            "search_disabled",
+            "Search expansion is disabled; using configured seed URLs only.",
+        )
+        return [], []
+
+    provider = str(config.get("search_provider") or "bing_rss").strip().lower()
+    if provider != "bing_rss":
+        append_event(
+            events_path,
+            "search_failed",
+            "Unsupported search provider configured.",
+            provider=provider,
+        )
+        log(f"[warn] unsupported search provider {provider}; skipping search expansion")
+        return [], []
+
+    queries = build_search_queries(criteria, config)
+    max_results = max(1, int(config.get("max_search_results_per_query") or 8))
+    excluded = config.get("excluded_domains") or []
+    queued_urls: List[str] = []
+    seen_urls = set()
+    records: List[Dict[str, Any]] = []
+
+    append_event(
+        events_path,
+        "search_started",
+        "Starting search-result expansion before crawl.",
+        provider=provider,
+        query_count=len(queries),
+        max_results_per_query=max_results,
+    )
+
+    for query in queries:
+        append_event(
+            events_path,
+            "search_query_started",
+            "Fetching search results.",
+            provider=provider,
+            query=query,
+        )
+        try:
+            results = fetch_bing_rss_results(query, limit=max_results)
+            append_event(
+                events_path,
+                "search_query_finished",
+                "Search results fetched.",
+                provider=provider,
+                query=query,
+                result_count=len(results),
+            )
+        except Exception as exc:
+            log(f"[warn] search failed for {query!r}: {exc}")
+            append_event(
+                events_path,
+                "search_query_failed",
+                "Search query failed; continuing with remaining queries.",
+                provider=provider,
+                query=query,
+                error=str(exc),
+            )
+            results = []
+
+        records.append({"query": query, "results": results})
+        for result in results:
+            url = normalize_url("", result.get("url", ""))
+            if not url:
+                continue
+            if is_excluded_url(url, excluded):
+                append_event(
+                    events_path,
+                    "search_result_skipped",
+                    "Search result skipped because its domain is excluded.",
+                    query=query,
+                    url=url,
+                )
+                continue
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+            queued_urls.append(url)
+            append_event(
+                events_path,
+                "search_result_queued",
+                "Search result queued as a crawl start URL.",
+                query=query,
+                url=url,
+                title=result.get("title", ""),
+            )
+
+    append_event(
+        events_path,
+        "search_finished",
+        "Search expansion finished.",
+        query_count=len(queries),
+        queued_url_count=len(queued_urls),
+    )
+    return queued_urls, records
 
 
 def fetch_page(url: str, max_links: int) -> FetchResult:
@@ -523,7 +729,11 @@ def fallback_triage(page: FetchResult) -> Dict[str, Any]:
     return {"next_urls": next_urls, "candidates": candidates}
 
 
-def triage_page(page: FetchResult, criteria: Dict[str, Any]) -> Dict[str, Any]:
+def triage_page(
+    page: FetchResult,
+    criteria: Dict[str, Any],
+    events_path: Optional[str] = None,
+) -> Dict[str, Any]:
     prompt = load_prompt("job_discovery_triage_system.txt")
     payload = {
         "criteria": criteria,
@@ -534,10 +744,33 @@ def triage_page(page: FetchResult, criteria: Dict[str, Any]) -> Dict[str, Any]:
             "links": page.links[:60],
         },
     }
+    append_event(
+        events_path,
+        "ollama_triage_started",
+        "Asking Ollama to triage fetched page.",
+        url=page.url,
+        link_count=len(page.links),
+    )
     try:
         triage = validate_triage(invoke_ollama_json(prompt, payload))
+        append_event(
+            events_path,
+            "ollama_triage_finished",
+            "Ollama selected next links and candidates.",
+            url=page.url,
+            next_url_count=len(triage["next_urls"]),
+            candidate_count=len(triage["candidates"]),
+            next_urls=triage["next_urls"][:10],
+        )
     except Exception as exc:
         log(f"[warn] triage failed for {page.url}; using fallback: {exc}")
+        append_event(
+            events_path,
+            "ollama_triage_failed",
+            "Ollama triage failed; using heuristic fallback.",
+            url=page.url,
+            error=str(exc),
+        )
         triage = fallback_triage(page)
     return triage
 
@@ -557,17 +790,42 @@ def load_seed_config(path: str) -> Dict[str, Any]:
     config.setdefault("max_pages", 25)
     config.setdefault("max_depth", 2)
     config.setdefault("max_links_per_page", 80)
+    config.setdefault("enable_search", True)
+    config.setdefault("search_provider", "bing_rss")
+    config.setdefault("max_search_queries", 12)
+    config.setdefault("max_search_results_per_query", 8)
+    config.setdefault("search_templates", DEFAULT_SEARCH_TEMPLATES)
     return config
 
 
-def crawl(config: Dict[str, Any], criteria: Dict[str, Any], max_pages: int, max_depth: int) -> Dict[str, Any]:
+def crawl(
+    config: Dict[str, Any],
+    criteria: Dict[str, Any],
+    max_pages: int,
+    max_depth: int,
+    extra_seed_urls: Optional[List[str]] = None,
+    events_path: Optional[str] = None,
+) -> Dict[str, Any]:
     max_links = max(1, int(config.get("max_links_per_page") or 80))
     excluded = config.get("excluded_domains") or []
     queue: List[Tuple[str, int]] = []
-    for seed in config.get("seed_urls") or []:
+    seen_start_urls = set()
+    start_urls = [(seed, "seed") for seed in (config.get("seed_urls") or [])]
+    start_urls.extend((seed, "search") for seed in (extra_seed_urls or []))
+    for seed, source in start_urls:
         url = normalize_url("", seed)
-        if url and not is_excluded_url(url, excluded):
-            queue.append((url, 0))
+        if not url or url in seen_start_urls or is_excluded_url(url, excluded):
+            continue
+        seen_start_urls.add(url)
+        queue.append((url, 0))
+        append_event(
+            events_path,
+            "seed_queued",
+            "Start URL queued for inspection.",
+            url=url,
+            depth=0,
+            source=source,
+        )
 
     visited = set()
     pages: List[Dict[str, Any]] = []
@@ -579,6 +837,15 @@ def crawl(config: Dict[str, Any], criteria: Dict[str, Any], max_pages: int, max_
             continue
         visited.add(url)
         log(f"[fetch] depth={depth} {url}")
+        append_event(
+            events_path,
+            "fetch_started",
+            "Fetching page.",
+            url=url,
+            depth=depth,
+            visited_count=len(visited),
+            queued_count=len(queue),
+        )
         page = fetch_page(url, max_links=max_links)
         pages.append(
             {
@@ -592,12 +859,44 @@ def crawl(config: Dict[str, Any], criteria: Dict[str, Any], max_pages: int, max_
             }
         )
         if not page.ok:
+            append_event(
+                events_path,
+                "fetch_failed",
+                "Page fetch failed or returned unsupported content.",
+                url=url,
+                depth=depth,
+                status=page.status,
+                error=page.error,
+            )
             continue
 
-        triage = triage_page(page, criteria)
+        append_event(
+            events_path,
+            "fetch_finished",
+            "Fetched page and extracted links.",
+            url=url,
+            depth=depth,
+            status=page.status,
+            link_count=len(page.links),
+            text_chars=len(page.text),
+        )
+
+        triage = triage_page(page, criteria, events_path=events_path)
         for candidate in triage["candidates"]:
             suggestion = build_suggestion(candidate, source_url=page.url)
-            suggestions_by_id.setdefault(suggestion["id"], suggestion)
+            if suggestion["id"] not in suggestions_by_id:
+                suggestions_by_id[suggestion["id"]] = suggestion
+                append_event(
+                    events_path,
+                    "suggestion_created",
+                    "Created a steps.json suggestion.",
+                    url=suggestion["url"],
+                    site_key=suggestion["site_key"],
+                    platform=suggestion["platform"],
+                    confidence=suggestion["confidence"],
+                    manual_review=suggestion["manual_review"],
+                    reason=suggestion["reason"],
+                )
 
         if depth >= max_depth:
             continue
@@ -606,109 +905,127 @@ def crawl(config: Dict[str, Any], criteria: Dict[str, Any], max_pages: int, max_
             if not normalized or normalized in visited or is_excluded_url(normalized, excluded):
                 continue
             queue.append((normalized, depth + 1))
+            append_event(
+                events_path,
+                "next_url_queued",
+                "Ollama-selected URL queued for inspection.",
+                from_url=page.url,
+                url=normalized,
+                depth=depth + 1,
+            )
 
-    return {
+    result = {
         "criteria": criteria,
         "pages": pages,
         "suggestions": list(suggestions_by_id.values()),
         "generated_at": datetime.now().isoformat(timespec="seconds"),
     }
-
-
-def _load_steps_urls(steps_data: Dict[str, Any]) -> set[str]:
-    urls = set()
-    for steps in steps_data.values():
-        if not isinstance(steps, list):
-            continue
-        for step in steps:
-            if isinstance(step, dict) and step.get("action") == "load_url":
-                url = normalize_url("", str(step.get("url") or ""))
-                if url:
-                    urls.add(url)
-    return urls
-
-
-def merge_steps_suggestions(
-    *,
-    steps_path: str = DEFAULT_STEPS_PATH,
-    suggestions_path: str = DEFAULT_SUGGESTIONS_PATH,
-    selected_ids: Optional[Iterable[str]] = None,
-    backup: bool = True,
-) -> Dict[str, Any]:
-    steps_data = read_json_file(steps_path, {})
-    if not isinstance(steps_data, dict):
-        raise ValueError(f"{steps_path} must contain a JSON object")
-
-    suggestions_doc = read_json_file(suggestions_path, {"suggestions": []})
-    suggestions = suggestions_doc.get("suggestions", [])
-    if not isinstance(suggestions, list):
-        raise ValueError(f"{suggestions_path} must contain suggestions[]")
-
-    selected = {str(item) for item in selected_ids or []}
-    existing_urls = _load_steps_urls(steps_data)
-    applied: List[str] = []
-    skipped: List[Dict[str, str]] = []
-
-    if backup and suggestions:
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup_path = f"{steps_path}.{ts}.bak"
-        if os.path.exists(steps_path):
-            shutil.copy2(steps_path, backup_path)
-    else:
-        backup_path = ""
-
-    for suggestion in suggestions:
-        if not isinstance(suggestion, dict):
-            continue
-        sid = str(suggestion.get("id") or "")
-        if selected and sid not in selected:
-            continue
-        if suggestion.get("state") not in {"pending", "approved"}:
-            continue
-        site_key = str(suggestion.get("site_key") or "").strip()
-        steps = suggestion.get("steps")
-        if not site_key or not isinstance(steps, list):
-            skipped.append({"id": sid, "reason": "missing site_key or steps"})
-            continue
-        load_url = ""
-        for step in steps:
-            if isinstance(step, dict) and step.get("action") == "load_url":
-                load_url = normalize_url("", str(step.get("url") or "")) or ""
-                break
-        if site_key in steps_data:
-            skipped.append({"id": sid, "reason": f"site_key exists: {site_key}"})
-            continue
-        if load_url and load_url in existing_urls:
-            skipped.append({"id": sid, "reason": f"load_url exists: {load_url}"})
-            continue
-        steps_data[site_key] = steps
-        if load_url:
-            existing_urls.add(load_url)
-        suggestion["state"] = "applied"
-        suggestion["applied_at"] = datetime.now().isoformat(timespec="seconds")
-        applied.append(sid)
-
-    write_json(steps_path, steps_data)
-    write_json(suggestions_path, suggestions_doc)
-    return {"applied": applied, "skipped": skipped, "backup_path": backup_path}
+    append_event(
+        events_path,
+        "crawl_finished",
+        "Discovery crawl finished.",
+        page_count=len(pages),
+        suggestion_count=len(result["suggestions"]),
+        visited_count=len(visited),
+        queued_count=len(queue),
+    )
+    return result
 
 
 def run_discovery(args: argparse.Namespace) -> Dict[str, Any]:
+    events_path = None if args.no_events or args.dry_run else args.events
+    reset_event_log(events_path)
+    append_event(
+        events_path,
+        "run_started",
+        "Job board discovery run started.",
+        resume_path=args.resume,
+        seeds_path=args.seeds,
+        model=OLLAMA_MODEL,
+    )
     resume_text = read_text(args.resume)
+    append_event(
+        events_path,
+        "resume_loaded",
+        "Loaded resume text for criteria extraction.",
+        resume_path=args.resume,
+        resume_chars=len(resume_text),
+    )
     config = load_seed_config(args.seeds)
+    if args.no_search:
+        config["enable_search"] = False
+    if args.max_search_queries is not None:
+        config["max_search_queries"] = args.max_search_queries
+    if args.max_search_results is not None:
+        config["max_search_results_per_query"] = args.max_search_results
     max_pages = max(1, int(args.max_pages or config.get("max_pages") or 25))
     max_depth = max(0, int(args.max_depth if args.max_depth is not None else config.get("max_depth") or 2))
+    append_event(
+        events_path,
+        "seeds_loaded",
+        "Loaded discovery seed configuration.",
+        seed_count=len(config.get("seed_urls") or []),
+        excluded_domain_count=len(config.get("excluded_domains") or []),
+        max_pages=max_pages,
+        max_depth=max_depth,
+    )
 
+    append_event(
+        events_path,
+        "criteria_extraction_started",
+        "Asking Ollama to extract discovery criteria from the resume.",
+    )
     criteria = extract_resume_criteria(resume_text)
-    result = crawl(config, criteria, max_pages=max_pages, max_depth=max_depth)
+    append_event(
+        events_path,
+        "criteria_extracted",
+        "Discovery criteria extracted.",
+        criteria=criteria,
+    )
+    search_urls, search_records = discover_search_urls(
+        criteria,
+        config,
+        events_path=events_path,
+    )
+    append_event(
+        events_path,
+        "crawl_started",
+        "Starting web crawl.",
+        max_pages=max_pages,
+        max_depth=max_depth,
+        seed_count=len(config.get("seed_urls") or []),
+        search_start_url_count=len(search_urls),
+    )
+    result = crawl(
+        config,
+        criteria,
+        max_pages=max_pages,
+        max_depth=max_depth,
+        extra_seed_urls=search_urls,
+        events_path=events_path,
+    )
+    result["search"] = {
+        "enabled": bool(config.get("enable_search", True)),
+        "provider": str(config.get("search_provider") or "bing_rss"),
+        "queued_urls": search_urls,
+        "queries": search_records,
+    }
     suggestions_doc = {
         "generated_at": result["generated_at"],
         "criteria": criteria,
+        "search": result["search"],
         "suggestions": result["suggestions"],
     }
     if not args.dry_run:
         write_json(DEFAULT_DISCOVERY_PATH, result)
         write_json(DEFAULT_SUGGESTIONS_PATH, suggestions_doc)
+        append_event(
+            events_path,
+            "outputs_written",
+            "Discovery output files written.",
+            discovery_path=DEFAULT_DISCOVERY_PATH,
+            suggestions_path=DEFAULT_SUGGESTIONS_PATH,
+        )
     return result
 
 

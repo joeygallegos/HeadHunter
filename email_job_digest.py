@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import base64
 import html
-import json
 import os
 import sys
 import urllib.error
@@ -18,6 +17,7 @@ from sqlalchemy import asc, desc, select
 from sqlalchemy.orm import Session
 
 from app.db import resolve_display_timezone
+from app.json_utils import safe_json_list
 from app.models import IntegrationRun, Job, SessionLocal
 
 
@@ -120,18 +120,7 @@ def _clean_text(value: Any, default: str = "") -> str:
 
 
 def _safe_json_list(value: Any) -> List[str]:
-    if not value:
-        return []
-    if isinstance(value, list):
-        raw = value
-    else:
-        try:
-            raw = json.loads(str(value))
-        except Exception:
-            return []
-    if not isinstance(raw, list):
-        return []
-    return [str(item).strip() for item in raw if str(item).strip()]
+    return safe_json_list(value, strip_items=True, drop_empty=True)
 
 
 def score_label(job: Job) -> str:

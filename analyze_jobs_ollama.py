@@ -76,9 +76,17 @@ from langchain_ollama import ChatOllama
 from langchain_core.messages import HumanMessage, SystemMessage
 
 # DB
-from sqlalchemy import inspect as sa_inspect, select, text as sa_text
+from sqlalchemy import inspect as sa_inspect, or_, select, text as sa_text
 from sqlalchemy.orm import Session
-from app.models import SessionLocal, Job, JobChange, init_db
+from app.models import (
+    SessionLocal,
+    Job,
+    JobSwipe,
+    JobChange,
+    JobFitBrief,
+    JobApplicationPrep,
+    init_db,
+)
 from app.db import utc_now_naive
 from app.compensation import (
     choose_deterministic_compensation,
@@ -120,12 +128,25 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--all",
         action="store_true",
         dest="all_jobs",
-        help="Include every active and inactive job in compensation-only mode.",
+        help="Include every active job in compensation-only mode.",
     )
     parser.add_argument(
         "--force",
         action="store_true",
-        help="Reprocess jobs already completed with the current compensation schema.",
+        help=(
+            "Reprocess jobs already completed with the current compensation schema, "
+            "or regenerate existing fit briefs in --fit-briefs-only mode."
+        ),
+    )
+    parser.add_argument(
+        "--fit-briefs-only",
+        action="store_true",
+        help="Generate applicant-facing fit briefs for already analyzed eligible jobs.",
+    )
+    parser.add_argument(
+        "--application-prep-only",
+        action="store_true",
+        help="Generate job-specific application prep for liked move-forward jobs.",
     )
     parser.add_argument(
         "--dry-run",
@@ -140,10 +161,21 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="In compensation-only mode, process only the newest N jobs per site.",
     )
     args = parser.parse_args(argv)
+    exclusive_modes = [
+        bool(args.compensation_only),
+        bool(args.fit_briefs_only),
+        bool(args.application_prep_only),
+    ]
+    if sum(1 for enabled in exclusive_modes if enabled) > 1:
+        parser.error("choose only one of --compensation-only, --fit-briefs-only, or --application-prep-only")
     if args.all_jobs and not args.compensation_only:
         parser.error("--all requires --compensation-only")
-    if (args.force or args.dry_run or args.sample_per_site) and not args.compensation_only:
-        parser.error("--force, --dry-run, and --sample-per-site require --compensation-only")
+    if (args.dry_run or args.sample_per_site) and not args.compensation_only:
+        parser.error("--dry-run and --sample-per-site require --compensation-only")
+    if args.force and not (
+        args.compensation_only or args.fit_briefs_only or args.application_prep_only
+    ):
+        parser.error("--force requires --compensation-only, --fit-briefs-only, or --application-prep-only")
     if args.compensation_only and not (args.all_jobs or args.sample_per_site):
         parser.error("--compensation-only requires --all or --sample-per-site N")
     if args.all_jobs and args.sample_per_site:
@@ -160,11 +192,21 @@ AI_SYSTEM_PROMPT_TEMPLATE_PATH = os.getenv(
     "AI_SYSTEM_PROMPT_TEMPLATE_PATH",
     os.path.join(BASE_DIR, "prompts", "job_match_system.txt"),
 )
+FIT_BRIEF_SYSTEM_PROMPT_PATH = os.getenv(
+    "FIT_BRIEF_SYSTEM_PROMPT_PATH",
+    os.path.join(BASE_DIR, "prompts", "fit_brief_system.txt"),
+)
+APPLICATION_PREP_SYSTEM_PROMPT_PATH = os.getenv(
+    "APPLICATION_PREP_SYSTEM_PROMPT_PATH",
+    os.path.join(BASE_DIR, "prompts", "application_prep_system.txt"),
+)
 COMPENSATION_SYSTEM_PROMPT_PATH = os.getenv(
     "COMPENSATION_SYSTEM_PROMPT_PATH",
     os.path.join(BASE_DIR, "prompts", "compensation_system.txt"),
 )
 COMPENSATION_SCHEMA_VERSION = 1
+FIT_BRIEF_SCHEMA_VERSION = 1
+APPLICATION_PREP_SCHEMA_VERSION = 1
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "deepseek-r1:8b")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
 ONLY_EMPTY = os.getenv("ONLY_EMPTY", "true").lower() == "true"
@@ -178,6 +220,15 @@ OLLAMA_NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT", "300"))
 AI_THINKING_RETRY_NUM_PREDICT = max(
     OLLAMA_NUM_PREDICT,
     int(os.getenv("AI_THINKING_RETRY_NUM_PREDICT", str(OLLAMA_NUM_PREDICT * 3))),
+)
+APPLICATION_PREP_NUM_PREDICT = max(
+    OLLAMA_NUM_PREDICT,
+    int(os.getenv("APPLICATION_PREP_NUM_PREDICT", "4096")),
+)
+APPLICATION_PREP_RETRY_NUM_PREDICT = max(
+    APPLICATION_PREP_NUM_PREDICT,
+    AI_THINKING_RETRY_NUM_PREDICT,
+    int(os.getenv("APPLICATION_PREP_RETRY_NUM_PREDICT", str(APPLICATION_PREP_NUM_PREDICT * 2))),
 )
 OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "30m")
 KEYWORD_LIST_LIMIT = int(os.getenv("AI_KEYWORD_LIST_LIMIT", "5"))
@@ -198,8 +249,15 @@ OLLAMA_STARTUP_POLL_SEC = max(
 AI_WAIT_HEARTBEAT_SEC = max(5, int(os.getenv("AI_WAIT_HEARTBEAT_SEC", "15")))
 AI_MAX_ATTEMPTS = max(1, int(os.getenv("AI_MAX_ATTEMPTS", "4")))
 AI_SECOND_PASS_REVIEW = os.getenv("AI_SECOND_PASS_REVIEW", "true").lower() == "true"
-AI_REVIEW_MIN_MATCH = int(os.getenv("AI_REVIEW_MIN_MATCH", "60"))
-AI_REVIEW_MAX_MATCH = int(os.getenv("AI_REVIEW_MAX_MATCH", "89"))
+_AI_REVIEW_MIN_MATCH_RAW = os.getenv("AI_REVIEW_MIN_MATCH")
+_AI_REVIEW_MAX_MATCH_RAW = os.getenv("AI_REVIEW_MAX_MATCH")
+AI_REVIEW_MIN_MATCH = (
+    int(_AI_REVIEW_MIN_MATCH_RAW) if _AI_REVIEW_MIN_MATCH_RAW not in {None, ""} else None
+)
+AI_REVIEW_MAX_MATCH = (
+    int(_AI_REVIEW_MAX_MATCH_RAW) if _AI_REVIEW_MAX_MATCH_RAW not in {None, ""} else None
+)
+AI_FIT_BRIEF_MIN_MATCH = int(os.getenv("AI_FIT_BRIEF_MIN_MATCH", "75"))
 
 
 def parse_ollama_think(value: str) -> Any:
@@ -217,6 +275,7 @@ def parse_ollama_think(value: str) -> Any:
 
 
 OLLAMA_THINK = parse_ollama_think(os.getenv("OLLAMA_THINK", "false"))
+APPLICATION_PREP_THINK = parse_ollama_think(os.getenv("APPLICATION_PREP_THINK", "false"))
 
 REQUIRED_KEYS = {
     "match_percentage",
@@ -271,6 +330,33 @@ class JobResult:
     llm_seconds: float
     error_text: str
     index: int
+
+
+@dataclass
+class FitBriefTask:
+    id: int
+    site: str
+    job_id: str
+    title: str
+    desc: str
+    ai_analysis: str
+    ai_match_percentage: Optional[int]
+    content_hash: Optional[str]
+    existing_resume_hash: Optional[str] = None
+    existing_job_content_hash: Optional[str] = None
+
+
+@dataclass
+class ApplicationPrepTask:
+    id: int
+    prep_id: int
+    site: str
+    job_id: str
+    title: str
+    desc: str
+    ai_analysis: str
+    ai_match_percentage: Optional[int]
+    content_hash: Optional[str]
 
 
 class OllamaEmptyContentError(RuntimeError):
@@ -479,7 +565,11 @@ def check_ollama_prerequisites() -> None:
     log(f"[ok] Ollama ready at {OLLAMA_BASE_URL} | model={OLLAMA_MODEL}")
 
 
-def invoke_ollama_json(messages: list, num_predict: Optional[int] = None) -> str:
+def invoke_ollama_json(
+    messages: list,
+    num_predict: Optional[int] = None,
+    think: Optional[Any] = None,
+) -> str:
     """Call Ollama directly so socket timeout failures return to the worker."""
     wire_messages = []
     for msg in messages:
@@ -494,7 +584,7 @@ def invoke_ollama_json(messages: list, num_predict: Optional[int] = None) -> str
         "messages": wire_messages,
         "stream": False,
         "format": "json",
-        "think": OLLAMA_THINK,
+        "think": OLLAMA_THINK if think is None else think,
         "keep_alive": OLLAMA_KEEP_ALIVE,
         "options": {
             "num_ctx": OLLAMA_NUM_CTX,
@@ -934,22 +1024,26 @@ def fresh_retry_prompt(previous_error: str) -> str:
 
 
 def should_review_payload(payload: Any) -> bool:
-    """Return whether a valid payload should get a private second-pass review."""
+    """Return whether a valid initial-analysis payload should get reviewed."""
     if not AI_SECOND_PASS_REVIEW or not isinstance(payload, dict):
         return False
     score = _coerce_int(payload.get("match_percentage"))
     if score is None:
         return False
-    lo = min(AI_REVIEW_MIN_MATCH, AI_REVIEW_MAX_MATCH)
-    hi = max(AI_REVIEW_MIN_MATCH, AI_REVIEW_MAX_MATCH)
+    if AI_REVIEW_MIN_MATCH is None and AI_REVIEW_MAX_MATCH is None:
+        return True
+    lo_raw = 0 if AI_REVIEW_MIN_MATCH is None else AI_REVIEW_MIN_MATCH
+    hi_raw = 100 if AI_REVIEW_MAX_MATCH is None else AI_REVIEW_MAX_MATCH
+    lo = min(lo_raw, hi_raw)
+    hi = max(lo_raw, hi_raw)
     return lo <= score <= hi
 
 
 def review_prompt(candidate_json: str) -> str:
-    """Build the private audit prompt for a valid borderline first-pass result."""
+    """Build the private audit prompt for a valid initial-analysis result."""
     return (
         "Privately review the candidate JSON below against the original resume, job title, and job description. "
-        "Audit score calibration, overlapping skills, missing critical skills, seniority fit, responsibilities fit, location policy, and compensation extraction. "
+        "Audit score calibration, seniority fit, location policy, compensation accuracy, overlapping skills, missing critical skills, and unsupported keyword claims. "
         "If the candidate is already accurate, return the same values. If it is miscalibrated, return corrected values. "
         "Return ONLY one valid JSON object with EXACTLY the same seven keys and no extra fields, markdown, reasoning, notes, or explanations.\n\n"
         "Candidate JSON:\n"
@@ -960,7 +1054,7 @@ def review_prompt(candidate_json: str) -> str:
 def run_second_pass_review(
     base_msgs: List[Any], payload: Dict[str, Any]
 ) -> Tuple[Dict[str, Any], float, str]:
-    """Review a borderline valid payload and fall back to it if review fails."""
+    """Review a valid initial payload and fall back to it if review fails."""
     if not should_review_payload(payload):
         return payload, 0.0, ""
 
@@ -1052,6 +1146,409 @@ def ai_changed_fields(update_params: Dict[str, Any]) -> str:
         "compensation_schema_version",
     ]
     return ",".join(fields)
+
+
+FIT_BRIEF_REQUIRED_KEYS = {
+    "score_explanation",
+    "strongest_matches",
+    "concerns_or_gaps",
+    "risk_flags",
+    "interview_angle",
+    "resume_bullet_matches",
+}
+FIT_BRIEF_MATCH_KEYS = {
+    "resume_bullet",
+    "job_requirement",
+    "why_it_matters",
+    "confidence",
+}
+FIT_BRIEF_CONFIDENCE = {"high", "medium", "low"}
+APPLICATION_PREP_REQUIRED_KEYS = {
+    "resume_improvements",
+    "draft_resume_bullets",
+    "evidence_notes",
+    "fit_gaps",
+    "positioning_summary",
+}
+APPLICATION_PREP_BULLET_KEYS = {
+    "bullet",
+    "source_resume_evidence",
+    "job_requirement",
+    "confidence",
+}
+APPLICATION_PREP_EVIDENCE_KEYS = {
+    "draft_bullet",
+    "note",
+}
+
+
+def stable_text_hash(text_value: str) -> str:
+    """Return a stable sha256 for source text used by generated AI artifacts."""
+    return hashlib.sha256((text_value or "").encode("utf-8", "ignore")).hexdigest()
+
+
+def fit_brief_job_hash(task: FitBriefTask) -> str:
+    """Use scraper content hash when available, otherwise hash core prompt input."""
+    if task.content_hash:
+        return task.content_hash
+    return stable_text_hash("|".join([task.title or "", task.desc or "", task.ai_analysis or ""]))
+
+
+def application_prep_job_hash(task: ApplicationPrepTask) -> str:
+    if task.content_hash:
+        return task.content_hash
+    return stable_text_hash("|".join([task.title or "", task.desc or "", task.ai_analysis or ""]))
+
+
+def render_fit_brief_system_prompt(
+    template_path: str = FIT_BRIEF_SYSTEM_PROMPT_PATH,
+) -> str:
+    """Render the system prompt for applicant-facing fit briefs."""
+    if not os.path.exists(template_path):
+        raise FileNotFoundError(f"Fit Brief system prompt not found: {template_path}")
+    with open(template_path, "r", encoding="utf-8") as handle:
+        return handle.read().lstrip("\ufeff").strip()
+
+
+def render_application_prep_system_prompt(
+    template_path: str = APPLICATION_PREP_SYSTEM_PROMPT_PATH,
+) -> str:
+    """Render the system prompt for job-specific application prep."""
+    if not os.path.exists(template_path):
+        raise FileNotFoundError(f"Application Prep system prompt not found: {template_path}")
+    with open(template_path, "r", encoding="utf-8") as handle:
+        return handle.read().lstrip("\ufeff").strip()
+
+
+def build_fit_brief_messages(resume_text: str, task: FitBriefTask) -> List[Any]:
+    """Build the LLM messages for one high-match Fit Brief."""
+    user_msg = (
+        "<resume>\n"
+        f"{clean_text(resume_text)}\n"
+        "</resume>\n\n"
+        "<job_title>\n"
+        f"{clean_text(task.title)}\n"
+        "</job_title>\n\n"
+        "<job_description>\n"
+        f"{clean_text(task.desc)}\n"
+        "</job_description>\n\n"
+        "<final_ai_analysis_json>\n"
+        f"{clean_text(task.ai_analysis)}\n"
+        "</final_ai_analysis_json>"
+    )
+    return [
+        SystemMessage(content=render_fit_brief_system_prompt()),
+        HumanMessage(content=user_msg),
+    ]
+
+
+def build_application_prep_messages(resume_text: str, task: ApplicationPrepTask) -> List[Any]:
+    """Build the LLM messages for one move-forward application prep."""
+    user_msg = (
+        "<resume>\n"
+        f"{clean_text(resume_text)}\n"
+        "</resume>\n\n"
+        "<job_title>\n"
+        f"{clean_text(task.title)}\n"
+        "</job_title>\n\n"
+        "<job_description>\n"
+        f"{clean_text(task.desc)}\n"
+        "</job_description>\n\n"
+        "<final_ai_analysis_json>\n"
+        f"{clean_text(task.ai_analysis)}\n"
+        "</final_ai_analysis_json>"
+    )
+    return [
+        SystemMessage(content=render_application_prep_system_prompt()),
+        HumanMessage(content=user_msg),
+    ]
+
+
+def _normalize_short_str_list(value: Any, limit: int = 8) -> Optional[List[str]]:
+    items = _normalize_str_list(value)
+    if items is None:
+        return None
+    return [item[:500].strip() for item in items if item.strip()][:limit]
+
+
+def validate_application_prep_schema(payload: Any, resume_text: str) -> Tuple[bool, str]:
+    """Validate and normalize Application Prep JSON before persistence."""
+    if not isinstance(payload, dict):
+        return False, "payload not an object"
+    if set(payload.keys()) != APPLICATION_PREP_REQUIRED_KEYS:
+        return False, "application prep keys must exactly match schema"
+
+    positioning = payload.get("positioning_summary")
+    if not isinstance(positioning, str) or not positioning.strip():
+        return False, "positioning_summary must be a non-empty string"
+    payload["positioning_summary"] = positioning.strip()[:1200]
+
+    for key in ("resume_improvements", "fit_gaps"):
+        items = _normalize_short_str_list(payload.get(key), limit=8)
+        if items is None:
+            return False, f"{key} must be list[str]"
+        payload[key] = items
+
+    bullets = payload.get("draft_resume_bullets")
+    if not isinstance(bullets, list):
+        return False, "draft_resume_bullets must be a list"
+    normalized_bullets: List[Dict[str, str]] = []
+    for item in bullets[:8]:
+        if not isinstance(item, dict) or set(item.keys()) != APPLICATION_PREP_BULLET_KEYS:
+            return False, "draft_resume_bullets entries must exactly match schema"
+        bullet = str(item.get("bullet") or "").strip()
+        source = str(item.get("source_resume_evidence") or "").strip()
+        requirement = str(item.get("job_requirement") or "").strip()
+        confidence = str(item.get("confidence") or "").strip().lower()
+        if not bullet or not source or not requirement:
+            return False, "draft bullet, source evidence, and job requirement must be non-empty"
+        if source not in resume_text:
+            return False, "source_resume_evidence must be exact text from resume"
+        if confidence not in FIT_BRIEF_CONFIDENCE:
+            return False, f"confidence must be one of {sorted(FIT_BRIEF_CONFIDENCE)}"
+        normalized_bullets.append(
+            {
+                "bullet": bullet[:1000],
+                "source_resume_evidence": source[:1500],
+                "job_requirement": requirement[:1000],
+                "confidence": confidence,
+            }
+        )
+    payload["draft_resume_bullets"] = normalized_bullets
+
+    evidence = payload.get("evidence_notes")
+    if not isinstance(evidence, list):
+        return False, "evidence_notes must be a list"
+    normalized_evidence: List[Dict[str, str]] = []
+    valid_bullets = {item["bullet"] for item in normalized_bullets}
+    for item in evidence[:8]:
+        if not isinstance(item, dict) or set(item.keys()) != APPLICATION_PREP_EVIDENCE_KEYS:
+            return False, "evidence_notes entries must exactly match schema"
+        draft_bullet = str(item.get("draft_bullet") or "").strip()
+        note = str(item.get("note") or "").strip()
+        if draft_bullet not in valid_bullets:
+            return False, "evidence note draft_bullet must match a generated draft bullet"
+        if not note:
+            return False, "evidence note must be non-empty"
+        normalized_evidence.append({"draft_bullet": draft_bullet, "note": note[:1000]})
+    payload["evidence_notes"] = normalized_evidence
+    return True, ""
+
+
+def validate_fit_brief_schema(payload: Any, resume_text: str) -> Tuple[bool, str]:
+    """Validate and normalize a Fit Brief before persistence."""
+    if not isinstance(payload, dict):
+        return False, "payload not an object"
+    if set(payload.keys()) != FIT_BRIEF_REQUIRED_KEYS:
+        return False, "fit brief keys must exactly match schema"
+
+    for key in ("score_explanation", "interview_angle"):
+        value = payload.get(key)
+        if not isinstance(value, str) or not value.strip():
+            return False, f"{key} must be a non-empty string"
+        payload[key] = value.strip()[:1000]
+
+    for key in ("strongest_matches", "concerns_or_gaps", "risk_flags"):
+        items = _normalize_short_str_list(payload.get(key))
+        if items is None:
+            return False, f"{key} must be list[str]"
+        payload[key] = items
+
+    matches = payload.get("resume_bullet_matches")
+    if not isinstance(matches, list):
+        return False, "resume_bullet_matches must be a list"
+    normalized_matches: List[Dict[str, str]] = []
+    for item in matches[:7]:
+        if not isinstance(item, dict) or set(item.keys()) != FIT_BRIEF_MATCH_KEYS:
+            return False, "resume_bullet_matches entries must exactly match schema"
+        bullet = str(item.get("resume_bullet") or "").strip()
+        requirement = str(item.get("job_requirement") or "").strip()
+        why = str(item.get("why_it_matters") or "").strip()
+        confidence = str(item.get("confidence") or "").strip().lower()
+        if not bullet or bullet not in resume_text:
+            return False, "resume_bullet must be exact text from resume"
+        if not requirement or not why:
+            return False, "job_requirement and why_it_matters must be non-empty"
+        if confidence not in FIT_BRIEF_CONFIDENCE:
+            return False, f"confidence must be one of {sorted(FIT_BRIEF_CONFIDENCE)}"
+        normalized_matches.append(
+            {
+                "resume_bullet": bullet,
+                "job_requirement": requirement[:1000],
+                "why_it_matters": why[:1000],
+                "confidence": confidence,
+            }
+        )
+    payload["resume_bullet_matches"] = normalized_matches
+    return True, ""
+
+
+def fit_brief_repair_prompt(raw: str) -> str:
+    """Build the repair prompt for invalid Fit Brief JSON."""
+    return (
+        "Your previous Fit Brief response was invalid. Return ONLY one JSON object "
+        "with exactly these keys: score_explanation, strongest_matches, "
+        "concerns_or_gaps, risk_flags, interview_angle, resume_bullet_matches. "
+        "Each resume_bullet_matches item must have exactly resume_bullet, "
+        "job_requirement, why_it_matters, confidence. resume_bullet must be exact "
+        "text copied from the resume. No markdown or extra text.\n\n"
+        f"Invalid previous reply:\n{raw[:1500]}"
+    )
+
+
+def application_prep_repair_prompt(raw: str) -> str:
+    """Build the repair prompt for invalid Application Prep JSON."""
+    return (
+        "Your previous Application Prep response was invalid. Return ONLY one JSON object "
+        "with exactly these keys: resume_improvements, draft_resume_bullets, "
+        "evidence_notes, fit_gaps, positioning_summary. draft_resume_bullets entries "
+        "must have exactly bullet, source_resume_evidence, job_requirement, confidence. "
+        "source_resume_evidence must be exact text copied from the resume. evidence_notes "
+        "entries must have exactly draft_bullet and note, and draft_bullet must match one "
+        "generated bullet exactly. No markdown or extra text.\n\n"
+        f"Invalid previous reply:\n{raw[:1500]}"
+    )
+
+
+def analyze_application_prep_worker(
+    resume_text: str, task: ApplicationPrepTask, index: int
+) -> JobResult:
+    """Generate and validate one job-specific application prep artifact."""
+    if not task.title and not task.desc:
+        return JobResult(task.id, task.site, task.job_id, "skip", None, None, 0.0, "Empty title+desc", index)
+
+    msgs = build_application_prep_messages(resume_text, task)
+    current_msgs = list(msgs)
+    current_num_predict = APPLICATION_PREP_NUM_PREDICT
+    took = 0.0
+    attempts: List[str] = []
+    payload: Dict[str, Any] = {}
+    ok = False
+
+    for attempt in range(1, AI_MAX_ATTEMPTS + 1):
+        raw = ""
+        t0 = time.time()
+        try:
+            raw = invoke_ollama_json(
+                current_msgs,
+                num_predict=current_num_predict,
+                think=APPLICATION_PREP_THINK,
+            )
+            took += time.time() - t0
+            parsed = parse_json_strict(raw) or {}
+            ok, why = validate_application_prep_schema(parsed, resume_text)
+            if ok:
+                payload = parsed
+                break
+            attempts.append(f"attempt {attempt}: {why}; {_payload_debug(parsed, raw)}")
+            current_msgs = msgs + [HumanMessage(content=application_prep_repair_prompt(raw))]
+        except OllamaEmptyContentError as exc:
+            took += time.time() - t0
+            detail = f"attempt {attempt}: {exc}"
+            if (
+                exc.done_reason == "length"
+                and exc.thinking_chars > 0
+                and current_num_predict < APPLICATION_PREP_RETRY_NUM_PREDICT
+                and attempt < AI_MAX_ATTEMPTS
+            ):
+                current_num_predict = APPLICATION_PREP_RETRY_NUM_PREDICT
+                detail += f"; retrying with num_predict={current_num_predict}"
+                attempts.append(detail)
+                current_msgs = list(msgs)
+                continue
+            attempts.append(detail)
+            current_msgs = msgs + [
+                HumanMessage(content=application_prep_repair_prompt(raw or str(exc)))
+            ]
+        except OllamaUnavailableError as exc:
+            took += time.time() - t0
+            return JobResult(task.id, task.site, task.job_id, "ollama_unavailable", None, None, took, str(exc), index)
+        except Exception as exc:
+            took += time.time() - t0
+            attempts.append(f"attempt {attempt}: {exc}")
+            current_msgs = msgs + [HumanMessage(content=application_prep_repair_prompt(raw or str(exc)))]
+
+    if not ok:
+        return JobResult(
+            task.id,
+            task.site,
+            task.job_id,
+            "schema_error",
+            None,
+            None,
+            took,
+            " | ".join(attempts),
+            index,
+        )
+
+    payload_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    update_params = {
+        "prep_json": payload_json,
+        "resume_hash": stable_text_hash(resume_text),
+        "job_content_hash": application_prep_job_hash(task),
+        "generated_at": utc_now_naive(),
+        "schema_version": APPLICATION_PREP_SCHEMA_VERSION,
+    }
+    return JobResult(task.id, task.site, task.job_id, "ok", payload_json, update_params, took, "", index)
+
+
+def analyze_fit_brief_worker(
+    resume_text: str, task: FitBriefTask, index: int
+) -> JobResult:
+    """Generate and validate the applicant-facing Fit Brief for one job."""
+    if not task.title and not task.desc:
+        return JobResult(task.id, task.site, task.job_id, "skip", None, None, 0.0, "Empty title+desc", index)
+
+    msgs = build_fit_brief_messages(resume_text, task)
+    current_msgs = list(msgs)
+    took = 0.0
+    attempts: List[str] = []
+    payload: Dict[str, Any] = {}
+    ok = False
+
+    for attempt in range(1, AI_MAX_ATTEMPTS + 1):
+        raw = ""
+        t0 = time.time()
+        try:
+            raw = invoke_ollama_json(current_msgs)
+            took += time.time() - t0
+            parsed = parse_json_strict(raw) or {}
+            ok, why = validate_fit_brief_schema(parsed, resume_text)
+            if ok:
+                payload = parsed
+                break
+            attempts.append(f"attempt {attempt}: {why}; {_payload_debug(parsed, raw)}")
+            current_msgs = msgs + [HumanMessage(content=fit_brief_repair_prompt(raw))]
+        except OllamaUnavailableError as exc:
+            took += time.time() - t0
+            return JobResult(task.id, task.site, task.job_id, "ollama_unavailable", None, None, took, str(exc), index)
+        except Exception as exc:
+            took += time.time() - t0
+            attempts.append(f"attempt {attempt}: {exc}")
+            current_msgs = msgs + [HumanMessage(content=fit_brief_repair_prompt(raw or str(exc)))]
+
+    if not ok:
+        return JobResult(
+            task.id,
+            task.site,
+            task.job_id,
+            "schema_error",
+            None,
+            None,
+            took,
+            " | ".join(attempts),
+            index,
+        )
+
+    payload_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    update_params = {
+        "brief_json": payload_json,
+        "resume_hash": stable_text_hash(resume_text),
+        "job_content_hash": fit_brief_job_hash(task),
+        "generated_at": utc_now_naive(),
+        "schema_version": FIT_BRIEF_SCHEMA_VERSION,
+    }
+    return JobResult(task.id, task.site, task.job_id, "ok", payload_json, update_params, took, "", index)
 
 
 
@@ -1204,7 +1701,7 @@ def analyze_job_worker(resume_text: str, task: JobTask, index: int) -> JobResult
 # -------------------------------
 def select_job_ids(session: Session, redo: Optional[int] = None) -> List[int]:
     """Return candidate job primary keys based on filters and optional redo mode."""
-    where = []
+    where = ["is_active = 1"]
     params: Dict[str, Any] = {}
     if ONLY_EMPTY and redo is None:
         where.append("(ai_analysis IS NULL OR ai_analysis = '')")
@@ -1355,8 +1852,8 @@ def analyze_compensation_worker(task: JobTask, index: int) -> JobResult:
 
 
 def select_compensation_jobs(session: Session, args: argparse.Namespace) -> List[Job]:
-    """Select active and inactive jobs while honoring resume/version controls."""
-    stmt = select(Job)
+    """Select active jobs while honoring resume/version controls."""
+    stmt = select(Job).where(Job.is_active.is_(True))
     if not args.force:
         stmt = stmt.where(
             (Job.compensation_schema_version.is_(None))
@@ -1535,6 +2032,13 @@ def run_compensation_backfill(args: argparse.Namespace) -> None:
 
                     job = jobs_by_id[result.id]
                     ai_data = result.update_params
+                    session.refresh(job)
+                    if not job.is_active:
+                        totals["skipped"] += 1
+                        log(
+                            f"[skip] {job.site}:{job.job_id} became inactive before compensation write"
+                        )
+                        continue
                     deterministic = choose_deterministic_compensation(
                         "",
                         job.desc or "",
@@ -1609,6 +2113,414 @@ def run_compensation_backfill(args: argparse.Namespace) -> None:
             raise SystemExit(1)
 
 
+def select_fit_brief_jobs(
+    session: Session, resume_text: str, *, force: bool = False
+) -> List[Tuple[Job, Optional[JobFitBrief]]]:
+    """Select active reviewed matches that need an applicant-facing Fit Brief."""
+    resume_hash = stable_text_hash(resume_text)
+    stmt = (
+        select(Job, JobFitBrief)
+        .outerjoin(JobFitBrief, JobFitBrief.job_pk == Job.id)
+        .where(Job.is_active.is_(True))
+        .where(Job.ai_match_percentage.is_not(None))
+        .where(Job.ai_match_percentage >= AI_FIT_BRIEF_MIN_MATCH)
+        .where(or_(Job.title != "", Job.desc != ""))
+        .order_by(Job.ai_match_percentage.desc(), Job.discovery_date.desc(), Job.id.desc())
+    )
+    rows = list(session.execute(stmt).all())
+    if force:
+        return rows
+
+    selected: List[Tuple[Job, Optional[JobFitBrief]]] = []
+    for job, brief in rows:
+        current_job_hash = job.content_hash or stable_text_hash(
+            "|".join([job.title or "", job.desc or "", job.ai_analysis or ""])
+        )
+        if brief is None:
+            selected.append((job, brief))
+            continue
+        if (
+            brief.resume_hash != resume_hash
+            or brief.job_content_hash != current_job_hash
+            or brief.schema_version != FIT_BRIEF_SCHEMA_VERSION
+        ):
+            selected.append((job, brief))
+    return selected
+
+
+def run_fit_brief_generation(
+    resume_text: str,
+    *,
+    force: bool = False,
+    preflight: bool = True,
+) -> Dict[str, int]:
+    """Run Stage 3 Fit Brief generation for eligible high-match jobs."""
+    init_db()
+    totals = {
+        "processed": 0,
+        "failed": 0,
+        "skipped": 0,
+        "cancelled": 0,
+        "unsubmitted": 0,
+    }
+    with SessionLocal() as session:
+        rows = select_fit_brief_jobs(session, resume_text, force=force)
+        tasks = [
+            FitBriefTask(
+                id=job.id,
+                site=job.site or "",
+                job_id=job.job_id or "",
+                title=job.title or "",
+                desc=job.desc or "",
+                ai_analysis=job.ai_analysis or "",
+                ai_match_percentage=job.ai_match_percentage,
+                content_hash=job.content_hash,
+                existing_resume_hash=getattr(brief, "resume_hash", None),
+                existing_job_content_hash=getattr(brief, "job_content_hash", None),
+            )
+            for job, brief in rows
+        ]
+        log(
+            f"Stage 3 Fit Brief jobs={len(tasks)} min_match={AI_FIT_BRIEF_MIN_MATCH} "
+            f"force={force} schema_version={FIT_BRIEF_SCHEMA_VERSION}"
+        )
+        if not tasks:
+            log(f"Stage 3 Fit Brief complete: {totals}")
+            return totals
+
+        if preflight:
+            try:
+                check_ollama_prerequisites()
+            except OllamaPrerequisiteError as exc:
+                log(f"[fatal] {exc}")
+                raise SystemExit(1) from exc
+
+        futures: Set[Future] = set()
+        future_to_task: Dict[Future, FitBriefTask] = {}
+        submitted = 0
+        aborted = False
+
+        with ThreadPoolExecutor(max_workers=AI_CONCURRENCY) as executor:
+            while (not aborted and submitted < len(tasks)) or futures:
+                while (
+                    not aborted
+                    and submitted < len(tasks)
+                    and len(futures) < AI_MAX_INFLIGHT
+                ):
+                    task = tasks[submitted]
+                    index = submitted + 1
+                    log(
+                        f"[submit] [Fit Brief {index}/{len(tasks)}] "
+                        f"{task.site}:{task.job_id} title={task.title[:80]!r}"
+                    )
+                    future = executor.submit(analyze_fit_brief_worker, resume_text, task, index)
+                    futures.add(future)
+                    future_to_task[future] = task
+                    submitted += 1
+
+                done, _ = wait(
+                    futures,
+                    timeout=AI_WAIT_HEARTBEAT_SEC,
+                    return_when=FIRST_COMPLETED,
+                )
+                if not done:
+                    log(
+                        f"[wait] fit-briefs submitted={submitted}/{len(tasks)} "
+                        f"inflight={len(futures)}"
+                    )
+                    continue
+
+                for future in done:
+                    futures.remove(future)
+                    task = future_to_task.pop(future)
+                    try:
+                        result = future.result()
+                    except Exception as exc:
+                        result = JobResult(
+                            id=task.id,
+                            site=task.site,
+                            job_id=task.job_id,
+                            status="llm_error",
+                            payload_json=None,
+                            update_params=None,
+                            llm_seconds=0.0,
+                            error_text=f"worker crash: {exc}",
+                            index=0,
+                        )
+
+                    if result.status == "ollama_unavailable":
+                        totals["failed"] += 1
+                        if not aborted:
+                            aborted = True
+                            log(f"[fatal] {result.error_text}; aborting fit-brief batch")
+                            for pending in list(futures):
+                                if pending.cancel():
+                                    futures.remove(pending)
+                                    future_to_task.pop(pending, None)
+                                    totals["cancelled"] += 1
+                        continue
+                    if result.status == "skip":
+                        totals["skipped"] += 1
+                        log(f"[skip] {result.site}:{result.job_id} {result.error_text}")
+                        continue
+                    if result.status != "ok" or result.update_params is None:
+                        totals["failed"] += 1
+                        log(f"[err] Fit Brief {result.site}:{result.job_id} {result.error_text}")
+                        continue
+
+                    brief = (
+                        session.execute(
+                            select(JobFitBrief).where(JobFitBrief.job_pk == result.id)
+                        )
+                        .scalars()
+                        .one_or_none()
+                    )
+                    if brief is None:
+                        brief = JobFitBrief(job_pk=result.id, brief_json="{}")
+                        session.add(brief)
+                    brief.brief_json = result.update_params["brief_json"]
+                    brief.resume_hash = result.update_params["resume_hash"]
+                    brief.job_content_hash = result.update_params["job_content_hash"]
+                    brief.generated_at = result.update_params["generated_at"]
+                    brief.schema_version = result.update_params["schema_version"]
+                    try:
+                        session.commit()
+                    except Exception as exc:
+                        session.rollback()
+                        totals["failed"] += 1
+                        log(f"[err] Fit Brief DB commit failed: {exc}")
+                        continue
+                    totals["processed"] += 1
+                    log(f"[ok] Fit Brief committed {result.site}:{result.job_id} in {result.llm_seconds:.1f}s")
+
+        totals["unsubmitted"] = len(tasks) - submitted
+        log(f"Stage 3 Fit Brief complete: {totals}")
+        if aborted:
+            raise SystemExit(1)
+        return totals
+
+
+def select_application_prep_jobs(
+    session: Session, resume_text: str, *, force: bool = False
+) -> List[Tuple[Job, JobApplicationPrep]]:
+    """Select liked move-forward jobs that need application-prep generation."""
+    resume_hash = stable_text_hash(resume_text)
+    rows = list(
+        session.execute(
+            select(Job, JobApplicationPrep)
+            .join(JobApplicationPrep, JobApplicationPrep.job_pk == Job.id)
+            .join(JobSwipe, JobSwipe.job_pk == Job.id)
+            .where(JobSwipe.action == "like")
+            .where(or_(Job.title != "", Job.desc != ""))
+            .order_by(JobApplicationPrep.queued_at.desc(), Job.id.desc())
+        ).all()
+    )
+    if force:
+        return rows
+
+    selected: List[Tuple[Job, JobApplicationPrep]] = []
+    for job, prep in rows:
+        current_job_hash = job.content_hash or stable_text_hash(
+            "|".join([job.title or "", job.desc or "", job.ai_analysis or ""])
+        )
+        status = (prep.status or "queued").strip().lower()
+        if status in {"queued", "stale"}:
+            selected.append((job, prep))
+            continue
+        if (
+            status == "done"
+            and (
+                prep.resume_hash != resume_hash
+                or prep.job_content_hash != current_job_hash
+                or prep.schema_version != APPLICATION_PREP_SCHEMA_VERSION
+            )
+        ):
+            prep.status = "stale"
+            selected.append((job, prep))
+    if selected:
+        session.commit()
+    return selected
+
+
+def run_application_prep_generation(
+    *,
+    resume_text: Optional[str] = None,
+    force: bool = False,
+    preflight: bool = True,
+) -> Dict[str, int]:
+    """Run high-priority application prep for liked move-forward jobs."""
+    init_db()
+    if resume_text is None:
+        if not os.path.exists(RESUME_PATH):
+            log(f"[err] Resume not found: {RESUME_PATH}")
+            raise SystemExit(1)
+        with open(RESUME_PATH, "r", encoding="utf-8", errors="ignore") as f:
+            resume_text = f.read()
+
+    totals = {
+        "processed": 0,
+        "failed": 0,
+        "skipped": 0,
+        "cancelled": 0,
+        "unsubmitted": 0,
+    }
+    with SessionLocal() as session:
+        rows = select_application_prep_jobs(session, resume_text, force=force)
+        tasks: List[ApplicationPrepTask] = []
+        now = utc_now_naive()
+        for job, prep in rows:
+            prep.status = "running"
+            prep.started_at = now
+            prep.error_text = None
+            tasks.append(
+                ApplicationPrepTask(
+                    id=job.id,
+                    prep_id=prep.id,
+                    site=job.site or "",
+                    job_id=job.job_id or "",
+                    title=job.title or "",
+                    desc=job.desc or "",
+                    ai_analysis=job.ai_analysis or "",
+                    ai_match_percentage=job.ai_match_percentage,
+                    content_hash=job.content_hash,
+                )
+            )
+        if tasks:
+            session.commit()
+
+        log(
+            f"Application Prep jobs={len(tasks)} force={force} "
+            f"schema_version={APPLICATION_PREP_SCHEMA_VERSION}"
+        )
+        if not tasks:
+            log(f"Application Prep complete: {totals}")
+            return totals
+
+        if preflight:
+            try:
+                check_ollama_prerequisites()
+            except OllamaPrerequisiteError as exc:
+                for task in tasks:
+                    prep = session.get(JobApplicationPrep, task.prep_id)
+                    if prep is not None:
+                        prep.status = "failed"
+                        prep.error_text = str(exc)
+                session.commit()
+                log(f"[fatal] {exc}")
+                raise SystemExit(1) from exc
+
+        futures: Set[Future] = set()
+        future_to_task: Dict[Future, ApplicationPrepTask] = {}
+        submitted = 0
+        aborted = False
+
+        with ThreadPoolExecutor(max_workers=AI_CONCURRENCY) as executor:
+            while (not aborted and submitted < len(tasks)) or futures:
+                while (
+                    not aborted
+                    and submitted < len(tasks)
+                    and len(futures) < AI_MAX_INFLIGHT
+                ):
+                    task = tasks[submitted]
+                    index = submitted + 1
+                    log(
+                        f"[submit] [Application Prep {index}/{len(tasks)}] "
+                        f"{task.site}:{task.job_id} title={task.title[:80]!r}"
+                    )
+                    future = executor.submit(analyze_application_prep_worker, resume_text, task, index)
+                    futures.add(future)
+                    future_to_task[future] = task
+                    submitted += 1
+
+                done, _ = wait(
+                    futures,
+                    timeout=AI_WAIT_HEARTBEAT_SEC,
+                    return_when=FIRST_COMPLETED,
+                )
+                if not done:
+                    log(
+                        f"[wait] application-prep submitted={submitted}/{len(tasks)} "
+                        f"inflight={len(futures)}"
+                    )
+                    continue
+
+                for future in done:
+                    futures.remove(future)
+                    task = future_to_task.pop(future)
+                    try:
+                        result = future.result()
+                    except Exception as exc:
+                        result = JobResult(
+                            id=task.id,
+                            site=task.site,
+                            job_id=task.job_id,
+                            status="llm_error",
+                            payload_json=None,
+                            update_params=None,
+                            llm_seconds=0.0,
+                            error_text=f"worker crash: {exc}",
+                            index=0,
+                        )
+
+                    prep = session.get(JobApplicationPrep, task.prep_id)
+                    if prep is None:
+                        totals["failed"] += 1
+                        log(f"[err] Application Prep row missing for {task.site}:{task.job_id}")
+                        continue
+
+                    if result.status == "ollama_unavailable":
+                        totals["failed"] += 1
+                        prep.status = "failed"
+                        prep.error_text = result.error_text
+                        session.commit()
+                        if not aborted:
+                            aborted = True
+                            log(f"[fatal] {result.error_text}; aborting application-prep batch")
+                            for pending in list(futures):
+                                if pending.cancel():
+                                    futures.remove(pending)
+                                    future_to_task.pop(pending, None)
+                                    totals["cancelled"] += 1
+                        continue
+                    if result.status == "skip":
+                        totals["skipped"] += 1
+                        prep.status = "failed"
+                        prep.error_text = result.error_text
+                        session.commit()
+                        log(f"[skip] {result.site}:{result.job_id} {result.error_text}")
+                        continue
+                    if result.status != "ok" or result.update_params is None:
+                        totals["failed"] += 1
+                        prep.status = "failed"
+                        prep.error_text = result.error_text
+                        session.commit()
+                        log(f"[err] Application Prep {result.site}:{result.job_id} {result.error_text}")
+                        continue
+
+                    prep.prep_json = result.update_params["prep_json"]
+                    prep.resume_hash = result.update_params["resume_hash"]
+                    prep.job_content_hash = result.update_params["job_content_hash"]
+                    prep.generated_at = result.update_params["generated_at"]
+                    prep.schema_version = result.update_params["schema_version"]
+                    prep.status = "done"
+                    prep.error_text = None
+                    try:
+                        session.commit()
+                    except Exception as exc:
+                        session.rollback()
+                        totals["failed"] += 1
+                        log(f"[err] Application Prep DB commit failed: {exc}")
+                        continue
+                    totals["processed"] += 1
+                    log(f"[ok] Application Prep committed {result.site}:{result.job_id} in {result.llm_seconds:.1f}s")
+
+        totals["unsubmitted"] = len(tasks) - submitted
+        log(f"Application Prep complete: {totals}")
+        if aborted:
+            raise SystemExit(1)
+        return totals
+
+
 # -------------------------------
 # Main
 # -------------------------------
@@ -1616,7 +2528,7 @@ def main() -> None:
     """Run the batch analysis workflow and persist valid model responses."""
     args = parse_args()
     signal.signal(signal.SIGINT, _handle_sigint)
-    if args.compensation_only:
+    if getattr(args, "compensation_only", False):
         run_compensation_backfill(args)
         return
     # Regular analysis also writes the structured compensation columns.
@@ -1657,6 +2569,21 @@ def main() -> None:
             f"[warn] Resume truncated from ~{resume_tokens} to ~{MAX_RESUME_TOKENS} tokens for prompt budget"
         )
 
+    if getattr(args, "fit_briefs_only", False):
+        run_fit_brief_generation(
+            resume_text,
+            force=bool(getattr(args, "force", False)),
+            preflight=True,
+        )
+        return
+    if getattr(args, "application_prep_only", False):
+        run_application_prep_generation(
+            resume_text=resume_text,
+            force=bool(getattr(args, "force", False)),
+            preflight=True,
+        )
+        return
+
     processed = 0
     failures = 0
     skipped = 0
@@ -1674,6 +2601,12 @@ def main() -> None:
         total = len(ids)
         if total == 0:
             log("[ok] No jobs matched filter criteria.")
+            run_application_prep_generation(
+                resume_text=resume_text,
+                force=False,
+                preflight=True,
+            )
+            run_fit_brief_generation(resume_text, force=False, preflight=True)
             return
 
         jobs = list(s.execute(select(Job).where(Job.id.in_(ids))).scalars())
@@ -1696,6 +2629,12 @@ def main() -> None:
         except OllamaPrerequisiteError as exc:
             log(f"[fatal] {exc}")
             raise SystemExit(1) from exc
+
+        run_application_prep_generation(
+            resume_text=resume_text,
+            force=False,
+            preflight=False,
+        )
 
         upd = sa_text(
             """
@@ -1725,6 +2664,7 @@ def main() -> None:
                 compensation_analyzed_at = :compensation_analyzed_at,
                 compensation_schema_version = :compensation_schema_version
             WHERE id = :id
+              AND is_active = 1
             """
         )
         if has_change_source:
@@ -1814,7 +2754,12 @@ def main() -> None:
                         "val": result.payload_json,
                         "id": result.id,
                     }
-                    s.execute(upd, params)
+                    update_result = s.execute(upd, params)
+                    if update_result.rowcount == 0:
+                        s.rollback()
+                        skipped += 1
+                        log("[skip] Job became inactive before AI write")
+                        return
                     task = task_by_id[result.id]
                     s.execute(
                         ins_ai_change,
@@ -1922,6 +2867,13 @@ def main() -> None:
                         log(
                             f"[batch] completed={completed}/{total} processed={processed} failed={failures} skipped={skipped} inflight={len(futures)} rate={rate:.2f}/s avg_llm={avg_llm:.2f}s"
                         )
+
+    run_application_prep_generation(
+        resume_text=resume_text,
+        force=False,
+        preflight=False,
+    )
+    run_fit_brief_generation(resume_text, force=False, preflight=False)
 
     end = datetime.now()
     log("------------------------------------------------------")

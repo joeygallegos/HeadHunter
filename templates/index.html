@@ -8,41 +8,55 @@
     <script src="https://cdn.tailwindcss.com"></script>
     <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
-    <style>[x-cloak] { display: none !important; }</style>
+    {% include "_dashboard_ui.html" %}
   </head>
 
-  <body class="bg-slate-50 text-slate-900">
-    <div class="w-full p-4 space-y-6">
-      <header class="space-y-2">
-        <h1 class="text-2xl font-bold tracking-tight">Impact Dashboard</h1>
+  <body class="dashboard-page bg-slate-50 text-slate-900">
+    <div class="dashboard-shell dashboard-shell--wide dashboard-stack">
+      <header class="dashboard-hero">
+        <div>
+          <h1 class="dashboard-title">Impact Dashboard</h1>
 
-        <div class="flex flex-wrap gap-2">
+          <p class="dashboard-subtitle">Review runs, filter jobs, and move candidates through the dashboard with one consistent shell.</p>
+        </div>
+
+        <div class="dashboard-nav">
           <button @click="view='runs'"
                   :class="view==='runs' ? 'bg-indigo-600 text-white' : 'bg-white text-slate-700'"
-                  class="px-3 py-2 rounded-lg border border-slate-200 text-sm">
+                  class="dashboard-tab px-3 py-2 rounded-lg border border-slate-200 text-sm">
             Integration Runs
           </button>
           <button @click="view='jobs'"
                   :class="view==='jobs' ? 'bg-indigo-600 text-white' : 'bg-white text-slate-700'"
-                  class="px-3 py-2 rounded-lg border border-slate-200 text-sm">
+                  class="dashboard-tab px-3 py-2 rounded-lg border border-slate-200 text-sm">
             Query Builder
           </button>
           <button @click="view='lookup'"
                   :class="view==='lookup' ? 'bg-indigo-600 text-white' : 'bg-white text-slate-700'"
-                  class="px-3 py-2 rounded-lg border border-slate-200 text-sm">
+                  class="dashboard-tab px-3 py-2 rounded-lg border border-slate-200 text-sm">
             Job lookup
+          </button>
+          <button @click="view='applicationPrep'; loadApplicationPrep()"
+                  :class="view==='applicationPrep' ? 'bg-indigo-600 text-white' : 'bg-white text-slate-700'"
+                  class="dashboard-tab px-3 py-2 rounded-lg border border-slate-200 text-sm">
+            Application Prep
+          </button>
+          <button @click="view='interesting'; loadInterestingJobs()"
+                  :class="view==='interesting' ? 'bg-indigo-600 text-white' : 'bg-white text-slate-700'"
+                  class="dashboard-tab px-3 py-2 rounded-lg border border-slate-200 text-sm">
+            Interesting
           </button>
           <button @click="view='discovery'; loadDiscovery()"
                   :class="view==='discovery' ? 'bg-indigo-600 text-white' : 'bg-white text-slate-700'"
-                  class="px-3 py-2 rounded-lg border border-slate-200 text-sm">
+                  class="dashboard-tab px-3 py-2 rounded-lg border border-slate-200 text-sm">
             Discovery
           </button>
           <a href="/steps"
-             class="px-3 py-2 rounded-lg border border-slate-200 text-sm bg-white text-slate-700">
+             class="dashboard-tab px-3 py-2 rounded-lg border border-slate-200 text-sm bg-white text-slate-700">
             Steps editor
           </a>
           <a href="/swipe"
-             class="px-3 py-2 rounded-lg border border-slate-200 text-sm bg-white text-slate-700">
+             class="dashboard-tab px-3 py-2 rounded-lg border border-slate-200 text-sm bg-white text-slate-700">
             Swipe
           </a>
         </div>
@@ -285,7 +299,7 @@
                    x-cloak
                    :role="reportError ? 'alert' : 'status'"
                    aria-live="polite"
-                   class="border-l-2 px-3 py-2 text-sm"
+                   class="dashboard-message px-3 py-2 text-sm"
                    :class="reportError ? 'border-red-400 bg-red-50 text-red-700' : 'border-indigo-400 bg-indigo-50 text-indigo-700'"
                    x-text="reportMessage"></div>
 
@@ -767,6 +781,70 @@
                 </div>
 
                 <div class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4">
+                  <div class="flex items-center justify-between gap-3">
+                    <h3 class="text-sm font-semibold text-slate-800">Fit Brief</h3>
+                    <span class="text-xs text-slate-500" x-text="selectedJob().fit_brief?.status || 'not_eligible'"></span>
+                  </div>
+                  <template x-if="selectedJob().fit_brief?.available && selectedJob().fit_brief?.brief">
+                    <div class="mt-3 space-y-4 text-sm text-slate-800">
+                      <p class="leading-6" x-text="selectedJob().fit_brief.brief.score_explanation || '-'"></p>
+                      <div>
+                        <h4 class="text-xs font-semibold uppercase text-slate-500">Interview angle</h4>
+                        <p class="mt-1 leading-6" x-text="selectedJob().fit_brief.brief.interview_angle || '-'"></p>
+                      </div>
+                      <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+                        <div>
+                          <h4 class="text-xs font-semibold uppercase text-slate-500">Strongest matches</h4>
+                          <ul class="mt-1 list-disc pl-5 space-y-1">
+                            <template x-for="item in (selectedJob().fit_brief.brief.strongest_matches || [])" :key="item">
+                              <li x-text="item"></li>
+                            </template>
+                          </ul>
+                        </div>
+                        <div>
+                          <h4 class="text-xs font-semibold uppercase text-slate-500">Gaps</h4>
+                          <ul class="mt-1 list-disc pl-5 space-y-1">
+                            <template x-for="item in (selectedJob().fit_brief.brief.concerns_or_gaps || [])" :key="item">
+                              <li x-text="item"></li>
+                            </template>
+                          </ul>
+                        </div>
+                        <div>
+                          <h4 class="text-xs font-semibold uppercase text-slate-500">Risk flags</h4>
+                          <ul class="mt-1 list-disc pl-5 space-y-1">
+                            <template x-for="item in (selectedJob().fit_brief.brief.risk_flags || [])" :key="item">
+                              <li x-text="item"></li>
+                            </template>
+                          </ul>
+                        </div>
+                      </div>
+                      <div>
+                        <h4 class="text-xs font-semibold uppercase text-slate-500">Mapped resume bullets</h4>
+                        <div class="mt-2 space-y-3">
+                          <template x-for="match in (selectedJob().fit_brief.brief.resume_bullet_matches || [])" :key="match.resume_bullet + match.job_requirement">
+                            <div class="rounded-lg border border-slate-200 bg-slate-50 p-3">
+                              <p class="font-medium text-slate-900" x-text="match.resume_bullet"></p>
+                              <p class="mt-1 text-slate-700" x-text="match.job_requirement"></p>
+                              <p class="mt-1 text-xs text-slate-500" x-text="`${match.confidence || 'medium'} confidence - ${match.why_it_matters || ''}`"></p>
+                            </div>
+                          </template>
+                          <p class="text-sm text-slate-500" x-show="!(selectedJob().fit_brief.brief.resume_bullet_matches || []).length">
+                            No strong resume bullet mapping was generated.
+                          </p>
+                        </div>
+                      </div>
+                      <p class="text-xs text-slate-500" x-text="`Generated: ${selectedJob().fit_brief.generated_at || '-'}`"></p>
+                    </div>
+                  </template>
+                  <template x-if="!(selectedJob().fit_brief?.available && selectedJob().fit_brief?.brief)">
+                    <p class="mt-3 text-sm text-slate-500"
+                       x-text="selectedJob().fit_brief?.eligible ? 'Eligible for a Fit Brief, but one has not been generated yet.' : 'This job is not eligible for a Fit Brief.'"></p>
+                  </template>
+                </div>
+              </section>
+
+              <section class="grid grid-cols-1 xl:grid-cols-2 gap-4">
+                <div class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4">
                   <h3 class="text-sm font-semibold text-slate-800">Metadata</h3>
                   <dl class="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-3 text-sm">
                     <div>
@@ -873,6 +951,358 @@
             </template>
           </section>
 
+        </div>
+      </template>
+
+      <!-- ---------------- APPLICATION PREP VIEW ---------------- -->
+      <template x-if="view==='applicationPrep'">
+        <div class="space-y-4">
+          <section class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4">
+            <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+              <div>
+                <h2 class="text-sm font-semibold text-slate-800">Application Prep</h2>
+                <p class="text-xs text-slate-500 mt-1">
+                  Use this to tailor your resume for one job. Review the suggested bullets, copy the ones you trust, then update your resume manually.
+                </p>
+              </div>
+              <div class="flex flex-wrap items-center gap-2">
+                <span class="text-xs text-slate-500" x-show="applicationPrepLoaded">
+                  <span x-text="applicationPrepJobs.length"></span> job(s)
+                </span>
+                <span class="inline-flex min-w-[5.75rem] items-center justify-end gap-2 text-xs text-slate-500"
+                      :class="applicationPrepLoading ? 'visible' : 'invisible'"
+                      aria-live="polite"
+                      x-cloak>
+                  <span class="h-3 w-3 animate-spin rounded-full border-2 border-slate-200 border-t-indigo-600"></span>
+                  <span x-text="applicationPrepLoaded ? 'Refreshing' : 'Loading'"></span>
+                </span>
+                <button @click="loadApplicationPrep()"
+                        :disabled="applicationPrepLoading"
+                        class="min-w-[5.75rem] px-3 py-2 rounded-lg border border-slate-300 bg-white text-sm text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+                        x-text="applicationPrepLoading ? 'Refreshing' : 'Refresh'">
+                  Refresh
+                </button>
+              </div>
+            </div>
+            <div class="mt-3 text-sm text-red-700" x-show="applicationPrepError" x-text="applicationPrepError"></div>
+          </section>
+
+          <section class="grid grid-cols-1 lg:grid-cols-4 gap-4 animate-pulse" x-show="applicationPrepLoading && !applicationPrepLoaded" x-cloak>
+            <div class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4 lg:col-span-1">
+              <div class="flex items-center justify-between">
+                <div class="h-4 w-12 rounded bg-slate-200"></div>
+                <div class="h-4 w-16 rounded bg-slate-100"></div>
+              </div>
+              <div class="mt-3 space-y-2">
+                <template x-for="n in 4" :key="n">
+                  <div class="rounded-lg border border-slate-200 bg-white px-3 py-2">
+                    <div class="h-4 w-4/5 rounded bg-slate-200"></div>
+                    <div class="mt-2 h-3 w-2/5 rounded bg-slate-100"></div>
+                  </div>
+                </template>
+              </div>
+            </div>
+            <div class="space-y-4 lg:col-span-3">
+              <section class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4">
+                <div class="h-4 w-24 rounded bg-slate-100"></div>
+                <div class="mt-2 h-6 w-2/3 rounded bg-slate-200"></div>
+                <div class="mt-2 h-4 w-48 rounded bg-slate-100"></div>
+              </section>
+              <section class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4">
+                <div class="h-4 w-28 rounded bg-slate-200"></div>
+                <div class="mt-4 grid grid-cols-1 md:grid-cols-3 gap-3">
+                  <div class="h-12 rounded bg-slate-100"></div>
+                  <div class="h-12 rounded bg-slate-100"></div>
+                  <div class="h-12 rounded bg-slate-100"></div>
+                </div>
+              </section>
+              <section class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4">
+                <div class="h-4 w-full rounded bg-slate-100"></div>
+                <div class="mt-3 h-4 w-5/6 rounded bg-slate-100"></div>
+                <div class="mt-5 grid grid-cols-1 xl:grid-cols-2 gap-4">
+                  <div class="h-28 rounded bg-slate-100"></div>
+                  <div class="h-28 rounded bg-slate-100"></div>
+                </div>
+              </section>
+            </div>
+          </section>
+
+          <section class="grid grid-cols-1 lg:grid-cols-4 gap-4" x-show="applicationPrepLoaded">
+            <div class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4 lg:col-span-1">
+              <div class="flex items-center justify-between">
+                <h3 class="text-sm font-semibold text-slate-800">Deck</h3>
+                <span class="text-xs text-slate-500" x-show="applicationPrepHasActive()">Auto-refreshing</span>
+              </div>
+              <div class="mt-3 space-y-2" x-show="applicationPrepJobs.length">
+                <template x-for="job in applicationPrepJobs" :key="job.id">
+                  <button type="button" @click="selectedApplicationPrepJobId = job.id"
+                          class="w-full text-left rounded-lg border px-3 py-2 text-sm"
+                          :class="selectedApplicationPrepJobId === job.id ? 'border-indigo-400 bg-indigo-50' : 'border-slate-200 bg-white hover:bg-slate-50'">
+                    <div class="flex items-start justify-between gap-2">
+                      <div class="min-w-0">
+                        <div class="font-medium text-slate-900 truncate" x-text="job.title || '(no title)'"></div>
+                        <div class="text-xs text-slate-500 truncate" x-text="job.site || '-'"></div>
+                      </div>
+                      <span class="shrink-0 rounded px-2 py-0.5 text-xs font-medium"
+                            :class="applicationPrepStatusClass(job.status)"
+                            x-text="applicationPrepStatusLabel(job.status)"></span>
+                    </div>
+                    <div class="mt-1 text-xs text-slate-500">
+                      Match <span x-text="job.ai_match_percentage ?? '-'"></span>%
+                      <span class="ml-2" :class="job.is_active ? 'text-green-700' : 'text-red-700'"
+                            x-text="job.is_active ? 'Active' : 'Inactive'"></span>
+                    </div>
+                  </button>
+                </template>
+              </div>
+              <div class="mt-3 text-sm text-slate-500" x-show="applicationPrepLoaded && applicationPrepJobs.length === 0">
+                No move-forward jobs yet.
+              </div>
+            </div>
+
+            <template x-if="selectedApplicationPrepJob()">
+              <div class="space-y-4 lg:col-span-3">
+                <section class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4">
+                  <div class="flex flex-col md:flex-row md:items-start gap-3 md:justify-between">
+                    <div>
+                      <div class="text-xs font-semibold uppercase text-slate-500" x-text="selectedApplicationPrepJob().site"></div>
+                      <h2 class="mt-1 text-xl font-semibold text-slate-900" x-text="selectedApplicationPrepJob().title || '(no title)'"></h2>
+                      <div class="mt-1 text-sm text-slate-600">
+                        <span x-text="`ID ${selectedApplicationPrepJob().id}`"></span>
+                        <span class="ml-2" x-text="`Match ${selectedApplicationPrepJob().ai_match_percentage ?? '-'}%`"></span>
+                      </div>
+                    </div>
+                    <div class="flex flex-wrap gap-2">
+                      <button @click="queueApplicationPrep(selectedApplicationPrepJob().id)"
+                              :disabled="applicationPrepSaving"
+                              class="px-3 py-2 rounded-lg border border-slate-300 bg-white text-sm text-slate-700 hover:bg-slate-50 disabled:opacity-40"
+                              x-text="String(selectedApplicationPrepJob().status || '').toLowerCase() === 'failed' ? 'Try again' : 'Re-run prep'">
+                      </button>
+                      <a class="inline-flex items-center justify-center px-3 py-2 rounded-lg bg-slate-900 text-white text-sm hover:bg-slate-800"
+                         :href="selectedApplicationPrepJob().url || '#'" target="_blank" rel="noreferrer"
+                         x-show="selectedApplicationPrepJob().url">
+                        Open posting
+                      </a>
+                    </div>
+                  </div>
+                </section>
+
+                <section class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4">
+                  <div class="flex items-center justify-between gap-3">
+                    <h3 class="text-sm font-semibold text-slate-800">Prep Status</h3>
+                    <span class="rounded px-2 py-0.5 text-xs font-medium"
+                          :class="applicationPrepStatusClass(selectedApplicationPrepJob().status)"
+                          x-text="applicationPrepStatusLabel(selectedApplicationPrepJob().status)"></span>
+                  </div>
+                  <p class="mt-2 text-sm text-slate-600" x-text="applicationPrepStatusDescription(selectedApplicationPrepJob().status)"></p>
+                  <dl class="mt-3 grid grid-cols-1 md:grid-cols-3 gap-3 text-sm">
+                    <div>
+                      <dt class="text-xs text-slate-500">Queued</dt>
+                      <dd x-text="selectedApplicationPrepJob().queued_at || '-'"></dd>
+                    </div>
+                    <div>
+                      <dt class="text-xs text-slate-500">Generated</dt>
+                      <dd x-text="selectedApplicationPrepJob().generated_at || '-'"></dd>
+                    </div>
+                    <div>
+                      <dt class="text-xs text-slate-500">Location</dt>
+                      <dd x-text="selectedApplicationPrepJob().ai_location_policy_match || '-'"></dd>
+                    </div>
+                  </dl>
+                  <p class="mt-3 text-sm text-red-700" x-show="selectedApplicationPrepJob().error_text"
+                     x-text="selectedApplicationPrepJob().error_text"></p>
+                </section>
+
+                <section class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4">
+                  <template x-if="selectedApplicationPrepJob().application_prep?.prep">
+                    <div class="space-y-4 text-sm text-slate-800">
+                      <div>
+                        <h3 class="text-sm font-semibold text-slate-900">1. Positioning</h3>
+                        <p class="mt-2 leading-6" x-text="selectedApplicationPrepJob().application_prep.prep.positioning_summary || '-'"></p>
+                      </div>
+
+                      <div>
+                        <div class="flex flex-col gap-1 sm:flex-row sm:items-end sm:justify-between">
+                          <div>
+                            <h3 class="text-sm font-semibold text-slate-900">2. Suggested resume bullets</h3>
+                            <p class="text-xs text-slate-500">Copy only bullets you trust, then paste them into your resume manually.</p>
+                          </div>
+                        </div>
+                        <div class="mt-2 space-y-3">
+                          <template x-for="item in (selectedApplicationPrepJob().application_prep.prep.draft_resume_bullets || [])" :key="item.bullet">
+                            <div class="rounded-lg border border-slate-200 bg-slate-50 p-3">
+                              <div class="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+                                <div class="min-w-0">
+                                  <div class="text-xs font-semibold uppercase text-slate-500">Suggested bullet</div>
+                                  <p class="mt-1 font-medium leading-6 text-slate-950" x-text="item.bullet"></p>
+                                  <p class="mt-2 text-sm text-slate-700">
+                                    <span class="font-medium">Why this fits:</span>
+                                    <span x-text="item.job_requirement || '-'"></span>
+                                  </p>
+                                  <p class="mt-1 text-xs text-slate-500" x-text="`${item.confidence || 'medium'} confidence`"></p>
+                                </div>
+                                <button type="button"
+                                        @click="copyApplicationPrepBullet(item.bullet)"
+                                        class="shrink-0 rounded-lg bg-indigo-600 px-3 py-2 text-sm font-medium text-white hover:bg-indigo-700"
+                                        x-text="copiedApplicationPrepBullet === item.bullet ? 'Copied' : 'Copy bullet'">
+                                  Copy bullet
+                                </button>
+                              </div>
+                              <details class="mt-3 rounded border border-slate-200 bg-white p-3">
+                                <summary class="cursor-pointer text-xs font-semibold uppercase text-slate-500">Evidence and safety check</summary>
+                                <div class="mt-3 space-y-3">
+                                  <div>
+                                    <div class="text-xs font-semibold text-slate-500">Based on resume evidence</div>
+                                    <p class="mt-1 text-sm leading-6 text-slate-700" x-text="item.source_resume_evidence || '-'"></p>
+                                  </div>
+                                  <div>
+                                    <div class="text-xs font-semibold text-slate-500">Reviewer note</div>
+                                    <p class="mt-1 text-sm leading-6 text-slate-700" x-text="applicationPrepEvidenceNote(item).note || '-'"></p>
+                                  </div>
+                                </div>
+                              </details>
+                            </div>
+                          </template>
+                          <p class="text-sm text-slate-500" x-show="!(selectedApplicationPrepJob().application_prep.prep.draft_resume_bullets || []).length">
+                            No grounded resume bullets were generated for this job.
+                          </p>
+                        </div>
+                      </div>
+
+                      <div>
+                        <h3 class="text-sm font-semibold text-slate-900">3. Resume edits and gaps</h3>
+                        <div class="mt-2 grid grid-cols-1 xl:grid-cols-2 gap-4">
+                          <div>
+                            <h4 class="text-xs font-semibold uppercase text-slate-500">Resume edits to consider</h4>
+                            <ul class="mt-2 list-disc pl-5 space-y-1">
+                              <template x-for="item in (selectedApplicationPrepJob().application_prep.prep.resume_improvements || [])" :key="item">
+                                <li x-text="item"></li>
+                              </template>
+                            </ul>
+                          </div>
+                          <div>
+                            <h4 class="text-xs font-semibold uppercase text-slate-500">Fit gaps to review</h4>
+                            <ul class="mt-2 list-disc pl-5 space-y-1">
+                              <template x-for="item in (selectedApplicationPrepJob().application_prep.prep.fit_gaps || [])" :key="item">
+                                <li x-text="item"></li>
+                              </template>
+                            </ul>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </template>
+                  <template x-if="!selectedApplicationPrepJob().application_prep?.prep">
+                    <p class="text-sm text-slate-500">Prep output is not available yet.</p>
+                  </template>
+                </section>
+              </div>
+            </template>
+          </section>
+        </div>
+      </template>
+
+      <!-- ---------------- INTERESTING REVIEW VIEW ---------------- -->
+      <template x-if="view==='interesting'">
+        <div class="space-y-4">
+          <section class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4">
+            <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+              <div>
+                <h2 class="text-sm font-semibold text-slate-800">Interesting Jobs</h2>
+                <p class="text-xs text-slate-500 mt-1">
+                  Jobs saved from Swipe for later review, without Application Prep processing.
+                </p>
+              </div>
+              <button @click="loadInterestingJobs()"
+                      class="px-3 py-2 rounded-lg border border-slate-300 bg-white text-sm text-slate-700 hover:bg-slate-50">
+                Refresh
+              </button>
+            </div>
+            <div class="mt-3 text-sm text-slate-500" x-show="interestingLoading">Loading interesting jobs...</div>
+            <div class="mt-3 text-sm text-red-700" x-show="interestingError" x-text="interestingError"></div>
+          </section>
+
+          <section class="grid grid-cols-1 lg:grid-cols-4 gap-4" x-show="interestingLoaded">
+            <div class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4 lg:col-span-1">
+              <div class="flex items-center justify-between">
+                <h3 class="text-sm font-semibold text-slate-800">Saved</h3>
+                <span class="text-xs text-slate-500" x-text="interestingJobs.length"></span>
+              </div>
+              <div class="mt-3 space-y-2" x-show="interestingJobs.length">
+                <template x-for="job in interestingJobs" :key="job.id">
+                  <button type="button" @click="selectedInterestingJobId = job.id"
+                          class="w-full text-left rounded-lg border px-3 py-2 text-sm"
+                          :class="selectedInterestingJobId === job.id ? 'border-indigo-400 bg-indigo-50' : 'border-slate-200 bg-white hover:bg-slate-50'">
+                    <div class="font-medium text-slate-900 truncate" x-text="job.JobTitle || '(no title)'"></div>
+                    <div class="mt-1 text-xs text-slate-500 truncate">
+                      <span x-text="job.Company || job.Site || '-'"></span>
+                      <span class="mx-1">&middot;</span>
+                      <span x-text="job.JobID || '-'"></span>
+                    </div>
+                    <div class="mt-1 text-xs text-slate-500">
+                      Match <span x-text="formatPercent(job.AIMatchPercentage)"></span>
+                    </div>
+                  </button>
+                </template>
+              </div>
+              <div class="mt-3 text-sm text-slate-500" x-show="interestingLoaded && interestingJobs.length === 0">
+                No interesting jobs saved yet.
+              </div>
+            </div>
+
+            <template x-if="selectedInterestingJob()">
+              <div class="space-y-4 lg:col-span-3">
+                <section class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4">
+                  <div class="flex flex-col md:flex-row md:items-start md:justify-between gap-3">
+                    <div>
+                      <h2 class="text-xl font-semibold text-slate-900" x-text="selectedInterestingJob().JobTitle || '(no title)'"></h2>
+                      <div class="mt-1 flex flex-wrap items-center gap-2 text-sm text-slate-600">
+                        <span class="font-medium text-slate-700" x-text="selectedInterestingJob().Company || selectedInterestingJob().Site || '-'"></span>
+                        <span class="text-slate-300">|</span>
+                        <span>ID: <span x-text="selectedInterestingJob().JobID || '-'"></span></span>
+                        <span class="text-slate-300">|</span>
+                        <span>Match <span x-text="formatPercent(selectedInterestingJob().AIMatchPercentage)"></span></span>
+                      </div>
+                    </div>
+                    <a class="inline-flex items-center justify-center px-3 py-2 rounded-lg bg-slate-900 text-white text-sm hover:bg-slate-800"
+                       :href="selectedInterestingJob().JobUrl || '#'" target="_blank" rel="noreferrer"
+                       x-show="selectedInterestingJob().JobUrl">
+                      Open posting
+                    </a>
+                  </div>
+                </section>
+
+                <section class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4">
+                  <h3 class="text-sm font-semibold text-slate-800">Changes to date</h3>
+                  <ul class="mt-2 divide-y divide-slate-100 rounded-lg border border-slate-200 bg-white"
+                      x-show="(selectedInterestingJob().Changes || []).length">
+                    <template x-for="change in (selectedInterestingJob().Changes || [])" :key="`${change.date}-${change.source}-${change.type}-${change.summary}`">
+                      <li class="flex flex-col gap-1 px-3 py-2 text-sm sm:flex-row sm:items-center sm:justify-between">
+                        <div class="min-w-0">
+                          <span class="font-medium text-slate-900" x-text="change.summary || 'job details'"></span>
+                          <span class="ml-2 rounded bg-slate-100 px-2 py-0.5 text-xs text-slate-600" x-text="change.type || 'changed'"></span>
+                        </div>
+                        <div class="shrink-0 text-xs text-slate-500">
+                          <span x-text="change.source || 'site'"></span>
+                          <span class="mx-1">&middot;</span>
+                          <span x-text="change.date || '-'"></span>
+                        </div>
+                      </li>
+                    </template>
+                  </ul>
+                  <p class="mt-2 text-sm text-slate-500" x-show="!(selectedInterestingJob().Changes || []).length">
+                    No changes recorded.
+                  </p>
+                </section>
+
+                <section class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4">
+                  <h3 class="text-sm font-semibold text-slate-800">Description</h3>
+                  <pre class="mt-3 whitespace-pre-wrap text-sm leading-6 text-slate-800 bg-slate-50 border border-slate-200 rounded-lg p-3 max-h-[34rem] overflow-auto"
+                       x-text="selectedInterestingJob().JobDesc || 'No description stored.'"></pre>
+                </section>
+              </div>
+            </template>
+          </section>
         </div>
       </template>
 
@@ -1104,6 +1534,23 @@
           lookupResults: [],
           selectedJobId: null,
           expandedChangeIds: [],
+
+          // Application Prep state
+          applicationPrepLoaded: false,
+          applicationPrepLoading: false,
+          applicationPrepSaving: false,
+          applicationPrepJobs: [],
+          selectedApplicationPrepJobId: null,
+          copiedApplicationPrepBullet: '',
+          applicationPrepError: '',
+          applicationPrepPoller: null,
+
+          // Interesting review state
+          interestingLoaded: false,
+          interestingLoading: false,
+          interestingJobs: [],
+          selectedInterestingJobId: null,
+          interestingError: '',
 
           // Discovery state
           discoveryLoaded: false,
@@ -2310,6 +2757,163 @@
             return classes[line?.type] || classes.context;
           },
 
+          // ---------------- APPLICATION PREP ----------------
+          async loadApplicationPrep() {
+            this.applicationPrepLoading = true;
+            this.applicationPrepError = '';
+            try {
+              const res = await fetch('/api/application-prep/jobs');
+              const data = await res.json();
+              if (!res.ok) throw new Error(data.error || 'Application prep load failed');
+              this.applicationPrepJobs = data.jobs || [];
+              if (!this.selectedApplicationPrepJobId && this.applicationPrepJobs.length) {
+                this.selectedApplicationPrepJobId = this.applicationPrepJobs[0].id;
+              }
+              if (!this.applicationPrepJobs.some(job => job.id === this.selectedApplicationPrepJobId)) {
+                this.selectedApplicationPrepJobId = this.applicationPrepJobs.length ? this.applicationPrepJobs[0].id : null;
+              }
+              this.applicationPrepLoaded = true;
+            } catch (err) {
+              this.applicationPrepError = err?.message || 'Application prep load failed.';
+            } finally {
+              this.applicationPrepLoading = false;
+            }
+          },
+
+          selectedApplicationPrepJob() {
+            return (this.applicationPrepJobs || []).find(job => job.id === this.selectedApplicationPrepJobId) || null;
+          },
+
+          applicationPrepHasActive() {
+            return (this.applicationPrepJobs || []).some(job => ['queued','running'].includes(String(job.status || '').toLowerCase()));
+          },
+
+          applicationPrepStatusClass(status) {
+            const value = String(status || '').toLowerCase();
+            const classes = {
+              queued: 'bg-amber-100 text-amber-800',
+              running: 'bg-blue-100 text-blue-800',
+              done: 'bg-green-100 text-green-800',
+              stale: 'bg-orange-100 text-orange-800',
+              failed: 'bg-red-100 text-red-800'
+            };
+            return classes[value] || 'bg-slate-100 text-slate-700';
+          },
+
+          applicationPrepStatusLabel(status) {
+            const value = String(status || '').toLowerCase();
+            const labels = {
+              queued: 'Waiting',
+              running: 'Generating',
+              done: 'Ready',
+              stale: 'Stale',
+              failed: 'Blocked',
+              none: 'Not queued'
+            };
+            return labels[value] || (status || 'Not queued');
+          },
+
+          applicationPrepStatusDescription(status) {
+            const value = String(status || '').toLowerCase();
+            const descriptions = {
+              queued: 'Waiting for AI prep.',
+              running: 'Generating resume suggestions.',
+              done: 'Ready to review.',
+              stale: 'Resume or job changed since this was generated.',
+              failed: 'Prep failed. Review the error and try again.',
+              none: 'Move a job forward from Swipe to queue resume prep.'
+            };
+            return descriptions[value] || 'Prep status is unavailable.';
+          },
+
+          applicationPrepEvidenceNote(bullet) {
+            const target = String(bullet?.bullet || '');
+            const notes = this.selectedApplicationPrepJob()?.application_prep?.prep?.evidence_notes || [];
+            return notes.find(item => String(item?.draft_bullet || '') === target) || {};
+          },
+
+          formatPercent(value) {
+            const parsed = Number(value);
+            return Number.isFinite(parsed) ? `${Math.round(parsed)}%` : '-';
+          },
+
+          async copyApplicationPrepBullet(text) {
+            const value = String(text || '').trim();
+            if (!value) return;
+            try {
+              if (navigator.clipboard?.writeText) {
+                await navigator.clipboard.writeText(value);
+              } else {
+                const textarea = document.createElement('textarea');
+                textarea.value = value;
+                textarea.setAttribute('readonly', '');
+                textarea.style.position = 'fixed';
+                textarea.style.opacity = '0';
+                document.body.appendChild(textarea);
+                textarea.select();
+                document.execCommand('copy');
+                document.body.removeChild(textarea);
+              }
+              this.copiedApplicationPrepBullet = value;
+              window.setTimeout(() => {
+                if (this.copiedApplicationPrepBullet === value) this.copiedApplicationPrepBullet = '';
+              }, 1800);
+            } catch (err) {
+              this.applicationPrepError = 'Copy failed. Select the bullet text and copy it manually.';
+            }
+          },
+
+          async queueApplicationPrep(id) {
+            if (this.applicationPrepSaving) return;
+            const jobId = Number(id);
+            if (!Number.isFinite(jobId) || jobId <= 0) return;
+            const confirmed = window.confirm('Regenerate suggestions for this job? This may replace the current prep output.');
+            if (!confirmed) return;
+            this.applicationPrepSaving = true;
+            this.applicationPrepError = '';
+            try {
+              const res = await fetch(`/api/application-prep/jobs/${encodeURIComponent(jobId)}/queue`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({})
+              });
+              const data = await res.json();
+              if (!res.ok) throw new Error(data.error || 'Queue failed');
+              await this.loadApplicationPrep();
+            } catch (err) {
+              this.applicationPrepError = err?.message || 'Queue failed.';
+            } finally {
+              this.applicationPrepSaving = false;
+            }
+          },
+
+          // ---------------- INTERESTING REVIEW ----------------
+          async loadInterestingJobs() {
+            this.interestingLoading = true;
+            this.interestingError = '';
+            try {
+              const res = await fetch('/api/interesting/jobs');
+              const data = await res.json();
+              if (!res.ok) throw new Error(data.error || 'Interesting jobs load failed');
+              this.interestingJobs = data.jobs || [];
+              if (!this.selectedInterestingJobId && this.interestingJobs.length) {
+                this.selectedInterestingJobId = this.interestingJobs[0].id;
+              }
+              if (!this.interestingJobs.some(job => job.id === this.selectedInterestingJobId)) {
+                this.selectedInterestingJobId = this.interestingJobs.length ? this.interestingJobs[0].id : null;
+              }
+              this.interestingLoaded = true;
+            } catch (err) {
+              this.interestingError = err?.message || 'Interesting jobs load failed.';
+            } finally {
+              this.interestingLoading = false;
+            }
+          },
+
+          selectedInterestingJob() {
+            return (this.interestingJobs || []).find(job => job.id === this.selectedInterestingJobId) || null;
+          },
+
           // ---------------- DISCOVERY ----------------
           // Load pending discovery suggestions and refresh the recent event feed in parallel.
           async loadDiscovery() {
@@ -2427,6 +3031,11 @@
               // Only poll while the discovery tab is visible and auto-refresh is still enabled.
               if (this.view === 'discovery' && this.discoveryAutoRefresh) {
                 this.loadDiscoveryEvents();
+              }
+            }, 3000);
+            this.applicationPrepPoller = setInterval(() => {
+              if (this.view === 'applicationPrep' && this.applicationPrepHasActive()) {
+                this.loadApplicationPrep();
               }
             }, 3000);
           }

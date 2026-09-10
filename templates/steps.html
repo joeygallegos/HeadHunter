@@ -7,33 +7,34 @@
     <title>Steps JSON Editor</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+    {% include "_dashboard_ui.html" %}
   </head>
-  <body class="bg-slate-50 text-slate-900 min-h-screen">
-    <main class="max-w-7xl mx-auto p-4 space-y-4" x-data="stepsEditor()" x-init="load()">
-      <header class="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-3">
+  <body class="dashboard-page bg-slate-50 text-slate-900 min-h-screen">
+    <main class="dashboard-shell dashboard-stack" x-data="stepsEditor()" x-init="load()">
+      <header class="dashboard-hero">
         <div>
-          <h1 class="text-2xl font-bold tracking-tight">Steps Builder</h1>
-          <p class="text-sm text-slate-500 mt-1">
+          <h1 class="dashboard-title">Steps Builder</h1>
+          <p class="dashboard-subtitle">
             <span x-text="path || 'steps.json'"></span>
             <span x-show="siteCount !== null"> · sites=<span x-text="siteCount"></span></span>
             <span x-show="modifiedAt"> · modified=<span x-text="modifiedAt"></span></span>
           </p>
         </div>
-        <div class="flex flex-wrap items-center gap-2">
+        <div class="dashboard-nav">
           <a href="/"
-             class="px-3 py-2 rounded-lg border border-slate-200 bg-white text-sm text-slate-700 hover:bg-slate-50">
+             class="dashboard-tab px-3 py-2 rounded-lg border border-slate-200 bg-white text-sm text-slate-700 hover:bg-slate-50">
             Dashboard
           </a>
           <button type="button" @click="reload()"
-                  class="px-3 py-2 rounded-lg border border-slate-300 bg-white text-sm text-slate-700 hover:bg-slate-50">
+                  class="dashboard-button dashboard-button--secondary px-3 py-2 rounded-lg border border-slate-300 bg-white text-sm text-slate-700 hover:bg-slate-50">
             Reload
           </button>
           <button type="button" @click="formatValidate()" :disabled="loading || saving"
-                  class="px-3 py-2 rounded-lg border border-slate-300 bg-white text-sm text-slate-700 hover:bg-slate-50 disabled:opacity-40">
+                  class="dashboard-button dashboard-button--secondary px-3 py-2 rounded-lg border border-slate-300 bg-white text-sm text-slate-700 hover:bg-slate-50 disabled:opacity-40">
             Format / Validate
           </button>
           <button type="button" @click="save()" :disabled="!canSave() || saving"
-                  class="px-3 py-2 rounded-lg bg-emerald-600 text-white text-sm hover:bg-emerald-700 disabled:opacity-40">
+                  class="dashboard-button dashboard-button--primary px-3 py-2 rounded-lg bg-emerald-600 text-white text-sm hover:bg-emerald-700 disabled:opacity-40">
             Save changes
           </button>
         </div>

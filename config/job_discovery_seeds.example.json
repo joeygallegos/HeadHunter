@@ -1,0 +1,42 @@
+{
+  "seed_urls": [
+    "https://www.builtin.com/jobs/remote/cybersecurity",
+    "https://remoteok.com/remote-security-jobs",
+    "https://weworkremotely.com/categories/remote-programming-jobs",
+    "https://www.flexjobs.com/search?search=cloud+security",
+    "https://www.indeed.com/q-cloud-security-l-houston,-tx-jobs.html"
+  ],
+  "excluded_domains": [
+    "facebook.com",
+    "instagram.com",
+    "linkedin.com",
+    "x.com",
+    "twitter.com",
+    "youtube.com"
+  ],
+  "max_pages": 25,
+  "max_depth": 2,
+  "max_links_per_page": 80,
+  "enable_search": true,
+  "search_provider": "bing_rss",
+  "max_search_queries": 12,
+  "max_search_results_per_query": 8,
+  "search_templates": [
+    "{role} remote careers",
+    "{role} {location} careers",
+    "{role} {location} jobs",
+    "{role} jobs greenhouse",
+    "{role} jobs lever",
+    "{role} jobs workday",
+    "{skill} remote jobs",
+    "{skill} {location} careers"
+  ],
+  "known_ats_hints": {
+    "workday": ["myworkdayjobs.com", "workdayjobs.com"],
+    "greenhouse": ["greenhouse.io"],
+    "lever": ["lever.co"],
+    "ashby": ["ashbyhq.com", "jobs.ashbyhq.com"],
+    "smartrecruiters": ["smartrecruiters.com"],
+    "icims": ["icims.com"]
+  }
+}

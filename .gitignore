@@ -5,6 +5,33 @@ JobScrape.code-workspace
 /.test-tmp-security
 /tests
 /scripts
+!/tests/
+/tests/*
+!/tests/test_timestamp_consistency.py
+!/tests/test_ollama_fail_fast.py
+!/scripts/
+/scripts/*
+!/scripts/migrate_timestamps_to_utc.py
+!/scripts/repair_missing_ai_compensation_overwrites.py
+!/scripts/sql/
+/scripts/sql/*
+!/scripts/sql/verify_timestamp_utc.mysql.sql
 .env
 *.log
 /.codex-test-tmp
+.aider*
+
+# Local credentials, personal inputs, runtime configuration, and databases.
+/config.json
+/config/job_discovery_seeds.json
+/data/
+/google_service_account.json
+/resume.txt
+/scheduler/
+/steps.json
+/test.json
+
+# Pytest artifacts created by local and agent-assisted test runs.
+/.pytest_cache/
+/.pytest-tmp*/
+/pytest-tmp*/

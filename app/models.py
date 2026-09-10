@@ -15,7 +15,7 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.dialects.mysql import LONGTEXT
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import foreign, relationship
 
 # Base, engine, and session setup live in app.db so every entry point resolves DB
 # configuration the same way.
@@ -130,6 +130,16 @@ class Job(Base):
     swipe = relationship(
         "JobSwipe", back_populates="job", uselist=False, cascade="all, delete-orphan"
     )
+    fit_brief = relationship(
+        "JobFitBrief", back_populates="job", uselist=False, cascade="all, delete-orphan"
+    )
+    application_prep = relationship(
+        "JobApplicationPrep",
+        primaryjoin=lambda: Job.id == foreign(JobApplicationPrep.job_pk),
+        back_populates="job",
+        uselist=False,
+        cascade="all, delete-orphan",
+    )
 
 
 class JobSwipe(Base):
@@ -173,6 +183,52 @@ class JobChange(Base):
 
     run = relationship("IntegrationRun", back_populates="changes")
     job = relationship("Job", back_populates="changes")
+
+
+class JobFitBrief(Base):
+    __tablename__ = "job_fit_briefs"
+    __table_args__ = (
+        UniqueConstraint("job_pk", name="uq_job_fit_brief_job_pk"),
+        {"mysql_charset": "utf8mb4", "mysql_collate": "utf8mb4_unicode_ci"},
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    job_pk = Column(Integer, ForeignKey("jobs.id", ondelete="CASCADE"), nullable=False)
+    brief_json = Column(LONGTEXT().with_variant(Text, "sqlite"), nullable=False)
+    resume_hash = Column(String(64), nullable=False)
+    job_content_hash = Column(String(64), nullable=False)
+    generated_at = Column(DateTime(timezone=False), nullable=False, default=utc_now_naive)
+    schema_version = Column(Integer, nullable=False)
+
+    job = relationship("Job", back_populates="fit_brief")
+
+
+class JobApplicationPrep(Base):
+    __tablename__ = "job_application_preps"
+    __table_args__ = (
+        UniqueConstraint("job_pk", name="uq_job_application_prep_job_pk"),
+        {"mysql_charset": "utf8mb4", "mysql_collate": "utf8mb4_unicode_ci"},
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    # Keep this dashboard-owned table creatable for DB users without REFERENCES
+    # privilege; the app still joins it to jobs.id and enforces one row per job.
+    job_pk = Column(Integer, nullable=False)
+    status = Column(String(16), nullable=False, server_default="queued")
+    prep_json = Column(LONGTEXT().with_variant(Text, "sqlite"), nullable=True)
+    resume_hash = Column(String(64), nullable=True)
+    job_content_hash = Column(String(64), nullable=True)
+    schema_version = Column(Integer, nullable=True)
+    queued_at = Column(DateTime(timezone=False), nullable=False, default=utc_now_naive)
+    started_at = Column(DateTime(timezone=False), nullable=True)
+    generated_at = Column(DateTime(timezone=False), nullable=True)
+    error_text = Column(Text, nullable=True)
+
+    job = relationship(
+        "Job",
+        primaryjoin=lambda: foreign(JobApplicationPrep.job_pk) == Job.id,
+        back_populates="application_prep",
+    )
 
 
 # ---------- DB URL resolution (env-first, enforced utf8mb4 for MySQL) ----------
@@ -245,9 +301,55 @@ def ensure_job_change_details_column(bind=None) -> None:
         conn.execute(text(f"ALTER TABLE job_changes ADD COLUMN change_details {column_type}"))
 
 
+def ensure_job_fit_briefs_table(bind=None) -> None:
+    """Create and lightly repair the applicant-facing fit brief table."""
+    target = bind or engine
+    Base.metadata.tables["job_fit_briefs"].create(bind=target, checkfirst=True)
+    inspector = sa_inspect(target)
+    columns = {col["name"] for col in inspector.get_columns("job_fit_briefs")}
+    text_type = "LONGTEXT" if target.dialect.name == "mysql" else "TEXT"
+    definitions = {
+        "brief_json": f"{text_type} NOT NULL",
+        "resume_hash": "VARCHAR(64) NOT NULL",
+        "job_content_hash": "VARCHAR(64) NOT NULL",
+        "generated_at": "DATETIME NOT NULL",
+        "schema_version": "INTEGER NOT NULL",
+    }
+    with target.begin() as conn:
+        for name, column_type in definitions.items():
+            if name not in columns:
+                conn.execute(text(f"ALTER TABLE job_fit_briefs ADD COLUMN {name} {column_type}"))
+
+
+def ensure_job_application_preps_table(bind=None) -> None:
+    """Create and lightly repair the job-specific application prep table."""
+    target = bind or engine
+    Base.metadata.tables["job_application_preps"].create(bind=target, checkfirst=True)
+    inspector = sa_inspect(target)
+    columns = {col["name"] for col in inspector.get_columns("job_application_preps")}
+    text_type = "LONGTEXT" if target.dialect.name == "mysql" else "TEXT"
+    definitions = {
+        "status": "VARCHAR(16) NOT NULL DEFAULT 'queued'",
+        "prep_json": text_type,
+        "resume_hash": "VARCHAR(64)",
+        "job_content_hash": "VARCHAR(64)",
+        "schema_version": "INTEGER",
+        "queued_at": "DATETIME",
+        "started_at": "DATETIME",
+        "generated_at": "DATETIME",
+        "error_text": text_type,
+    }
+    with target.begin() as conn:
+        for name, column_type in definitions.items():
+            if name not in columns:
+                conn.execute(text(f"ALTER TABLE job_application_preps ADD COLUMN {name} {column_type}"))
+
+
 def init_db() -> None:
     """Create tables and apply the small additive runtime schema updates."""
     Base.metadata.create_all(bind=engine)
     ensure_job_reference_fields_column(engine)
     ensure_job_compensation_columns(engine)
     ensure_job_change_details_column(engine)
+    ensure_job_fit_briefs_table(engine)
+    ensure_job_application_preps_table(engine)

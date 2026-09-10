@@ -1,157 +1,372 @@
 <!-- Extracted from dashboard.py so the swipe UI can change without touching API routes. -->
 <!doctype html>
 <html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width,initial-scale=1" />
-    <title>Job Swipe</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
-  </head>
-  <body class="bg-slate-50 text-slate-900 min-h-screen">
-    <main class="max-w-5xl mx-auto p-4 space-y-4" x-data="jobSwiper()" x-init="fetchJobs()">
-      <header class="flex items-center justify-between gap-3">
+
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Job Swipe</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+  {% include "_dashboard_ui.html" %}
+</head>
+
+<body class="dashboard-page bg-slate-50 text-slate-900 min-h-screen">
+  <main class="dashboard-shell dashboard-stack" x-data="jobSwiper()" x-init="fetchJobs()">
+    <header class="dashboard-hero">
+      <div>
+        <h1 class="dashboard-title">Job Swipe</h1>
+        <p class="dashboard-subtitle">
+          <span x-text="idx < jobs.length ? `${idx + 1} of ${jobs.length}` : `${jobs.length} reviewed`"></span>
+        </p>
+      </div>
+      <a href="/"
+        class="dashboard-tab px-3 py-2 rounded-lg border border-slate-200 bg-white text-sm text-slate-700 hover:bg-slate-50">
+        Dashboard
+      </a>
+    </header>
+
+    <section class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4" x-show="!loading && !error">
+      <div class="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
         <div>
-          <h1 class="text-2xl font-bold tracking-tight">Job Swipe</h1>
-          <p class="text-sm text-slate-500">
-            <span x-text="idx < jobs.length ? `${idx + 1} of ${jobs.length}` : `${jobs.length} reviewed`"></span>
+          <h2 class="text-sm font-semibold text-slate-800">Find a job in this deck</h2>
+          <p class="mt-1 text-xs text-slate-500">
+            Search active unreviewed and interesting jobs, then jump to the one you want to move forward.
           </p>
         </div>
-        <a href="/" class="px-3 py-2 rounded-lg border border-slate-200 bg-white text-sm text-slate-700 hover:bg-slate-50">
-          Dashboard
-        </a>
-      </header>
-
-      <section class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-6" x-show="loading">
-        <div class="text-sm text-slate-500">Loading jobs...</div>
-      </section>
-
-      <section class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-6" x-show="error">
-        <div class="text-sm text-red-700" x-text="error"></div>
-      </section>
-
-      <template x-if="!loading && !error && jobs.length > 0 && idx < jobs.length">
-        <article class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-6 space-y-4">
-          <div class="flex flex-col md:flex-row md:items-start md:justify-between gap-3">
-            <div>
-              <h2 class="text-2xl font-semibold text-slate-950" x-text="currentJob().JobTitle || 'No title'"></h2>
-              <div class="mt-2 flex flex-wrap items-center gap-2 text-sm">
-                <span class="font-medium">Level:</span>
-                <span x-text="currentJob().JobLevel || 'Unknown'"
-                      :class="`text-white px-2 py-0.5 rounded ${levelClass()}`"></span>
-                <span class="font-medium ml-2">Pay:</span>
-                <span x-text="currentJob().JobPay || '-'"></span>
-                <span class="font-medium ml-2">Discovered:</span>
-                <span x-text="currentJob().DiscoveryDate || '-'"></span>
+        <button type="button"
+          class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 hover:bg-slate-50 md:w-auto"
+          x-show="searchQuery"
+          @click="clearSearch()">
+          Clear
+        </button>
+      </div>
+      <div class="mt-3">
+        <input type="search"
+          class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+          placeholder="Search jobs, companies, IDs, skills..."
+          x-model.trim="searchQuery"
+          @input="searchDeck()"
+          @keydown.enter.prevent="jumpToFirstSearchResult()" />
+      </div>
+      <div class="mt-3 inline-flex items-center gap-2 text-xs text-slate-500" x-show="searchLoading" x-cloak>
+        <span class="h-3 w-3 animate-spin rounded-full border-2 border-slate-200 border-t-indigo-600"></span>
+        <span>Searching full swipe deck</span>
+      </div>
+      <div class="mt-3 text-xs text-slate-500" x-show="searchQuery">
+        <span x-text="`${searchResults().length} match${searchResults().length === 1 ? '' : 'es'}`"></span>
+        <span x-show="searchResults().length > maxSearchResults">
+          · showing first <span x-text="maxSearchResults"></span>
+        </span>
+      </div>
+      <div class="mt-3 grid gap-2 md:grid-cols-2" x-show="searchQuery && searchResults().length">
+        <template x-for="result in visibleSearchResults()" :key="result.job.id">
+          <button type="button"
+            class="rounded-lg border px-3 py-2 text-left text-sm hover:bg-slate-50"
+            :class="result.index === idx ? 'border-indigo-400 bg-indigo-50' : 'border-slate-200 bg-white'"
+            @click="jumpToSearchResult(result.index)">
+            <div class="flex items-start justify-between gap-2">
+              <div class="min-w-0">
+                <div class="truncate font-medium text-slate-900" x-text="result.job.JobTitle || '(no title)'"></div>
+                <div class="mt-0.5 truncate text-xs text-slate-500">
+                  <span x-text="result.job.Company || result.job.Site || '-'"></span>
+                  <span class="mx-1">|</span>
+                  <span x-text="result.job.JobID || '-'"></span>
+                </div>
               </div>
-              <div class="mt-1 text-xs text-slate-500">
-                ID: <span x-text="currentJob().JobID || '-'"></span>
+              <div class="flex shrink-0 items-center gap-2">
+                <span class="rounded bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-800"
+                  x-show="result.job.SwipeAction === 'interesting'">Interesting</span>
+                <span class="text-xs text-slate-500" x-text="`#${result.index + 1}`"></span>
               </div>
             </div>
-            <a :href="currentJob().JobUrl || '#'"
-               x-show="currentJob().JobUrl"
-               class="inline-flex items-center justify-center px-3 py-2 rounded-lg bg-slate-900 text-white text-sm hover:bg-slate-800"
-               target="_blank" rel="noreferrer">
-              Open posting
-            </a>
+            <div class="mt-1 text-xs text-slate-500">
+              Match <span x-text="formatMatch(result.job.AIMatchPercentage)"></span>
+              <span class="ml-2" x-text="formatKeywords(result.job.AIKeywordsOverlap)"></span>
+            </div>
+          </button>
+        </template>
+      </div>
+      <p class="mt-3 text-sm text-slate-500" x-show="searchQuery && !searchResults().length">
+        No active unreviewed or interesting jobs match that search.
+      </p>
+    </section>
+
+    <section class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-6" x-show="loading">
+      <div class="text-sm text-slate-500">Loading jobs...</div>
+    </section>
+
+    <section class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-6" x-show="error">
+      <div class="text-sm text-red-700" x-text="error"></div>
+    </section>
+
+    <template x-if="!loading && !error && jobs.length > 0 && idx < jobs.length">
+      <article class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-6 space-y-4">
+        <div class="flex flex-col md:flex-row md:items-start md:justify-between gap-3">
+          <div>
+            <h2 class="text-2xl font-semibold text-slate-950" x-text="currentJob().JobTitle || 'No title'"></h2>
+            <div class="mt-1 flex flex-wrap items-center gap-2 text-sm">
+              <span class="font-medium text-slate-700" x-text="currentJob().Company || currentJob().Site || '-'"></span>
+              <span class="text-slate-300">|</span>
+              <span class="text-xs text-slate-500">
+                ID: <span x-text="currentJob().JobID || '-'"></span>
+              </span>
+              <span class="rounded bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-800"
+                x-show="currentJob().SwipeAction === 'interesting'">Interesting</span>
+            </div>
+            <div class="mt-2 flex flex-wrap items-center gap-2 text-sm">
+              <span class="font-medium">Level:</span>
+              <span x-text="currentJob().JobLevel || 'Unknown'"
+                :class="`text-white px-2 py-0.5 rounded ${levelClass()}`"></span>
+              <span class="font-medium ml-2">Pay:</span>
+              <span x-text="currentJob().JobPay || '-'"></span>
+              <span class="font-medium ml-2">Match:</span>
+              <span x-text="formatMatch(currentJob().AIMatchPercentage)"></span>
+              <span class="font-medium ml-2">Discovered:</span>
+              <span x-text="currentJob().DiscoveryDateSimple || currentJob().DiscoveryDate || '-'"></span>
+            </div>
+
           </div>
+          <a :href="currentJob().JobUrl || '#'" x-show="currentJob().JobUrl"
+            class="inline-flex items-center justify-center px-3 py-2 rounded-lg bg-slate-900 text-white text-sm hover:bg-slate-800"
+            target="_blank" rel="noreferrer">
+            Open posting
+          </a>
+        </div>
 
-          <div class="prose prose-sm max-w-none text-slate-800">
-            <p class="whitespace-pre-wrap leading-6" x-html="currentJob().JobDescHighlighted || 'No description'"></p>
+        <div class="prose prose-sm max-w-none text-slate-800">
+          <p class="whitespace-pre-wrap leading-6" x-html="currentJob().JobDescHighlighted || 'No description'"></p>
+        </div>
+
+        <div class="rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm space-y-2">
+          <div>
+            <span class="font-medium text-slate-700">AI keyword matches:</span>
+            <span class="text-slate-700" x-text="formatKeywords(currentJob().AIKeywordsOverlap)"></span>
           </div>
-
-          <div class="rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm">
-            <span class="font-medium text-slate-700">Keywords:</span>
-            <span class="text-slate-700" x-text="currentJob().Keywords || '-'"></span>
+          <div>
+            <span class="font-medium text-slate-700">AI missing keywords:</span>
+            <span class="text-slate-700" x-text="formatKeywords(currentJob().AIMissingKeywords)"></span>
           </div>
+        </div>
 
-          <div class="flex flex-col sm:flex-row justify-center gap-3 pt-2">
-            <button class="bg-red-600 hover:bg-red-700 text-white px-6 py-3 rounded-lg text-base font-semibold"
-                    :disabled="saving"
-                    @click="swipe('dislike')">
-              Dislike
-            </button>
-            <button class="bg-emerald-600 hover:bg-emerald-700 text-white px-6 py-3 rounded-lg text-base font-semibold"
-                    :disabled="saving"
-                    @click="swipe('like')">
-              Like
-            </button>
+        <div class="grid grid-cols-3 gap-3 pt-2">
+          <button class="w-full bg-red-600 hover:bg-red-700 text-white px-6 py-3 rounded-lg text-base font-semibold"
+            :disabled="saving" @click="swipe('dislike')">
+            Dislike
+          </button>
+          <button class="w-full bg-amber-500 hover:bg-amber-600 text-white px-6 py-3 rounded-lg text-base font-semibold"
+            :disabled="saving" @click="swipe('interesting')">
+            Interesting
+          </button>
+          <button
+            class="w-full bg-emerald-600 hover:bg-emerald-700 text-white px-6 py-3 rounded-lg text-base font-semibold"
+            :disabled="saving" @click="swipe('like')">
+            Move forward
+          </button>
+        </div>
+
+        <section class="border-t border-slate-100 pt-4">
+          <div class="flex items-center justify-between gap-3">
+            <h3 class="text-sm font-semibold text-slate-800">Changes to date</h3>
+            <span class="text-xs text-slate-500" x-text="`${currentJob().ChangeCount || 0} recorded`"></span>
           </div>
-        </article>
-      </template>
+          <ul class="mt-2 divide-y divide-slate-100 rounded-lg border border-slate-200 bg-white"
+            x-show="(currentJob().Changes || []).length">
+            <template x-for="change in (currentJob().Changes || [])"
+              :key="`${change.date}-${change.source}-${change.type}-${change.summary}`">
+              <li class="flex flex-col gap-1 px-3 py-2 text-sm sm:flex-row sm:items-center sm:justify-between">
+                <div class="min-w-0">
+                  <span class="font-medium text-slate-900" x-text="change.summary || 'job details'"></span>
+                  <span class="ml-2 rounded bg-slate-100 px-2 py-0.5 text-xs text-slate-600"
+                    x-text="change.type || 'changed'"></span>
+                </div>
+                <div class="shrink-0 text-xs text-slate-500">
+                  <span x-text="change.source || 'site'"></span>
+                  <span class="mx-1">&middot;</span>
+                  <span x-text="change.date || '-'"></span>
+                </div>
+              </li>
+            </template>
+          </ul>
+          <p class="mt-2 text-sm text-slate-500" x-show="!(currentJob().Changes || []).length">
+            No changes recorded.
+          </p>
+        </section>
+      </article>
+    </template>
 
-      <section class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-8 text-center"
-               x-show="!loading && !error && (jobs.length === 0 || idx >= jobs.length)">
-        <h2 class="text-2xl font-semibold">No more jobs</h2>
-        <button class="mt-4 px-3 py-2 rounded-lg bg-indigo-600 text-white text-sm hover:bg-indigo-700"
-                @click="fetchJobs()">
-          Refresh
-        </button>
-      </section>
-    </main>
+    <section class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-8 text-center"
+      x-show="!loading && !error && (jobs.length === 0 || idx >= jobs.length)">
+      <h2 class="text-2xl font-semibold">No more jobs</h2>
+      <button class="mt-4 px-3 py-2 rounded-lg bg-indigo-600 text-white text-sm hover:bg-indigo-700"
+        @click="fetchJobs()">
+        Refresh
+      </button>
+    </section>
+  </main>
 
-    <script>
-      function jobSwiper() {
-        return {
-          jobs: [],
-          idx: 0,
-          loading: false,
-          saving: false,
-          error: '',
+  <script>
+    function jobSwiper()
+    {
+      return {
+        jobs: [],
+        idx: 0,
+        loading: false,
+        saving: false,
+        error: '',
+        searchQuery: '',
+        searchLoading: false,
+        searchTimer: null,
+        searchRequestId: 0,
+        maxSearchResults: 12,
 
-          async fetchJobs() {
-            this.loading = true;
-            this.error = '';
-            try {
-              const res = await fetch('/api/swipe/jobs');
-              if (!res.ok) throw new Error(await res.text());
-              this.jobs = await res.json();
-              this.idx = 0;
-            } catch (err) {
-              this.error = err?.message || 'Failed to load swipe jobs.';
-            } finally {
+        async fetchJobs(search = '')
+        {
+          const query = String(search || '').trim();
+          const requestId = ++this.searchRequestId;
+          this.loading = !query && !this.jobs.length;
+          this.searchLoading = Boolean(query);
+          this.error = '';
+          try
+          {
+            const url = query ? `/api/swipe/jobs?q=${encodeURIComponent(query)}` : '/api/swipe/jobs';
+            const res = await fetch(url);
+            if (!res.ok) throw new Error(await res.text());
+            if (requestId !== this.searchRequestId) return;
+            this.jobs = await res.json();
+            this.idx = 0;
+            if (!query) this.searchQuery = '';
+          } catch (err)
+          {
+            if (requestId !== this.searchRequestId) return;
+            this.error = err?.message || 'Failed to load swipe jobs.';
+          } finally
+          {
+            if (requestId === this.searchRequestId)
+            {
               this.loading = false;
+              this.searchLoading = false;
             }
-          },
+          }
+        },
 
-          currentJob() {
-            return this.jobs[this.idx] || {};
-          },
+        currentJob()
+        {
+          return this.jobs[this.idx] || {};
+        },
 
-          levelClass() {
-            const lvl = (this.currentJob().JobLevel || '').toLowerCase();
-            const map = {
-              architect: 'bg-red-600',
-              senior: 'bg-orange-500',
-              leader: 'bg-slate-500',
-              junior: 'bg-blue-500',
-              unknown: 'bg-slate-400',
-            };
-            return map[lvl] || 'bg-slate-400';
-          },
+        searchableText(job)
+        {
+          return [
+            job?.JobTitle,
+            job?.Company,
+            job?.Site,
+            job?.JobID,
+            job?.JobPay,
+            job?.JobLevel,
+            job?.SwipeAction,
+            job?.JobDesc,
+            ...(Array.isArray(job?.AIKeywordsOverlap) ? job.AIKeywordsOverlap : []),
+            ...(Array.isArray(job?.AIMissingKeywords) ? job.AIMissingKeywords : []),
+          ].filter(Boolean).join(' ').toLowerCase();
+        },
 
-          async swipe(action) {
-            if (this.saving) return;
-            const job = this.currentJob();
-            this.saving = true;
-            this.error = '';
-            try {
-              const res = await fetch('/api/swipe', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({job, action})
-              });
-              if (!res.ok) throw new Error(await res.text());
-              this.idx++;
-              window.scrollTo({top: 0, behavior: 'smooth'});
-            } catch (err) {
-              this.error = err?.message || 'Failed to save swipe.';
-            } finally {
-              this.saving = false;
-            }
+        searchResults()
+        {
+          const query = String(this.searchQuery || '').toLowerCase().trim();
+          if (!query) return [];
+          const terms = query.split(/\s+/).filter(Boolean);
+          return this.jobs
+            .map((job, index) => ({ job, index, text: this.searchableText(job) }))
+            .filter(result => terms.every(term => result.text.includes(term)));
+        },
+
+        searchDeck()
+        {
+          if (this.searchTimer) window.clearTimeout(this.searchTimer);
+          this.searchTimer = window.setTimeout(() =>
+          {
+            this.fetchJobs(this.searchQuery);
+          }, 300);
+        },
+
+        visibleSearchResults()
+        {
+          return this.searchResults().slice(0, this.maxSearchResults);
+        },
+
+        jumpToSearchResult(index)
+        {
+          const target = Number(index);
+          if (!Number.isInteger(target) || target < 0 || target >= this.jobs.length) return;
+          this.idx = target;
+          window.scrollTo({ top: 0, behavior: 'smooth' });
+        },
+
+        jumpToFirstSearchResult()
+        {
+          const first = this.searchResults()[0];
+          if (first) this.jumpToSearchResult(first.index);
+        },
+
+        clearSearch()
+        {
+          this.searchQuery = '';
+          this.fetchJobs();
+        },
+
+        levelClass()
+        {
+          const lvl = (this.currentJob().JobLevel || '').toLowerCase();
+          const map = {
+            architect: 'bg-red-600',
+            senior: 'bg-orange-500',
+            leader: 'bg-slate-500',
+            junior: 'bg-blue-500',
+            unknown: 'bg-slate-400',
+          };
+          return map[lvl] || 'bg-slate-400';
+        },
+
+        formatMatch(value)
+        {
+          const match = Number(value);
+          return Number.isFinite(match) ? `${Math.round(match)}%` : '-';
+        },
+
+        formatKeywords(value)
+        {
+          return Array.isArray(value) && value.length ? value.join(', ') : '-';
+        },
+
+        async swipe(action)
+        {
+          if (this.saving) return;
+          const job = this.currentJob();
+          this.saving = true;
+          this.error = '';
+          try
+          {
+            const res = await fetch('/api/swipe', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ job, action })
+            });
+            if (!res.ok) throw new Error(await res.text());
+            this.jobs.splice(this.idx, 1);
+            if (this.idx >= this.jobs.length) this.idx = Math.max(0, this.jobs.length - 1);
+            window.scrollTo({ top: 0, behavior: 'smooth' });
+          } catch (err)
+          {
+            this.error = err?.message || 'Failed to save swipe.';
+          } finally
+          {
+            this.saving = false;
           }
         }
       }
-    </script>
-  </body>
+    }
+  </script>
+</body>
+
 </html>

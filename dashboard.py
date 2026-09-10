@@ -14,6 +14,7 @@ import io
 import threading
 import time
 import uuid
+import hashlib
 from collections import defaultdict, OrderedDict
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -62,12 +63,16 @@ load_dotenv()
 from app.models import (  # type: ignore
     Base,
     JobChange,
+    JobFitBrief,
+    JobApplicationPrep,
     SessionLocal,
     IntegrationRun,
     Job,
     engine,
     ensure_job_reference_fields_column,
     ensure_job_compensation_columns,
+    ensure_job_fit_briefs_table,
+    ensure_job_application_preps_table,
 )
 from app.db import resolve_display_timezone, utc_now_naive
 
@@ -75,6 +80,9 @@ OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 DEFAULT_EVENTS_PATH = os.path.join(OUTPUT_DIR, "job_board_discovery_events.jsonl")
 DEFAULT_STEPS_PATH = os.path.join(BASE_DIR, "steps.json")
 DEFAULT_SUGGESTIONS_PATH = os.path.join(OUTPUT_DIR, "steps_suggestions.json")
+RESUME_PATH = os.getenv("RESUME_PATH", os.path.join(BASE_DIR, "resume.txt"))
+DASH_FIT_BRIEF_MIN_MATCH = int(os.getenv("AI_FIT_BRIEF_MIN_MATCH", "75"))
+APPLICATION_PREP_SCHEMA_VERSION = 1
 
 
 def read_json_file(path: str, default: Any) -> Any:
@@ -342,6 +350,59 @@ def _safe_json_list(s: Any) -> List[str]:
     return [str(item) for item in value if item is not None]
 
 
+def _change_fields(change: JobChange) -> List[str]:
+    raw = getattr(change, "changed_fields", None)
+    if not raw:
+        return []
+    parsed = _safe_json_loads(raw)
+    if isinstance(parsed, list):
+        return [str(item).strip() for item in parsed if str(item).strip()]
+    return [item.strip() for item in str(raw).split(",") if item.strip()]
+
+
+def _diff_lines(before: Any, after: Any) -> List[Dict[str, str]]:
+    before_lines = str(before or "").splitlines()
+    after_lines = str(after or "").splitlines()
+    out: List[Dict[str, str]] = []
+    for line in difflib.unified_diff(before_lines, after_lines, lineterm=""):
+        if line.startswith("---") or line.startswith("+++"):
+            continue
+        if line.startswith("@@"):
+            out.append({"type": "hunk", "text": line})
+        elif line.startswith("-"):
+            out.append({"type": "remove", "text": line[1:]})
+        elif line.startswith("+"):
+            out.append({"type": "add", "text": line[1:]})
+        else:
+            out.append({"type": "context", "text": line[1:] if line.startswith(" ") else line})
+    return out
+
+
+def _serialize_change(change: JobChange) -> Dict[str, Any]:
+    fields = _change_fields(change)
+    details = _safe_json_loads(getattr(change, "change_details", None))
+    diffs: List[Dict[str, Any]] = []
+    if isinstance(details, dict):
+        before = details.get("before") if isinstance(details.get("before"), dict) else {}
+        after = details.get("after") if isinstance(details.get("after"), dict) else {}
+        detail_fields = details.get("fields") if isinstance(details.get("fields"), list) else fields
+        fields = [str(item).strip() for item in detail_fields if str(item).strip()] or fields
+        for field in fields:
+            lines = _diff_lines(before.get(field, ""), after.get(field, ""))
+            if lines:
+                diffs.append({"field": field, "lines": lines})
+    return {
+        "id": change.id,
+        "change_type": getattr(change, "change_type", None),
+        "change_source": getattr(change, "change_source", None) or "site",
+        "created_at": _fmt_dt(getattr(change, "created_at", None)),
+        "changed_fields": getattr(change, "changed_fields", None),
+        "fields": fields,
+        "has_detail": bool(diffs),
+        "diffs": diffs,
+    }
+
+
 _REFERENCE_FIELDS_COLUMN_READY = False
 
 
@@ -355,7 +416,39 @@ def _ensure_reference_fields_column() -> None:
         bind = session.get_bind()
         ensure_job_reference_fields_column(bind)
         ensure_job_compensation_columns(bind)
+        ensure_job_fit_briefs_table(bind)
+        ensure_job_application_preps_table(bind)
     _REFERENCE_FIELDS_COLUMN_READY = True
+
+
+_APP_PREP_WORKER_THREAD: Optional[threading.Thread] = None
+_APP_PREP_WORKER_LOCK = threading.Lock()
+
+
+def _start_application_prep_worker() -> None:
+    """Start one best-effort dashboard worker for newly queued prep jobs."""
+    global _APP_PREP_WORKER_THREAD
+    with _APP_PREP_WORKER_LOCK:
+        if _APP_PREP_WORKER_THREAD and _APP_PREP_WORKER_THREAD.is_alive():
+            return
+
+        def _run() -> None:
+            try:
+                import analyze_jobs_ollama as analyzer
+
+                analyzer.run_application_prep_generation(preflight=True)
+            except SystemExit:
+                return
+            except Exception:
+                # The analyzer writes its own detailed log; keep request handling isolated.
+                return
+
+        _APP_PREP_WORKER_THREAD = threading.Thread(
+            target=_run,
+            name="application-prep-worker",
+            daemon=True,
+        )
+        _APP_PREP_WORKER_THREAD.start()
 
 
 def _job_reference_fields(j: Job) -> List[Dict[str, str]]:
@@ -404,6 +497,8 @@ def highlight_as_you_will(job_title: str, job_desc: str) -> str:
     end = r'[.!?](?:["\')\]]+)?(?:\s|$)'
     patterns = [
         rf"\bAs\s+a\b[^.!?]{{0,300}}?\byou\s+will\b[^.!?]*?{end}",
+        rf"\bAs\s+an?\b[^.!?]*?{end}",
+        rf"\bThe\s+ideal\s+candidate\b[^.!?]*?{end}",
         r"\bAbout the Role:\s*[^.!?]*?(?<!S)(?<!J)\.{1}(?:\s|$)",
         r"\bWhat You(?:'|â€™)ll Do:\s*[^.!?]*?(?<!S)(?<!J)\.{1}(?:\s|$)",
         rf"\bIn this role\b[^.!?]*?{end}",
@@ -476,45 +571,175 @@ def _ensure_query_report_table() -> None:
     _QUERY_REPORT_TABLE_READY = True
 
 
-def _serialize_swipe_job(job: Job) -> Dict[str, Any]:
+def _simple_date(dt: Any) -> str:
+    if not dt:
+        return ""
+    try:
+        return _as_local(dt).strftime("%b %d, %Y").replace(" 0", " ")
+    except Exception:
+        return str(dt)
+
+
+def _swipe_company_name(job: Job) -> str:
+    refs = _job_reference_fields(job)
+    preferred = {
+        "company",
+        "companyname",
+        "employer",
+        "employername",
+        "organization",
+        "organizationname",
+    }
+    for item in refs:
+        label = re.sub(r"[^a-z0-9]", "", str(item.get("label") or "").lower())
+        value = str(item.get("value") or "").strip()
+        if label in preferred and value:
+            return value
+    return job.site or ""
+
+
+def _swipe_change_summary(changes: List[JobChange], limit: int = 4) -> str:
+    if not changes:
+        return "No changes recorded."
+    parts: List[str] = []
+    for change in changes[:limit]:
+        fields = _change_fields(change)
+        fields_label = ", ".join(fields[:3]) if fields else "job details"
+        if len(fields) > 3:
+            fields_label += f", +{len(fields) - 3} more"
+        change_type = str(getattr(change, "change_type", None) or "changed")
+        source = str(getattr(change, "change_source", None) or "site")
+        when = _simple_date(getattr(change, "created_at", None)) or "unknown date"
+        parts.append(f"{when}: {source} {change_type} changed {fields_label}")
+    if len(changes) > limit:
+        parts.append(f"+{len(changes) - limit} older change(s)")
+    return "; ".join(parts)
+
+
+def _swipe_change_items(changes: List[JobChange], limit: int = 5) -> List[Dict[str, str]]:
+    items: List[Dict[str, str]] = []
+    for change in changes[:limit]:
+        fields = _change_fields(change)
+        fields_label = ", ".join(fields[:4]) if fields else "job details"
+        if len(fields) > 4:
+            fields_label += f", +{len(fields) - 4} more"
+        items.append(
+            {
+                "date": _simple_date(getattr(change, "created_at", None)) or "Unknown date",
+                "source": str(getattr(change, "change_source", None) or "site"),
+                "type": str(getattr(change, "change_type", None) or "changed"),
+                "summary": fields_label,
+            }
+        )
+    return items
+
+
+def _serialize_swipe_job(job: Job, changes: Optional[List[JobChange]] = None) -> Dict[str, Any]:
+    changes = changes or []
+    swipe = getattr(job, "swipe", None)
     return {
         "id": job.id,
         "JobID": job.job_id or "",
         "Site": job.site or "",
+        "Company": _swipe_company_name(job),
         "JobTitle": job.title or "",
         "JobUrl": job.url or "",
         "JobDesc": job.desc or "",
         "JobDescHighlighted": highlight_as_you_will(job.title or "", job.desc or ""),
-        "Keywords": job.keywords or "",
+        "AIKeywordsOverlap": _safe_json_list(job.ai_keywords_overlap),
+        "AIMissingKeywords": _safe_json_list(job.ai_missing_keywords),
         "JobLevel": job.level or "Unknown",
         "JobPay": job.pay or "",
         "DiscoveryDate": _fmt_dt(job.discovery_date) or "",
+        "DiscoveryDateSimple": _simple_date(job.discovery_date),
+        "ChangeSummary": _swipe_change_summary(changes),
+        "Changes": _swipe_change_items(changes),
+        "ChangeCount": len(changes),
         "AIMatchPercentage": job.ai_match_percentage,
         "AILocationPolicyMatch": job.ai_location_policy_match or "",
+        "SwipeAction": getattr(swipe, "action", None) or "",
     }
 
 
-def fetch_swipe_jobs() -> List[Dict[str, Any]]:
+def fetch_swipe_jobs(search_query: str = "") -> List[Dict[str, Any]]:
+    _ensure_reference_fields_column()
+    _ensure_swipe_table()
+    terms = [part.lower() for part in re.split(r"\s+", (search_query or "").strip()) if part.strip()]
+    with SessionLocal() as session:
+        stmt = (
+            select(Job)
+            .outerjoin(JobSwipe, JobSwipe.job_pk == Job.id)
+            .where(Job.is_active.is_(True))
+        )
+        if terms:
+            # Search treats "interesting" as saved-for-later, so those jobs stay findable.
+            stmt = stmt.where(or_(JobSwipe.id.is_(None), JobSwipe.action == "interesting"))
+        else:
+            stmt = stmt.where(JobSwipe.id.is_(None))
+        for term in terms[:6]:
+            like_q = f"%{term}%"
+            stmt = stmt.where(
+                or_(
+                    func.lower(Job.job_id).like(like_q),
+                    func.lower(Job.site).like(like_q),
+                    func.lower(Job.title).like(like_q),
+                    func.lower(Job.url).like(like_q),
+                    func.lower(Job.desc).like(like_q),
+                    func.lower(Job.keywords).like(like_q),
+                    func.lower(Job.pay).like(like_q),
+                    func.lower(Job.level).like(like_q),
+                    func.lower(Job.reference_fields).like(like_q),
+                    func.lower(Job.ai_fit_summary).like(like_q),
+                    func.lower(Job.ai_keywords_overlap).like(like_q),
+                    func.lower(Job.ai_missing_keywords).like(like_q),
+                    func.lower(Job.ai_location_policy_match).like(like_q),
+                )
+            )
+        stmt = stmt.order_by(Job.discovery_date.desc(), Job.id.desc()).limit(500)
+        jobs = (
+            session.execute(stmt)
+            .scalars()
+            .all()
+        )
+        changes_by_job = _changes_by_job(session, jobs, per_job_limit=20)
+        return [
+            _serialize_swipe_job(
+                job,
+                changes_by_job.get(((job.site or ""), (job.job_id or "")), []),
+            )
+            for job in jobs
+        ]
+
+
+def fetch_interesting_jobs() -> Dict[str, Any]:
+    _ensure_reference_fields_column()
     _ensure_swipe_table()
     with SessionLocal() as session:
         jobs = (
             session.execute(
                 select(Job)
-                .outerjoin(JobSwipe, JobSwipe.job_pk == Job.id)
-                .where(JobSwipe.id.is_(None))
-                .where(Job.is_active.is_(True))
-                .order_by(Job.discovery_date.desc(), Job.id.desc())
-                .limit(500)
+                .join(JobSwipe, JobSwipe.job_pk == Job.id)
+                .where(JobSwipe.action == "interesting")
+                .order_by(JobSwipe.created_at.desc(), Job.discovery_date.desc(), Job.id.desc())
             )
             .scalars()
             .all()
         )
-        return [_serialize_swipe_job(job) for job in jobs]
+        changes_by_job = _changes_by_job(session, jobs, per_job_limit=20)
+        rows = [
+            _serialize_swipe_job(
+                job,
+                changes_by_job.get(((job.site or ""), (job.job_id or "")), []),
+            )
+            for job in jobs
+        ]
+    return {"returned": len(rows), "jobs": rows}
 
 
-def record_swipe(job: Dict[str, Any], action: str) -> bool:
+def record_swipe(job: Dict[str, Any], action: str) -> Dict[str, Any]:
     _ensure_swipe_table()
     job_pk = _to_int(job.get("id"))
+    saved_job_pk = 0
     with SessionLocal() as session:
         db_job = session.get(Job, job_pk) if job_pk else None
         if db_job is None and job.get("JobID") and job.get("Site"):
@@ -528,7 +753,8 @@ def record_swipe(job: Dict[str, Any], action: str) -> bool:
                 .first()
             )
         if db_job is None:
-            return False
+            return {"success": False}
+        saved_job_pk = int(db_job.id or 0)
 
         existing = (
             session.execute(select(JobSwipe).where(JobSwipe.job_pk == db_job.id))
@@ -540,7 +766,86 @@ def record_swipe(job: Dict[str, Any], action: str) -> bool:
         else:
             session.add(JobSwipe(job_pk=db_job.id, action=action))
         session.commit()
-        return True
+    prep = None
+    if action == "like" and saved_job_pk:
+        prep_result = queue_application_prep_for_job(saved_job_pk)
+        prep = prep_result.get("application_prep")
+        _start_application_prep_worker()
+    return {"success": True, "application_prep": prep}
+
+
+def queue_application_prep_for_job(job_pk: int, *, force: bool = False) -> Dict[str, Any]:
+    _ensure_reference_fields_column()
+    job_pk = _to_int(job_pk)
+    if not job_pk:
+        return {"found": False, "application_prep": None}
+
+    with SessionLocal() as session:
+        job = session.get(Job, job_pk)
+        if job is None:
+            return {"found": False, "application_prep": None}
+
+        prep = (
+            session.execute(
+                select(JobApplicationPrep).where(JobApplicationPrep.job_pk == job.id)
+            )
+            .scalars()
+            .one_or_none()
+        )
+        now = utc_now_naive()
+        if prep is None:
+            prep = JobApplicationPrep(job_pk=job.id)
+            session.add(prep)
+        current_status = _application_prep_status(job, prep)
+        if force or current_status in {"none", "queued", "failed", "stale"}:
+            prep.status = "queued"
+            prep.queued_at = now
+            prep.started_at = None
+            prep.error_text = None
+            if force:
+                prep.generated_at = None
+        session.commit()
+        return {
+            "found": True,
+            "application_prep": _serialize_application_prep(job),
+        }
+
+
+def fetch_application_prep_deck() -> Dict[str, Any]:
+    _ensure_reference_fields_column()
+    with SessionLocal() as session:
+        rows = (
+            session.execute(
+                select(Job)
+                .join(JobApplicationPrep, JobApplicationPrep.job_pk == Job.id)
+                .join(JobSwipe, JobSwipe.job_pk == Job.id)
+                .where(JobSwipe.action == "like")
+                .order_by(JobApplicationPrep.queued_at.desc(), Job.id.desc())
+            )
+            .scalars()
+            .all()
+        )
+        jobs = []
+        for job in rows:
+            prep = _serialize_application_prep(job)
+            jobs.append(
+                {
+                    "id": job.id,
+                    "site": job.site or "",
+                    "job_id": job.job_id or "",
+                    "title": job.title or "",
+                    "url": job.url or "",
+                    "is_active": bool(job.is_active),
+                    "ai_match_percentage": job.ai_match_percentage,
+                    "ai_location_policy_match": job.ai_location_policy_match or "",
+                    "queued_at": prep.get("queued_at", ""),
+                    "generated_at": prep.get("generated_at", ""),
+                    "status": prep.get("status", "none"),
+                    "error_text": prep.get("error_text", ""),
+                    "application_prep": prep,
+                }
+            )
+    return {"returned": len(jobs), "jobs": jobs}
 
 
 # ----------------------------------------------------------------------
@@ -1150,6 +1455,102 @@ def _fmt_dt(dt: Any) -> Optional[str]:
             return str(dt)
 
 
+def _stable_text_hash(text_value: str) -> str:
+    return hashlib.sha256((text_value or "").encode("utf-8", "ignore")).hexdigest()
+
+
+def _current_resume_hash() -> str:
+    try:
+        with open(RESUME_PATH, "r", encoding="utf-8", errors="ignore") as handle:
+            return _stable_text_hash(handle.read())
+    except Exception:
+        return ""
+
+
+def _fit_brief_job_hash(j: Job) -> str:
+    return j.content_hash or _stable_text_hash(
+        "|".join([j.title or "", j.desc or "", j.ai_analysis or ""])
+    )
+
+
+def _application_prep_job_hash(j: Job) -> str:
+    return j.content_hash or _stable_text_hash(
+        "|".join([j.title or "", j.desc or "", j.ai_analysis or ""])
+    )
+
+
+def _serialize_fit_brief(j: Job) -> Dict[str, Any]:
+    brief = getattr(j, "fit_brief", None)
+    if brief is None:
+        eligible = bool(j.is_active) and (j.ai_match_percentage or 0) >= DASH_FIT_BRIEF_MIN_MATCH and bool((j.title or j.desc or "").strip())
+        return {
+            "available": False,
+            "eligible": eligible,
+            "status": "missing" if eligible else "not_eligible",
+            "generated_at": "",
+            "schema_version": None,
+            "resume_bullet_count": 0,
+            "brief": None,
+        }
+
+    payload = _safe_json_loads(getattr(brief, "brief_json", None)) or {}
+    current_resume_hash = _current_resume_hash()
+    stale_resume = bool(current_resume_hash) and brief.resume_hash != current_resume_hash
+    stale_job = brief.job_content_hash != _fit_brief_job_hash(j)
+    matches = payload.get("resume_bullet_matches") if isinstance(payload, dict) else []
+    return {
+        "available": True,
+        "eligible": True,
+        "status": "stale" if (stale_resume or stale_job) else "current",
+        "generated_at": _fmt_dt(getattr(brief, "generated_at", None)) or "",
+        "schema_version": getattr(brief, "schema_version", None),
+        "resume_bullet_count": len(matches) if isinstance(matches, list) else 0,
+        "brief": payload if isinstance(payload, dict) else None,
+    }
+
+
+def _application_prep_status(j: Job, prep: Optional[JobApplicationPrep]) -> str:
+    if prep is None:
+        return "none"
+    status = (prep.status or "queued").strip().lower()
+    if status in {"queued", "running", "failed"}:
+        return status
+    current_resume_hash = _current_resume_hash()
+    if (
+        (current_resume_hash and prep.resume_hash != current_resume_hash)
+        or prep.job_content_hash != _application_prep_job_hash(j)
+        or prep.schema_version != APPLICATION_PREP_SCHEMA_VERSION
+    ):
+        return "stale"
+    return "done" if status == "done" else status
+
+
+def _serialize_application_prep(j: Job) -> Dict[str, Any]:
+    prep = getattr(j, "application_prep", None)
+    if prep is None:
+        return {
+            "available": False,
+            "status": "none",
+            "queued_at": "",
+            "started_at": "",
+            "generated_at": "",
+            "schema_version": None,
+            "error_text": "",
+            "prep": None,
+        }
+    payload = _safe_json_loads(getattr(prep, "prep_json", None)) or {}
+    return {
+        "available": bool(isinstance(payload, dict) and payload),
+        "status": _application_prep_status(j, prep),
+        "queued_at": _fmt_dt(getattr(prep, "queued_at", None)) or "",
+        "started_at": _fmt_dt(getattr(prep, "started_at", None)) or "",
+        "generated_at": _fmt_dt(getattr(prep, "generated_at", None)) or "",
+        "schema_version": getattr(prep, "schema_version", None),
+        "error_text": getattr(prep, "error_text", None) or "",
+        "prep": payload if isinstance(payload, dict) else None,
+    }
+
+
 def _serialize_job_detail(j: Job, changes: List[JobChange]) -> Dict[str, Any]:
     ai_raw = (getattr(j, "ai_analysis", None) or "").strip()
     ai_obj = _safe_json_loads(ai_raw)
@@ -1175,19 +1576,9 @@ def _serialize_job_detail(j: Job, changes: List[JobChange]) -> Dict[str, Any]:
         "ai": ai_obj,
         "ai_row": ai_row,
         "ai_raw": ai_raw if not ai_obj else "",
-        "changes": [
-            {
-                "id": c.id,
-                "site": getattr(c, "site", None),
-                "change_type": getattr(c, "change_type", None),
-                "change_source": getattr(c, "change_source", None) or "site",
-                "created_at": _fmt_dt(getattr(c, "created_at", None)),
-                "changed_fields": getattr(c, "changed_fields", None),
-                "old_hash": getattr(c, "old_hash", None),
-                "new_hash": getattr(c, "new_hash", None),
-            }
-            for c in changes
-        ],
+        "fit_brief": _serialize_fit_brief(j),
+        "application_prep": _serialize_application_prep(j),
+        "changes": [_serialize_change(c) for c in changes],
     }
 
 
@@ -1261,6 +1652,11 @@ STATIC_QUERY_COLUMNS: List[Dict[str, str]] = [
     {"key": "ai_experience_match", "label": "AI Experience", "group": "AI", "type": "text"},
     {"key": "ai_location_policy_match", "label": "AI Location", "group": "AI", "type": "text"},
     {"key": "ai_analyzed_at", "label": "AI Analyzed", "group": "AI", "type": "datetime"},
+    {"key": "fit_brief_generated_at", "label": "Fit Brief Generated", "group": "Fit Brief", "type": "datetime"},
+    {"key": "fit_brief_status", "label": "Fit Brief Status", "group": "Fit Brief", "type": "text"},
+    {"key": "fit_brief_resume_bullet_count", "label": "Mapped Resume Bullets", "group": "Fit Brief", "type": "number"},
+    {"key": "application_prep_status", "label": "Application Prep Status", "group": "Application Prep", "type": "text"},
+    {"key": "application_prep_generated_at", "label": "Application Prep Generated", "group": "Application Prep", "type": "datetime"},
     {"key": "latest_change_type", "label": "Latest Change", "group": "Changes", "type": "text"},
     {"key": "latest_change_source", "label": "Latest Change Source", "group": "Changes", "type": "text"},
     {"key": "latest_change_at", "label": "Latest Change At", "group": "Changes", "type": "datetime"},
@@ -1804,6 +2200,8 @@ def _serialize_query_row(
     ai_obj = _safe_json_loads(ai_raw)
     refs = _job_reference_map(j)
     latest = changes[0] if changes else None
+    fit_brief = _serialize_fit_brief(j)
+    application_prep = _serialize_application_prep(j)
     raw: Dict[str, Any] = {
         "id": j.id,
         "site": j.site or "",
@@ -1845,6 +2243,11 @@ def _serialize_query_row(
         "ai_experience_match": j.ai_experience_match or "",
         "ai_location_policy_match": j.ai_location_policy_match or "",
         "ai_analyzed_at": j.ai_analyzed_at,
+        "fit_brief_generated_at": getattr(getattr(j, "fit_brief", None), "generated_at", None),
+        "fit_brief_status": fit_brief.get("status", ""),
+        "fit_brief_resume_bullet_count": fit_brief.get("resume_bullet_count", 0),
+        "application_prep_status": application_prep.get("status", ""),
+        "application_prep_generated_at": getattr(getattr(j, "application_prep", None), "generated_at", None),
         "latest_change_type": getattr(latest, "change_type", "") if latest else "",
         "latest_change_source": (getattr(latest, "change_source", None) or "site") if latest else "",
         "latest_change_at": getattr(latest, "created_at", None) if latest else None,
@@ -1893,22 +2296,18 @@ def _serialize_query_row(
         "ai_experience_match": j.ai_experience_match or "",
         "ai_location_policy_match": j.ai_location_policy_match or "",
         "ai_analyzed_at": _fmt_dt(j.ai_analyzed_at) or "",
+        "fit_brief_generated_at": fit_brief.get("generated_at", ""),
+        "fit_brief_status": fit_brief.get("status", ""),
+        "fit_brief_resume_bullet_count": fit_brief.get("resume_bullet_count", 0),
+        "application_prep_status": application_prep.get("status", ""),
+        "application_prep_generated_at": application_prep.get("generated_at", ""),
         "ai_raw": ai_raw if not ai_obj else "",
         "ai_json": ai_obj or "",
         "latest_change_type": getattr(latest, "change_type", "") if latest else "",
         "latest_change_source": (getattr(latest, "change_source", None) or "site") if latest else "",
         "latest_change_at": _fmt_dt(getattr(latest, "created_at", None)) if latest else "",
         "latest_changed_fields": getattr(latest, "changed_fields", "") if latest else "",
-        "changes_json": [
-            {
-                "id": c.id,
-                "change_type": getattr(c, "change_type", None),
-                "change_source": getattr(c, "change_source", None) or "site",
-                "created_at": _fmt_dt(getattr(c, "created_at", None)),
-                "changed_fields": getattr(c, "changed_fields", None),
-            }
-            for c in changes
-        ],
+        "changes_json": [_serialize_change(c) for c in changes],
     }
     for label, value in refs.items():
         row[f"reference.{label}"] = value
@@ -2507,7 +2906,7 @@ def steps_page():
 @app.route("/api/swipe/jobs")
 def swipe_jobs_api():
     try:
-        return jsonify(fetch_swipe_jobs())
+        return jsonify(fetch_swipe_jobs(request.args.get("q", "")))
     except Exception as exc:
         return jsonify(error=str(exc)), 500
 
@@ -2517,14 +2916,23 @@ def swipe_api():
     data = request.get_json(silent=True) or {}
     job = data.get("job") or {}
     action = str(data.get("action") or "").strip().lower()
-    if action not in {"like", "dislike"}:
-        return jsonify(error="action must be like or dislike"), 400
+    if action not in {"like", "dislike", "interesting"}:
+        return jsonify(error="action must be like, dislike, or interesting"), 400
     try:
-        if not record_swipe(job, action):
+        result = record_swipe(job, action)
+        if not result.get("success"):
             return jsonify(error="job not found in database"), 404
-        return jsonify(success=True)
+        return jsonify(result)
     except Exception as exc:
         return jsonify(error=str(exc)), 500
+
+
+@app.route("/api/interesting/jobs")
+def api_interesting_jobs():
+    try:
+        return jsonify(fetch_interesting_jobs())
+    except Exception as exc:
+        return jsonify(error=str(exc), jobs=[]), 500
 
 
 @app.route("/api/steps")
@@ -2709,6 +3117,34 @@ def api_job_detail():
     except Exception:
         job_pk = 0
     return jsonify(fetch_job_detail_by_id(job_pk))
+
+
+@app.route("/api/application-prep/jobs")
+def api_application_prep_jobs():
+    try:
+        return jsonify(fetch_application_prep_deck())
+    except Exception as exc:
+        return jsonify(error=str(exc), jobs=[]), 500
+
+
+@app.route("/api/application-prep/jobs/<int:job_pk>")
+def api_application_prep_job(job_pk: int):
+    try:
+        return jsonify(fetch_job_detail_by_id(job_pk))
+    except Exception as exc:
+        return jsonify(error=str(exc)), 500
+
+
+@app.route("/api/application-prep/jobs/<int:job_pk>/queue", methods=["POST"])
+def api_application_prep_queue(job_pk: int):
+    try:
+        result = queue_application_prep_for_job(job_pk, force=True)
+        if not result.get("found"):
+            return jsonify(error="job not found in database"), 404
+        _start_application_prep_worker()
+        return jsonify(result)
+    except Exception as exc:
+        return jsonify(error=str(exc)), 500
 
 
 @app.route("/api/discovery/suggestions")
