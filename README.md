@@ -416,6 +416,7 @@ Report presets are stored in the dashboard-owned `dashboard_query_reports` table
 #### Job lookup and swipe review
 
 - Job lookup searches by natural job ID or keyword and displays both `jobs.job_id` and the database primary key `jobs.id` for cross-referencing.
+- Each resolved job has a shareable read-only detail page at `/job/<site>/<job-id>`. The route uses the natural job ID together with its site because a natural ID can appear on more than one site.
 - Additional extracted fields are stored in `jobs.reference_fields` and shown in job details.
 - The swipe review page is available at `http://<orange-pi-ip>:5000/swipe` and records reviews in the dashboard-owned `job_swipes` table.
 - The Application Prep deck is available in the dashboard and shows move-forward jobs with `queued`, `running`, `done`, `failed`, or `stale` processing status. The deck polls while queued or running jobs exist.

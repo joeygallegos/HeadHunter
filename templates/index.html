@@ -4,7 +4,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width,initial-scale=1" />
-    <title>{% if initial_view == 'jobs' %}Query Builder | {% endif %}Jobs Dashboard</title>
+    <title>{{ page_title or ('Query Builder | Jobs Dashboard' if initial_view == 'jobs' else 'Jobs Dashboard') }}</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
@@ -31,11 +31,11 @@
                   class="dashboard-tab px-3 py-2 rounded-lg border border-slate-200 text-sm">
             Query Builder
           </a>
-          <button @click="view='lookup'"
+          <a href="/?view=lookup"
                   :class="view==='lookup' ? 'bg-indigo-600 text-white' : 'bg-white text-slate-700'"
                   class="dashboard-tab px-3 py-2 rounded-lg border border-slate-200 text-sm">
             Job lookup
-          </button>
+          </a>
           <button @click="view='applicationPrep'; loadApplicationPrep()"
                   :class="view==='applicationPrep' ? 'bg-indigo-600 text-white' : 'bg-white text-slate-700'"
                   class="dashboard-tab px-3 py-2 rounded-lg border border-slate-200 text-sm">
@@ -672,6 +672,14 @@
       <template x-if="view==='lookup'">
         <div class="space-y-4">
 
+          {% if job_detail_page %}
+          <a href="/?view=lookup"
+             class="inline-flex items-center text-sm font-medium text-indigo-700 hover:underline">
+            ← Back to Job Lookup
+          </a>
+          {% endif %}
+
+          {% if not job_detail_page %}
           <section class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4">
             <form class="flex flex-col md:flex-row md:items-center gap-3" @submit.prevent="lookupJob()">
               <label class="text-sm font-medium text-slate-700" for="jobLookup">Job ID or keyword:</label>
@@ -684,8 +692,10 @@
               <div class="text-sm text-slate-500" x-show="lookupLoading">Searching...</div>
             </form>
           </section>
+          {% endif %}
 
-          <section class="grid grid-cols-1 lg:grid-cols-4 gap-4" x-show="lookupLoaded">
+          <section class="{% if job_detail_page %}block{% else %}grid grid-cols-1 lg:grid-cols-4{% endif %} gap-4" x-show="lookupLoaded">
+            {% if not job_detail_page %}
             <div class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4 lg:col-span-1">
               <div class="flex items-center justify-between">
                 <h2 class="text-sm font-semibold text-slate-800">Matches</h2>
@@ -709,9 +719,10 @@
                 No jobs found.
               </div>
             </div>
+            {% endif %}
 
             <template x-if="selectedJob()">
-            <div class="space-y-4 lg:col-span-3">
+            <div class="space-y-4 {% if not job_detail_page %}lg:col-span-3{% endif %}">
               <section class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4">
                 <div class="flex flex-col md:flex-row md:items-start gap-3 md:justify-between">
                   <div>
@@ -724,11 +735,18 @@
                             x-text="selectedJob().is_active ? 'Active' : 'Inactive'"></span>
                     </div>
                   </div>
-                  <a class="inline-flex items-center justify-center px-3 py-2 rounded-lg bg-slate-900 text-white text-sm hover:bg-slate-800"
-                     :href="selectedJob().url || '#'" target="_blank" rel="noreferrer"
-                     x-show="selectedJob().url">
-                    Open posting
-                  </a>
+                  <div class="flex flex-wrap gap-2">
+                    <a class="inline-flex items-center justify-center px-3 py-2 rounded-lg border border-slate-300 bg-white text-sm text-slate-700 hover:bg-slate-50"
+                       :href="jobDetailUrl(selectedJob())"
+                       x-show="!jobDetailPage">
+                      Open job page
+                    </a>
+                    <a class="inline-flex items-center justify-center px-3 py-2 rounded-lg bg-slate-900 text-white text-sm hover:bg-slate-800"
+                       :href="selectedJob().url || '#'" target="_blank" rel="noreferrer"
+                       x-show="selectedJob().url">
+                      Open posting
+                    </a>
+                  </div>
                 </div>
 
                 <dl class="mt-4 grid grid-cols-1 md:grid-cols-3 gap-3 text-sm">
@@ -767,6 +785,68 @@
                      x-text="selectedJob().desc || 'No description stored.'"></pre>
               </section>
 
+              <section class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4">
+                <div class="flex items-center justify-between gap-3">
+                  <h3 class="text-sm font-semibold text-slate-800">Fit Brief</h3>
+                  <span class="text-xs text-slate-500" x-text="selectedJob().fit_brief?.status || 'not_eligible'"></span>
+                </div>
+                <template x-if="selectedJob().fit_brief?.available && selectedJob().fit_brief?.brief">
+                  <div class="mt-3 space-y-4 text-sm text-slate-800">
+                    <p class="leading-6" x-text="selectedJob().fit_brief.brief.score_explanation || '-'"></p>
+                    <div>
+                      <h4 class="text-xs font-semibold uppercase text-slate-500">Interview angle</h4>
+                      <p class="mt-1 leading-6" x-text="selectedJob().fit_brief.brief.interview_angle || '-'"></p>
+                    </div>
+                    <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+                      <div>
+                        <h4 class="text-xs font-semibold uppercase text-slate-500">Strongest matches</h4>
+                        <ul class="mt-1 list-disc pl-5 space-y-1">
+                          <template x-for="item in (selectedJob().fit_brief.brief.strongest_matches || [])" :key="item">
+                            <li x-text="item"></li>
+                          </template>
+                        </ul>
+                      </div>
+                      <div>
+                        <h4 class="text-xs font-semibold uppercase text-slate-500">Gaps</h4>
+                        <ul class="mt-1 list-disc pl-5 space-y-1">
+                          <template x-for="item in (selectedJob().fit_brief.brief.concerns_or_gaps || [])" :key="item">
+                            <li x-text="item"></li>
+                          </template>
+                        </ul>
+                      </div>
+                      <div>
+                        <h4 class="text-xs font-semibold uppercase text-slate-500">Risk flags</h4>
+                        <ul class="mt-1 list-disc pl-5 space-y-1">
+                          <template x-for="item in (selectedJob().fit_brief.brief.risk_flags || [])" :key="item">
+                            <li x-text="item"></li>
+                          </template>
+                        </ul>
+                      </div>
+                    </div>
+                    <div>
+                      <h4 class="text-xs font-semibold uppercase text-slate-500">Mapped resume bullets</h4>
+                      <div class="mt-2 space-y-3">
+                        <template x-for="match in (selectedJob().fit_brief.brief.resume_bullet_matches || [])" :key="match.resume_bullet + match.job_requirement">
+                          <div class="rounded-lg border border-slate-200 bg-slate-50 p-3">
+                            <p class="font-medium text-slate-900" x-text="match.resume_bullet"></p>
+                            <p class="mt-1 text-slate-700" x-text="match.job_requirement"></p>
+                            <p class="mt-1 text-xs text-slate-500" x-text="`${match.confidence || 'medium'} confidence - ${match.why_it_matters || ''}`"></p>
+                          </div>
+                        </template>
+                        <p class="text-sm text-slate-500" x-show="!(selectedJob().fit_brief.brief.resume_bullet_matches || []).length">
+                          No strong resume bullet mapping was generated.
+                        </p>
+                      </div>
+                    </div>
+                    <p class="text-xs text-slate-500" x-text="`Generated: ${selectedJob().fit_brief.generated_at || '-'}`"></p>
+                  </div>
+                </template>
+                <template x-if="!(selectedJob().fit_brief?.available && selectedJob().fit_brief?.brief)">
+                  <p class="mt-3 text-sm text-slate-500"
+                     x-text="selectedJob().fit_brief?.eligible ? 'Eligible for a Fit Brief, but one has not been generated yet.' : 'This job is not eligible for a Fit Brief.'"></p>
+                </template>
+              </section>
+
               <section class="grid grid-cols-1 xl:grid-cols-2 gap-4">
                 <div class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4">
                   <h3 class="text-sm font-semibold text-slate-800">AI analysis</h3>
@@ -780,70 +860,6 @@
                   </template>
                 </div>
 
-                <div class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4">
-                  <div class="flex items-center justify-between gap-3">
-                    <h3 class="text-sm font-semibold text-slate-800">Fit Brief</h3>
-                    <span class="text-xs text-slate-500" x-text="selectedJob().fit_brief?.status || 'not_eligible'"></span>
-                  </div>
-                  <template x-if="selectedJob().fit_brief?.available && selectedJob().fit_brief?.brief">
-                    <div class="mt-3 space-y-4 text-sm text-slate-800">
-                      <p class="leading-6" x-text="selectedJob().fit_brief.brief.score_explanation || '-'"></p>
-                      <div>
-                        <h4 class="text-xs font-semibold uppercase text-slate-500">Interview angle</h4>
-                        <p class="mt-1 leading-6" x-text="selectedJob().fit_brief.brief.interview_angle || '-'"></p>
-                      </div>
-                      <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
-                        <div>
-                          <h4 class="text-xs font-semibold uppercase text-slate-500">Strongest matches</h4>
-                          <ul class="mt-1 list-disc pl-5 space-y-1">
-                            <template x-for="item in (selectedJob().fit_brief.brief.strongest_matches || [])" :key="item">
-                              <li x-text="item"></li>
-                            </template>
-                          </ul>
-                        </div>
-                        <div>
-                          <h4 class="text-xs font-semibold uppercase text-slate-500">Gaps</h4>
-                          <ul class="mt-1 list-disc pl-5 space-y-1">
-                            <template x-for="item in (selectedJob().fit_brief.brief.concerns_or_gaps || [])" :key="item">
-                              <li x-text="item"></li>
-                            </template>
-                          </ul>
-                        </div>
-                        <div>
-                          <h4 class="text-xs font-semibold uppercase text-slate-500">Risk flags</h4>
-                          <ul class="mt-1 list-disc pl-5 space-y-1">
-                            <template x-for="item in (selectedJob().fit_brief.brief.risk_flags || [])" :key="item">
-                              <li x-text="item"></li>
-                            </template>
-                          </ul>
-                        </div>
-                      </div>
-                      <div>
-                        <h4 class="text-xs font-semibold uppercase text-slate-500">Mapped resume bullets</h4>
-                        <div class="mt-2 space-y-3">
-                          <template x-for="match in (selectedJob().fit_brief.brief.resume_bullet_matches || [])" :key="match.resume_bullet + match.job_requirement">
-                            <div class="rounded-lg border border-slate-200 bg-slate-50 p-3">
-                              <p class="font-medium text-slate-900" x-text="match.resume_bullet"></p>
-                              <p class="mt-1 text-slate-700" x-text="match.job_requirement"></p>
-                              <p class="mt-1 text-xs text-slate-500" x-text="`${match.confidence || 'medium'} confidence - ${match.why_it_matters || ''}`"></p>
-                            </div>
-                          </template>
-                          <p class="text-sm text-slate-500" x-show="!(selectedJob().fit_brief.brief.resume_bullet_matches || []).length">
-                            No strong resume bullet mapping was generated.
-                          </p>
-                        </div>
-                      </div>
-                      <p class="text-xs text-slate-500" x-text="`Generated: ${selectedJob().fit_brief.generated_at || '-'}`"></p>
-                    </div>
-                  </template>
-                  <template x-if="!(selectedJob().fit_brief?.available && selectedJob().fit_brief?.brief)">
-                    <p class="mt-3 text-sm text-slate-500"
-                       x-text="selectedJob().fit_brief?.eligible ? 'Eligible for a Fit Brief, but one has not been generated yet.' : 'This job is not eligible for a Fit Brief.'"></p>
-                  </template>
-                </div>
-              </section>
-
-              <section class="grid grid-cols-1 xl:grid-cols-2 gap-4">
                 <div class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4">
                   <h3 class="text-sm font-semibold text-slate-800">Metadata</h3>
                   <dl class="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-3 text-sm">
@@ -1459,6 +1475,9 @@
         return {
           // Flask supplies the page's initial view so /report can be bookmarked.
           view: {{ initial_view|tojson }},
+          // Dedicated job pages preload one exact job, avoiding a second browser request.
+          jobDetailPage: {{ job_detail_page|tojson }},
+          initialJob: {{ initial_job|tojson }},
 
           // Runs state
           days: 30,
@@ -2733,6 +2752,14 @@
             this.lookupLoading = false;
           },
 
+          // Build the canonical natural-ID URL for the currently selected job.
+          jobDetailUrl(job) {
+            const site = String(job?.site || '').trim();
+            const jobId = String(job?.job_id || '').trim();
+            if (!site || !jobId) return '#';
+            return `/job/${encodeURIComponent(site)}/${encodeURIComponent(jobId)}`;
+          },
+
           // Resolve the currently highlighted lookup row into the detail object shown on the right.
           selectedJob() {
             return (this.lookupResults || []).find(j => j.id === this.selectedJobId) || null;
@@ -3033,6 +3060,11 @@
               // Query metadata must exist before the builder can safely render and sort typed columns.
               await this.loadQueryBuilderMetadata();
               this.loadJobs();
+            } else if (this.view === 'lookup' && this.initialJob) {
+              // The server already verified the standalone URL's site/job-ID pair.
+              this.lookupResults = [this.initialJob];
+              this.selectedJobId = this.initialJob.id;
+              this.lookupLoaded = true;
             }
             this.discoveryPoller = setInterval(() => {
               // Only poll while the discovery tab is visible and auto-refresh is still enabled.

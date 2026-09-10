@@ -21,7 +21,7 @@ from decimal import Decimal
 import math
 from typing import Any, Dict, List, Optional
 
-from flask import Flask, Response, jsonify, render_template, request
+from flask import Flask, Response, abort, jsonify, render_template, request
 from sqlalchemy import (
     and_,
     Column,
@@ -2872,6 +2872,43 @@ def fetch_job_detail_by_id(job_pk: int) -> Dict[str, Any]:
         return {"id": job_pk, "found": True, "job": _serialize_job_detail(job, changes)}
 
 
+def fetch_job_detail_by_identity(site: str, job_id: str) -> Dict[str, Any]:
+    """Return one job detail using the natural ID plus site identity pair."""
+    site = (site or "").strip()
+    job_id = (job_id or "").strip()
+    if not site or not job_id:
+        return {"site": site, "job_id": job_id, "found": False, "job": None}
+
+    _ensure_reference_fields_column()
+    with SessionLocal() as session:
+        job = session.execute(
+            select(Job)
+            .where(Job.site == site)
+            .where(Job.job_id == job_id)
+            .limit(1)
+        ).scalar_one_or_none()
+        if job is None:
+            return {"site": site, "job_id": job_id, "found": False, "job": None}
+
+        changes = (
+            session.execute(
+                select(JobChange)
+                .where(JobChange.job_id_text == job.job_id)
+                .where(JobChange.site == job.site)
+                .order_by(JobChange.created_at.desc(), JobChange.id.desc())
+                .limit(100)
+            )
+            .scalars()
+            .all()
+        )
+        return {
+            "site": site,
+            "job_id": job_id,
+            "found": True,
+            "job": _serialize_job_detail(job, changes),
+        }
+
+
 # ----------------------------------------------------------------------
 # Flask app + templates
 # ----------------------------------------------------------------------
@@ -2887,14 +2924,43 @@ app = Flask(__name__)
 # ----------------------------------------------------------------------
 @app.route("/")
 def index():
-    # The main dashboard always opens on its integration-runs overview.
-    return render_template("index.html", initial_view="runs")
+    # Job Lookup is addressable for the standalone detail page's return link.
+    initial_view = "lookup" if request.args.get("view") == "lookup" else "runs"
+    return render_template(
+        "index.html",
+        initial_view=initial_view,
+        job_detail_page=False,
+        initial_job=None,
+    )
 
 
 @app.route("/report")
 def report_page():
     # Query Builder has a stable URL so reports can be opened directly.
-    return render_template("index.html", initial_view="jobs")
+    return render_template(
+        "index.html",
+        initial_view="jobs",
+        job_detail_page=False,
+        initial_job=None,
+    )
+
+
+@app.route("/job/<site>/<path:job_id>")
+def job_detail_page(site: str, job_id: str):
+    # A natural job ID is only unique within one site, so both path values are required.
+    result = fetch_job_detail_by_identity(site, job_id)
+    if not result.get("found"):
+        abort(404)
+
+    job = result["job"]
+    page_label = job.get("title") or job.get("job_id") or "Job detail"
+    return render_template(
+        "index.html",
+        initial_view="lookup",
+        job_detail_page=True,
+        initial_job=job,
+        page_title=f"{page_label} | Job Detail",
+    )
 
 
 @app.route("/swipe")
