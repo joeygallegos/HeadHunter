@@ -219,6 +219,12 @@ TOKEN_THRESHOLD = int(os.getenv("AI_TOKEN_THRESHOLD", "4096"))
 MAX_JOB_DESC_TOKENS = int(os.getenv("MAX_JOB_DESC_TOKENS", "700"))
 MAX_RESUME_TOKENS = int(os.getenv("MAX_RESUME_TOKENS", "500"))
 OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "2048"))
+# Application Prep combines the resume, a grounded responsibilities inventory,
+# and the full job posting. Give that workflow a larger independent context
+# window without changing regular job-match processing.
+APPLICATION_PREP_NUM_CTX = max(
+    OLLAMA_NUM_CTX, int(os.getenv("APPLICATION_PREP_NUM_CTX", "65536"))
+)
 OLLAMA_NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT", "300"))
 AI_THINKING_RETRY_NUM_PREDICT = max(
     OLLAMA_NUM_PREDICT,
@@ -577,6 +583,7 @@ def invoke_ollama_json(
     messages: list,
     num_predict: Optional[int] = None,
     think: Optional[Any] = None,
+    num_ctx: Optional[int] = None,
 ) -> str:
     """Call Ollama directly so socket timeout failures return to the worker."""
     wire_messages = []
@@ -587,6 +594,7 @@ def invoke_ollama_json(
         wire_messages.append({"role": role, "content": str(msg.content)})
 
     effective_num_predict = num_predict or OLLAMA_NUM_PREDICT
+    effective_num_ctx = num_ctx or OLLAMA_NUM_CTX
     payload = {
         "model": OLLAMA_MODEL,
         "messages": wire_messages,
@@ -595,7 +603,7 @@ def invoke_ollama_json(
         "think": OLLAMA_THINK if think is None else think,
         "keep_alive": OLLAMA_KEEP_ALIVE,
         "options": {
-            "num_ctx": OLLAMA_NUM_CTX,
+            "num_ctx": effective_num_ctx,
             "num_predict": effective_num_predict,
             "temperature": 0.2,
         },
@@ -1481,6 +1489,7 @@ def analyze_application_prep_worker(
                 current_msgs,
                 num_predict=current_num_predict,
                 think=APPLICATION_PREP_THINK,
+                num_ctx=APPLICATION_PREP_NUM_CTX,
             )
             took += time.time() - t0
             parsed = parse_json_strict(raw) or {}
@@ -2470,7 +2479,8 @@ def run_application_prep_generation(
         log(
             f"Application Prep jobs={len(tasks)} min_match={minimum_match_percentage} "
             f"inventory={token_budget_label(APPLICATION_PREP_INVENTORY_MAX_TOKENS)} "
-            f"inventory_tokens={inventory_tokens} truncated={inventory_truncated} force={force} "
+            f"inventory_tokens={inventory_tokens} truncated={inventory_truncated} "
+            f"num_ctx={APPLICATION_PREP_NUM_CTX} force={force} "
             f"schema_version={APPLICATION_PREP_SCHEMA_VERSION}"
         )
         if not tasks:

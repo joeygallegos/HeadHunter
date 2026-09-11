@@ -1225,7 +1225,7 @@
                           </div>
                         </div>
                         <div class="mt-2 space-y-3">
-                          <template x-for="item in (selectedApplicationPrepJob().application_prep.prep.draft_resume_bullets || [])" :key="item.bullet">
+                          <template x-for="item in sortedApplicationPrepBullets()" :key="item.bullet">
                             <div class="rounded-lg border border-slate-200 bg-slate-50 p-3">
                               <div class="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
                                 <div class="min-w-0">
@@ -1235,7 +1235,9 @@
                                     <span class="font-medium">Why this fits:</span>
                                     <span x-text="item.job_requirement || '-'"></span>
                                   </p>
-                                  <p class="mt-1 text-xs text-slate-500" x-text="`${item.confidence || 'medium'} confidence`"></p>
+                                  <span class="mt-2 inline-flex rounded px-2 py-0.5 text-xs font-medium"
+                                        :class="item.confidence === 'high' ? 'bg-green-100 text-green-800' : (item.confidence === 'low' ? 'bg-amber-100 text-amber-800' : 'bg-slate-100 text-slate-700')"
+                                        x-text="`${item.confidence || 'medium'} confidence`"></span>
                                 </div>
                                 <button type="button"
                                         @click="copyApplicationPrepBullet(item.bullet)"
@@ -2985,6 +2987,15 @@
 
           selectedApplicationPrepJob() {
             return (this.applicationPrepJobs || []).find(job => job.id === this.selectedApplicationPrepJobId) || null;
+          },
+
+          sortedApplicationPrepBullets() {
+            const bullets = this.selectedApplicationPrepJob()?.application_prep?.prep?.draft_resume_bullets || [];
+            const rank = {high: 0, medium: 1, low: 2};
+            // Preserve the model's order when two bullets have the same confidence.
+            return bullets.map((item, index) => ({item, index}))
+              .sort((a, b) => (rank[String(a.item?.confidence || 'medium').toLowerCase()] ?? 1) - (rank[String(b.item?.confidence || 'medium').toLowerCase()] ?? 1) || a.index - b.index)
+              .map(entry => entry.item);
           },
 
           applicationPrepHasActive() {
