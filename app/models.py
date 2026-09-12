@@ -140,6 +140,12 @@ class Job(Base):
         uselist=False,
         cascade="all, delete-orphan",
     )
+    resume_variants = relationship(
+        "JobResumeVariant",
+        primaryjoin=lambda: Job.id == foreign(JobResumeVariant.job_pk),
+        back_populates="job",
+        cascade="all, delete-orphan",
+    )
 
 
 class JobSwipe(Base):
@@ -262,6 +268,77 @@ class ResponsibilitiesInventory(Base):
     content_hash = Column(String(64), nullable=False, default="")
     updated_at = Column(
         DateTime(timezone=False), nullable=False, default=utc_now_naive, onupdate=utc_now_naive
+    )
+
+
+class ResumeSourceSettings(Base):
+    """Per-host resume source used by the future resume variant workflow."""
+
+    __tablename__ = "resume_source_settings"
+    __table_args__ = (
+        UniqueConstraint("host_id", name="uq_resume_source_settings_host_id"),
+        {"mysql_charset": "utf8mb4", "mysql_collate": "utf8mb4_unicode_ci"},
+    )
+
+    id = Column(Integer, primary_key=True)
+    host_id = Column(String(255), nullable=False)
+    # resume_txt is review-only; google_doc is required before apply/export.
+    source_mode = Column(String(32), nullable=False, default="resume_txt")
+    google_document_id = Column(String(255), nullable=True)
+    google_document_name = Column(String(512), nullable=True)
+    google_document_url = Column(String(1024), nullable=True)
+    google_folder_id = Column(String(255), nullable=True)
+    baseline_revision = Column(String(255), nullable=True)
+    baseline_hash = Column(String(64), nullable=True)
+    baseline_snapshot_json = Column(LONGTEXT().with_variant(Text, "sqlite"), nullable=True)
+    last_synced_at = Column(DateTime(timezone=False), nullable=True)
+    updated_at = Column(
+        DateTime(timezone=False), nullable=False, default=utc_now_naive, onupdate=utc_now_naive
+    )
+
+
+class JobResumeVariant(Base):
+    """A user-reviewed resume bullet swap draft or generated resume artifact."""
+
+    __tablename__ = "job_resume_variants"
+    __table_args__ = {"mysql_charset": "utf8mb4", "mysql_collate": "utf8mb4_unicode_ci"}
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    # Keep the dashboard-owned table creatable for DB users without REFERENCES
+    # privilege; the app still joins it to jobs.id.
+    job_pk = Column(Integer, nullable=False, index=True)
+    host_id = Column(String(255), nullable=False, default="")
+    status = Column(String(16), nullable=False, default="draft")
+    stage = Column(String(32), nullable=False, default="analysis")
+    error_text = Column(Text, nullable=True)
+    source_mode = Column(String(32), nullable=False, default="resume_txt")
+    baseline_document_id = Column(String(255), nullable=True)
+    baseline_document_name = Column(String(512), nullable=True)
+    baseline_document_url = Column(String(1024), nullable=True)
+    baseline_folder_id = Column(String(255), nullable=True)
+    baseline_revision = Column(String(255), nullable=True)
+    baseline_hash = Column(String(64), nullable=True)
+    baseline_snapshot_json = Column(LONGTEXT().with_variant(Text, "sqlite"), nullable=True)
+    application_prep_hash = Column(String(64), nullable=True)
+    analysis_json = Column(LONGTEXT().with_variant(Text, "sqlite"), nullable=True)
+    replacements_json = Column(LONGTEXT().with_variant(Text, "sqlite"), nullable=True)
+    copied_document_id = Column(String(255), nullable=True)
+    copied_document_url = Column(String(1024), nullable=True)
+    pdf_relative_path = Column(String(1024), nullable=True)
+    pdf_sha256 = Column(String(64), nullable=True)
+    baseline_page_count = Column(Integer, nullable=True)
+    pdf_page_count = Column(Integer, nullable=True)
+    page_count_warning = Column(Boolean, nullable=False, default=False, server_default="0")
+    created_at = Column(DateTime(timezone=False), nullable=False, default=utc_now_naive)
+    updated_at = Column(
+        DateTime(timezone=False), nullable=False, default=utc_now_naive, onupdate=utc_now_naive
+    )
+    generated_at = Column(DateTime(timezone=False), nullable=True)
+
+    job = relationship(
+        "Job",
+        primaryjoin=lambda: foreign(JobResumeVariant.job_pk) == Job.id,
+        back_populates="resume_variants",
     )
 
 
@@ -392,6 +469,73 @@ def ensure_responsibilities_inventory_table(bind=None) -> None:
     Base.metadata.tables["responsibilities_inventory"].create(bind=target, checkfirst=True)
 
 
+def ensure_resume_source_settings_table(bind=None) -> None:
+    """Create and lightly repair per-host resume source settings."""
+    target = bind or engine
+    Base.metadata.tables["resume_source_settings"].create(bind=target, checkfirst=True)
+    inspector = sa_inspect(target)
+    columns = {col["name"] for col in inspector.get_columns("resume_source_settings")}
+    text_type = "LONGTEXT" if target.dialect.name == "mysql" else "TEXT"
+    definitions = {
+        "host_id": "VARCHAR(255) NOT NULL DEFAULT ''",
+        "source_mode": "VARCHAR(32) NOT NULL DEFAULT 'resume_txt'",
+        "google_document_id": "VARCHAR(255)",
+        "google_document_name": "VARCHAR(512)",
+        "google_document_url": "VARCHAR(1024)",
+        "google_folder_id": "VARCHAR(255)",
+        "baseline_revision": "VARCHAR(255)",
+        "baseline_hash": "VARCHAR(64)",
+        "baseline_snapshot_json": text_type,
+        "last_synced_at": "DATETIME",
+        "updated_at": "DATETIME",
+    }
+    with target.begin() as conn:
+        for name, column_type in definitions.items():
+            if name not in columns:
+                conn.execute(text(f"ALTER TABLE resume_source_settings ADD COLUMN {name} {column_type}"))
+
+
+def ensure_job_resume_variants_table(bind=None) -> None:
+    """Create and lightly repair resume variant draft/artifact records."""
+    target = bind or engine
+    Base.metadata.tables["job_resume_variants"].create(bind=target, checkfirst=True)
+    inspector = sa_inspect(target)
+    columns = {col["name"] for col in inspector.get_columns("job_resume_variants")}
+    text_type = "LONGTEXT" if target.dialect.name == "mysql" else "TEXT"
+    definitions = {
+        "job_pk": "INTEGER NOT NULL",
+        "host_id": "VARCHAR(255) NOT NULL DEFAULT ''",
+        "status": "VARCHAR(16) NOT NULL DEFAULT 'draft'",
+        "stage": "VARCHAR(32) NOT NULL DEFAULT 'analysis'",
+        "error_text": text_type,
+        "source_mode": "VARCHAR(32) NOT NULL DEFAULT 'resume_txt'",
+        "baseline_document_id": "VARCHAR(255)",
+        "baseline_document_name": "VARCHAR(512)",
+        "baseline_document_url": "VARCHAR(1024)",
+        "baseline_folder_id": "VARCHAR(255)",
+        "baseline_revision": "VARCHAR(255)",
+        "baseline_hash": "VARCHAR(64)",
+        "baseline_snapshot_json": text_type,
+        "application_prep_hash": "VARCHAR(64)",
+        "analysis_json": text_type,
+        "replacements_json": text_type,
+        "copied_document_id": "VARCHAR(255)",
+        "copied_document_url": "VARCHAR(1024)",
+        "pdf_relative_path": "VARCHAR(1024)",
+        "pdf_sha256": "VARCHAR(64)",
+        "baseline_page_count": "INTEGER",
+        "pdf_page_count": "INTEGER",
+        "page_count_warning": "BOOLEAN NOT NULL DEFAULT 0",
+        "created_at": "DATETIME",
+        "updated_at": "DATETIME",
+        "generated_at": "DATETIME",
+    }
+    with target.begin() as conn:
+        for name, column_type in definitions.items():
+            if name not in columns:
+                conn.execute(text(f"ALTER TABLE job_resume_variants ADD COLUMN {name} {column_type}"))
+
+
 def init_db() -> None:
     """Create tables and apply the small additive runtime schema updates."""
     Base.metadata.create_all(bind=engine)
@@ -402,3 +546,5 @@ def init_db() -> None:
     ensure_job_application_preps_table(engine)
     ensure_application_prep_settings_table(engine)
     ensure_responsibilities_inventory_table(engine)
+    ensure_resume_source_settings_table(engine)
+    ensure_job_resume_variants_table(engine)

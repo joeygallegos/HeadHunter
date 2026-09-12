@@ -16,19 +16,22 @@ that job's application. This plan does not automate submission to a job board.
 
 - Application Prep creates grounded draft bullets for jobs moved forward from
   Swipe, using `resume.txt` and the optional responsibilities inventory.
-- The Application Prep UI currently presents the drafts for manual copying.
-- The app does not connect to Google, create document copies, edit resumes,
-  export PDFs, or persist generated resume files.
-- The future Google Doc baseline and current `resume.txt` are separate sources.
-  Before swap recommendations are trusted, the app must verify that they are
-  the same resume revision or make the synced Google Doc snapshot the canonical
-  Application Prep source.
+- The Application Prep UI now uses a resume bullet swap workflow instead of
+  presenting draft bullets for manual copying.
+- The app connects to Google with a local service account for read-only
+  baseline sync, keeps the baseline Google Doc unchanged, and renders generated
+  PDFs locally.
+- The synced Google Doc snapshot is the canonical source for PDF generation.
+  `resume.txt` and the responsibilities inventory still provide prompt evidence
+  for Application Prep.
 - `job_application_preps` represents AI-generation state, not a generated
   resume artifact. Resume variants need their own persisted records.
-- Before building this feature, reconcile the existing Application Prep field
-  contract: the prompt currently requests `source_resume_evidence`, the
-  validator requires `evidence_sources`, and the UI reads
-  `source_resume_evidence`. One canonical schema must be used end to end.
+- The Application Prep draft-bullet contract now uses `evidence_sources` end to
+  end.
+- The local PDF export path is implemented: resume source settings, encrypted
+  service-account storage, Google baseline snapshot sync, swap-analysis
+  validation, approved-pair validation, local PDF generation, saved variants,
+  and guarded download APIs exist without any Google document mutation.
 
 ## Product Principles
 
@@ -41,51 +44,54 @@ that job's application. This plan does not automate submission to a job board.
    replacement and the baseline bullet it supersedes.
 5. Do not turn inventory-only evidence into a resume claim without review.
 6. Keep an auditable record of the baseline version, approved replacements,
-   copied Google Doc, and exported PDF.
+   and locally rendered PDF.
 7. Treat a baseline change as a reason to review or regenerate a variant, not
    as permission to silently overwrite it.
 
 ## User Flow
 
-1. The user opens Application Prep and connects their Google account.
-2. The user selects one Google Docs baseline resume. The app reads and
+1. The user opens Settings and pastes a Google service-account JSON key.
+2. The user shares the baseline Google Docs resume with the displayed service
+   account email.
+3. The user selects one Google Docs baseline resume by document ID. The app reads and
    snapshots its editable body bullets.
-3. For a selected job, the app compares each existing baseline bullet with the
+4. For a selected job, the app compares each existing baseline bullet with the
    job description and identifies a small set of lower-value swap candidates,
    explaining weaker job alignment or redundant signal.
-4. For each candidate, the app proposes a grounded replacement draft with its
+5. For each candidate, the app proposes a grounded replacement draft with its
    source evidence, matching job requirement, and confidence. The page shows
    the original and proposed replacement side by side.
-5. The user clicks **Create tailored resume** and confirms the summary.
-6. The app copies the baseline Doc, applies the approved replacements to the
-   copy, exports it to PDF, and stores the PDF locally.
-7. The Application Prep job card shows the variant status plus **Download PDF**
-   and **Open Google Doc** actions.
+6. The user clicks **Generate PDF** and confirms the summary.
+7. The app applies the approved replacements in memory, renders a local PDF,
+   and stores it locally.
+8. The Application Prep job card shows the variant status plus **Download PDF**.
 
-The minimum viable release supports replacement of existing normal body-list
-bullets only. Adding bullets, editing tables, headers/footers, text boxes, or
-multi-column layouts is explicitly out of scope until the replacement path is
-proven safe.
+The minimum viable release supports replacement of existing synced baseline
+bullets only. The local renderer now preserves ordinary text blocks and simple
+table content such as certifications/awards, but adding jobs, changing person
+details, editing headers/footers, or reproducing complex Google Docs layout
+exactly remains out of scope.
 
 ## Architecture
 
 ### Google integration
 
-Use a server-side Google OAuth flow, configured through environment variables:
+Prefer a service-account setup for the local personal workflow:
 
-- Google OAuth client ID and client secret.
-- Exact authorized callback URL.
-- An application secret for protected local credential storage, if credentials
-  must persist across dashboard restarts.
+- The user creates a Google Cloud service account and downloads its JSON key.
+- The key is pasted into the local Settings page and encrypted under
+  `data/google_resume/`.
+- The UI displays the service account email so the user can share the baseline
+  Google Doc with that email.
+- Sync operates on explicit document IDs rather than broad Drive search.
+- Google Drive cloning/export is deferred because personal Gmail service
+  accounts can hit Drive ownership/quota failures such as
+  `storageQuotaExceeded` when calling `files.copy`.
 
-Request the smallest scopes that support the selected document. Use a picker or
-explicit document selection rather than broad Drive search. Do not commit client
-secrets, refresh tokens, or downloaded Google credential files.
-
-For a user-triggered export, a session-scoped credential is the safer initial
-option. Persist a refresh token only if background regeneration is a product
-requirement, and only after implementing encrypted at-rest storage and a
-disconnect/revoke action.
+OAuth is intentionally not supported for this workflow because Google's
+consent-screen homepage/privacy requirements are too heavy for quick personal
+applications. Do not commit service-account keys or downloaded Google
+credential files.
 
 ### Document operations
 
@@ -100,16 +106,12 @@ disconnect/revoke action.
    that better address a specific job requirement. Do not recommend a swap just
    to maximize keyword overlap or when the proposal is less confident than the
    existing evidence.
-5. At creation time, copy the baseline with Drive.
-6. Re-read the copied document and re-resolve each selected anchor by exact
-   text plus section context. Abort with a useful error if an anchor is absent
-   or ambiguous.
-7. Apply replacements with one Docs `batchUpdate`, in descending document-index
-   order. Delete only the original bullet text and preserve its paragraph
-   newline; then insert the replacement text at the same position.
-8. Export the copied Google Doc as `application/pdf` and write it to the local
+5. At creation time, re-read the baseline and reject generation if its hash no
+   longer matches the synced snapshot.
+6. Apply approved replacements in memory against the synced block snapshot.
+7. Render a local PDF from the resulting blocks and write it to the local
    artifact directory.
-9. Record the successful variant only after the PDF bytes are written and
+8. Record the successful variant only after the PDF bytes are written and
    hashed.
 
 Avoid `replaceAllText`: identical bullets can appear more than once, and global
@@ -139,7 +141,7 @@ job, not poor experience or a poor resume bullet generally.
 Store files outside static assets, under:
 
 ```text
-output/application_resumes/<job-id>/<safe-company>-<safe-title>-<date>.pdf
+output/resume_variants/<safe-company>-<safe-title>-variant-<id>.pdf
 ```
 
 Persist only a workspace-relative path. The download endpoint receives a variant
@@ -160,7 +162,7 @@ Suggested fields:
 | `status`, `error_text` | `draft`, `creating`, `done`, `failed`, or `stale`. |
 | `baseline_document_id` | Selected source Google Doc. |
 | `baseline_version`, `baseline_hash` | Detect source edits before generation/reuse. |
-| `copied_document_id`, `copied_document_url` | Traceable Google Docs copy. |
+| `copied_document_id`, `copied_document_url` | Reserved for a future Drive-copy flow; empty for local rendering. |
 | `replacements_json` | User-approved original-anchor, job-specific value rationale, and replacement mappings. |
 | `application_prep_hash` | Detect drafts that were regenerated after approval. |
 | `pdf_relative_path`, `pdf_sha256` | Local, verified export artifact. |
@@ -184,7 +186,7 @@ Use a compact three-stage flow in the selected job panel:
 ```text
 Job context and baseline status
         |
-1. Match bullet swaps  ->  2. Review changes  ->  3. Create PDF
+1. Match bullet swaps  ->  2. Review changes  ->  3. Generate PDF
 ```
 
 The stage indicator is informative, not a blocking multi-page wizard. The user
@@ -285,16 +287,15 @@ error banner.
 ### Stage 3: Creation and handoff
 
 After confirmation, replace the primary button with a compact visible progress
-sequence: **Copying baseline**, **Applying 3 approved swaps**, **Exporting PDF**,
-and **Saving your resume**. Disable duplicate submission but preserve the
-reviewed pairs in the draft record.
+sequence: **Checking baseline**, **Applying 3 approved swaps**, **Rendering
+PDF**, and **Saving your resume**. Disable duplicate submission but preserve
+the reviewed pairs in the variant record.
 
 On success, show a completion card at the top of the job detail:
 
 - **Tailored resume ready** and the file name.
 - Primary action: **Download PDF**.
-- Secondary action: **Open Google Doc copy**.
-- Tertiary action: **View changes** or **Create another version**.
+- Secondary action: **View changes** or **Create another version**.
 
 State plainly that the PDF is downloaded by the browser and must be attached to
 the employer's application manually. If the application runs on a remote host,
@@ -333,9 +334,14 @@ In Application Prep:
 
 Suggested endpoints:
 
-- `POST /api/resume-source/google/connect`
-- `GET /api/resume-source/google/callback`
+- `GET /api/resume-source/settings`
+- `PUT /api/resume-source/settings`
+- `GET /api/resume-source/google/status`
+- `PUT /api/resume-source/google/config`
+- `POST /api/resume-source/google/disconnect`
+- `POST /api/resume-source/google/select`
 - `POST /api/resume-source/sync`
+- `GET /api/application-prep/jobs/<job_pk>/resume-variants/swap-analysis`
 - `POST /api/application-prep/jobs/<job_pk>/resume-variants`
 - `GET /api/application-prep/jobs/<job_pk>/resume-variants`
 - `GET /api/resume-variants/<variant_id>/download`
@@ -346,22 +352,76 @@ a resume from unseen source changes.
 
 ## Implementation Sequence
 
-1. Repair and test the Application Prep JSON contract. Reconcile `resume.txt`
-   with the Google Doc baseline, and finish the optional responsibilities-
-   inventory work before relying on its evidence in variants.
-2. Add the additive models and migrations for source settings and variants.
-3. Add Google OAuth configuration, connect/disconnect, and baseline document
-   selection/snapshot. Document all configuration in `README.md`.
-4. Implement the conservative bullet parser and anchor resolution, with no
-   writes to Google yet.
-5. Add baseline-bullet relevance evaluation, swap recommendations, and a review
-   UI. Validate that each selected replacement targets one eligible, current
-   baseline bullet and is a job-specific improvement over it.
-6. Implement copy, guarded Docs update, PDF export, secure local write, and
-   variant persistence.
-7. Add Application Prep variant history and download/open actions.
-8. Complete automated and manual verification, then update `README.md` with
-   operation, recovery, privacy, and artifact-location guidance.
+1. Done: repair and test the Application Prep JSON contract.
+2. Done: add additive models, runtime schema helpers, source settings, variant
+   draft APIs, and swap/pair validation contracts.
+3. Done: add localhost-only service-account credential configuration,
+   selected-document sync, encrypted local key storage, disconnect cleanup, and
+   README setup notes.
+4. Done for read-only sync: implement conservative body-list bullet snapshot
+   extraction with document indices, section context, revision metadata, and
+   baseline hash. Write-time anchor re-resolution remains part of export work.
+5. Done for the simple UI: add deterministic baseline-bullet relevance preview,
+   swap recommendations, click-to-pair matching board, review panel, and draft
+   persistence. Draft saves rebuild the current server-side analysis and reject
+   stale browser hashes.
+5.5. Done: replace broad keyword-overlap recommendations with requirement-
+   specific swap scoring that compares each baseline bullet to each grounded
+   replacement's job requirement, accounts for evidence confidence and durable
+   resume signals, omits already-strong baseline bullets, and requires an
+   analysis hash for every draft save.
+6. Done for Phase 4 UI: add the barebones service-account Google baseline setup
+   workflow in Settings, surface baseline readiness on Application Prep,
+   clarify the match-left-to-right swap flow, show saved draft history, and
+   make disabled states explain the missing setup/status requirement.
+7. Done for the local export pivot: verify the synced baseline is current,
+   apply replacements in memory, render PDF bytes locally, write the PDF under
+   `output/resume_variants/`, persist generated variant metadata, and expose a
+   guarded download endpoint.
+8. Done: add Application Prep variant history with download actions.
+9. Done: update `README.md` with operation, recovery, privacy, dependency, and
+   artifact-location guidance.
+10. Stabilization cleanup: remove stale manual-copy UI code, update plan/README
+    wording to match the swap-and-generate flow, keep generated PDFs out of the
+    repo root, and run a targeted syntax/test pass.
+
+## Stabilization Cleanup Tasks
+
+- [x] Update this plan so it reflects the current service-account, local PDF,
+  swap-board workflow instead of the older manual-copy/Drive-copy phases.
+- [x] Remove dead frontend helpers from the old suggested-bullet copy flow.
+- [x] Ensure generated resume PDFs are ignored outside `output/resume_variants/`
+  so UAT artifacts are not accidentally committed.
+- [x] Run a targeted frontend syntax check after cleanup.
+- [x] Run the resume variant/parser regression tests if code cleanup touches
+  generation, parsing, or API paths.
+
+## Application Prep UX/UI Cleanup Plan
+
+Goal: make the page read as a fast, guided application workflow: understand
+the job fit, match resume bullet swaps, review changes, and generate a PDF.
+
+- [x] Combine selected job context, prep readiness, and baseline status into a
+  compact summary area so users do not pass through several operational cards
+  before reaching the swap workflow.
+- [x] Rename vague or stale labels: **Deck** to **Jobs**, **Auto-refreshing** to
+  **Updating statuses**, **Saved drafts** to **Generated PDFs**, and **Load swap
+  board** to **Start resume swap review**.
+- [x] Reduce judgmental wording by replacing broad "lower-value" language with
+  "less targeted for this job" where it appears in user-facing copy.
+- [x] Add a lightweight step indicator for Review fit -> Match swaps -> Review
+  changes -> Generate PDF.
+- [x] Move generated PDF history below the active matching/review workflow so
+  it does not interrupt first-time completion.
+- [x] Improve pairing feedback so selecting one side gives a clear next
+  instruction and completed pairs feel intentional.
+- [x] Keep the planned swaps tray prominent during matching, especially on long
+  boards and small screens.
+- [x] Keep regenerate/re-run actions visually secondary and make their risk
+  clearer when swaps may already exist.
+- [x] Hide operational job/prep metadata behind a compact info disclosure so
+  the selected job pane stays focused on the resume workflow.
+- [x] Re-run the frontend syntax check after each UI cleanup slice.
 
 ## Verification
 
@@ -390,10 +450,9 @@ a resume from unseen source changes.
 - The Google Docs API exposes structured body content, but nonstandard resume
   layouts may use tables or other structures. The first release must detect and
   reject unsupported target bullets rather than risk formatting damage.
-- Google authorization adds secret and token-handling responsibility. A
-  session-only credential avoids persistent token storage but requires a new
-  connection after a restart; persistent credentials require encryption,
-  rotation, and revoke/disconnect behavior.
+- Google service-account keys are sensitive credentials. Keep them encrypted at
+  rest, support disconnect/delete locally, and rotate the key in Google Cloud if
+  it is exposed.
 - A single source bullet can support multiple suggested drafts. The UI must
   prevent two selected replacements from targeting the same baseline bullet.
 - "Low value" is job-specific, not a claim that a bullet is universally weak.
@@ -412,7 +471,6 @@ a resume from unseen source changes.
 
 ## Dependencies
 
-No dependency changes are made by this plan. Implementation will need pinned
-Google API/OAuth client packages, selected only after checking their current
-security posture and adding matching pins to both `requirements.txt` and
+The Google implementation uses pinned `google-api-python-client`, `google-auth`,
+and `cryptography` packages, with pins kept in both `requirements.txt` and
 `pyproject.toml`.

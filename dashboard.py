@@ -21,7 +21,7 @@ from decimal import Decimal
 import math
 from typing import Any, Dict, List, Optional
 
-from flask import Flask, Response, abort, jsonify, render_template, request
+from flask import Flask, Response, abort, jsonify, render_template, request, send_file
 from sqlalchemy import (
     and_,
     Column,
@@ -68,6 +68,8 @@ from app.models import (  # type: ignore
     JobChange,
     JobFitBrief,
     JobApplicationPrep,
+    JobResumeVariant,
+    ResumeSourceSettings,
     SessionLocal,
     IntegrationRun,
     Job,
@@ -78,8 +80,35 @@ from app.models import (  # type: ignore
     ensure_job_application_preps_table,
     ensure_application_prep_settings_table,
     ensure_responsibilities_inventory_table,
+    ensure_job_resume_variants_table,
+    ensure_resume_source_settings_table,
 )
 from app.db import resolve_display_timezone, utc_now_naive
+from app.google_resume import (
+    GoogleResumeClient,
+    GoogleResumeError,
+    GoogleResumeStore,
+    google_config_status,
+    normalize_google_config,
+)
+from app.resume_pdf import render_resume_pdf_bytes
+from app.resume_variants import (
+    RESUME_SOURCE_MODE_GOOGLE_DOC,
+    RESUME_SOURCE_MODE_RESUME_TXT,
+    RESUME_SOURCE_MODES,
+    RESUME_VARIANT_STAGE_MATCHING,
+    RESUME_VARIANT_STAGE_REVIEW,
+    RESUME_VARIANT_STAGE_COMPLETE,
+    RESUME_VARIANT_STATUS_DRAFT,
+    RESUME_VARIANT_STATUS_DONE,
+    RESUME_VARIANT_STATUS_FAILED,
+    serialize_resume_source_settings,
+    serialize_resume_variant,
+    stable_json_hash,
+    validate_approved_pairs,
+    validate_swap_analysis,
+    resume_variant_host_id as default_resume_variant_host_id,
+)
 
 OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 DEFAULT_EVENTS_PATH = os.path.join(OUTPUT_DIR, "job_board_discovery_events.jsonl")
@@ -428,6 +457,8 @@ def _ensure_reference_fields_column() -> None:
         ensure_job_application_preps_table(bind)
         ensure_application_prep_settings_table(bind)
         ensure_responsibilities_inventory_table(bind)
+        ensure_resume_source_settings_table(bind)
+        ensure_job_resume_variants_table(bind)
     _REFERENCE_FIELDS_COLUMN_READY = True
 
 
@@ -908,6 +939,583 @@ def save_application_prep_settings(data: Dict[str, Any]) -> Dict[str, Any]:
         inventory.updated_at = utc_now_naive()
         session.commit()
     return fetch_application_prep_settings()
+
+
+def _resume_variant_host_id() -> str:
+    return (os.getenv("RESUME_VARIANT_HOST_ID") or default_resume_variant_host_id()).strip().lower()
+
+
+def _get_or_create_resume_source_settings(session) -> ResumeSourceSettings:
+    """Use one resume-source row per host so localhost and LAN deployments do not collide."""
+    host_id = _resume_variant_host_id()
+    settings = (
+        session.execute(
+            select(ResumeSourceSettings).where(ResumeSourceSettings.host_id == host_id)
+        )
+        .scalars()
+        .one_or_none()
+    )
+    if settings is None:
+        settings = ResumeSourceSettings(host_id=host_id, source_mode=RESUME_SOURCE_MODE_RESUME_TXT)
+        session.add(settings)
+        session.flush()
+    return settings
+
+
+def _format_resume_source_settings(settings: ResumeSourceSettings) -> Dict[str, Any]:
+    payload = serialize_resume_source_settings(settings)
+    payload["last_synced_at"] = _fmt_dt(payload.get("last_synced_at")) or ""
+    return payload
+
+
+def fetch_resume_source_settings() -> Dict[str, Any]:
+    """Return the current host's baseline resume source settings."""
+    _ensure_reference_fields_column()
+    with SessionLocal() as session:
+        settings = _get_or_create_resume_source_settings(session)
+        session.commit()
+        payload = _format_resume_source_settings(settings)
+    payload["resume_txt_review_only"] = payload["source_mode"] == RESUME_SOURCE_MODE_RESUME_TXT
+    return payload
+
+
+def save_resume_source_settings(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Persist Phase 1 source mode; Google document selection arrives in Phase 2."""
+    mode = str(data.get("source_mode") or RESUME_SOURCE_MODE_RESUME_TXT).strip()
+    if mode not in RESUME_SOURCE_MODES:
+        raise ValueError("source_mode must be resume_txt or google_doc")
+
+    _ensure_reference_fields_column()
+    with SessionLocal() as session:
+        settings = _get_or_create_resume_source_settings(session)
+        settings.source_mode = mode
+        if mode == RESUME_SOURCE_MODE_RESUME_TXT:
+            # resume.txt mode is intentionally review-only and has no editable
+            # Google baseline that can be copied or exported.
+            settings.google_document_id = None
+            settings.google_document_name = None
+            settings.google_document_url = None
+            settings.google_folder_id = None
+            settings.baseline_revision = None
+            settings.baseline_hash = None
+            settings.baseline_snapshot_json = None
+            settings.last_synced_at = None
+        settings.updated_at = utc_now_naive()
+        session.commit()
+        payload = _format_resume_source_settings(settings)
+    payload["resume_txt_review_only"] = payload["source_mode"] == RESUME_SOURCE_MODE_RESUME_TXT
+    return payload
+
+
+def _google_resume_store() -> GoogleResumeStore:
+    return GoogleResumeStore()
+
+
+def _google_resume_client() -> GoogleResumeClient:
+    return GoogleResumeClient(_google_resume_store())
+
+
+def _is_loopback_request() -> bool:
+    raw_host = (request.host or "").strip().lower()
+    if raw_host.startswith("[") and "]" in raw_host:
+        host = raw_host[1 : raw_host.index("]")]
+    else:
+        host = raw_host.split(":", 1)[0]
+    return host in {"localhost", "127.0.0.1", "::1"}
+
+
+def google_resume_status() -> Dict[str, Any]:
+    payload = google_config_status(_google_resume_store())
+    payload["localhost_only"] = True
+    payload["current_request_loopback"] = _is_loopback_request()
+    return payload
+
+
+def save_google_resume_config(data: Dict[str, Any]) -> Dict[str, Any]:
+    if not _is_loopback_request():
+        raise GoogleResumeError("Google resume setup is only available from http://localhost.")
+    config = normalize_google_config(data)
+    store = _google_resume_store()
+    store.clear_config()
+    store.save_config(config)
+    return google_resume_status()
+
+
+def disconnect_google_resume() -> Dict[str, Any]:
+    store = _google_resume_store()
+    store.clear_config()
+    return google_resume_status()
+
+
+def sync_google_resume_source(document_id: str = "") -> Dict[str, Any]:
+    if not _is_loopback_request():
+        raise GoogleResumeError("Google resume sync is only available from http://localhost.")
+    _ensure_reference_fields_column()
+    with SessionLocal() as session:
+        settings = _get_or_create_resume_source_settings(session)
+        selected_document_id = str(document_id or settings.google_document_id or "").strip()
+        session.commit()
+    if not selected_document_id:
+        raise GoogleResumeError("Select a Google Docs baseline before syncing.")
+
+    result = _google_resume_client().document_snapshot(selected_document_id)
+    metadata = result["metadata"]
+    snapshot = result["snapshot"]
+    bullets = snapshot.get("bullets") if isinstance(snapshot.get("bullets"), list) else []
+    if not bullets:
+        raise GoogleResumeError(
+            "The selected Google Doc does not contain ordinary body-list resume bullets."
+        )
+
+    with SessionLocal() as session:
+        settings = _get_or_create_resume_source_settings(session)
+        metadata = result["metadata"]
+        snapshot = result["snapshot"]
+        parents = metadata.get("parents") if isinstance(metadata.get("parents"), list) else []
+        settings.source_mode = RESUME_SOURCE_MODE_GOOGLE_DOC
+        settings.google_document_id = str(metadata.get("id") or selected_document_id)
+        settings.google_document_name = str(metadata.get("name") or snapshot.get("title") or "")
+        settings.google_document_url = str(metadata.get("webViewLink") or "")
+        settings.google_folder_id = str(parents[0]) if parents else ""
+        settings.baseline_revision = str(snapshot.get("revision") or "")
+        settings.baseline_hash = str(snapshot.get("baseline_hash") or "")
+        settings.baseline_snapshot_json = json.dumps(snapshot, ensure_ascii=False, sort_keys=True)
+        settings.last_synced_at = utc_now_naive()
+        settings.updated_at = utc_now_naive()
+        session.commit()
+        payload = _format_resume_source_settings(settings)
+        bullet_count = len(bullets)
+    payload["resume_txt_review_only"] = False
+    payload["baseline_bullet_count"] = bullet_count
+    return payload
+
+
+def _resume_variant_tokens(text_value: str) -> set[str]:
+    stopwords = {
+        "and", "the", "for", "with", "that", "this", "from", "into", "your",
+        "you", "are", "our", "will", "have", "has", "was", "were", "their",
+        "a", "an", "to", "of", "in", "on", "by", "as", "or", "is", "be",
+    }
+    return {
+        token
+        for token in re.findall(r"[a-z0-9][a-z0-9+#.-]{2,}", str(text_value or "").lower())
+        if token not in stopwords
+    }
+
+
+def _resume_variant_signal_score(text_value: str) -> float:
+    """Give durable resume signals a small preservation/selection boost."""
+    text = str(text_value or "").lower()
+    signals = 0.0
+    if re.search(r"(\d|%|\$|x\b)", text):
+        signals += 0.08
+    action_terms = {
+        "built", "led", "owned", "designed", "launched", "reduced", "improved",
+        "automated", "secured", "migrated", "scaled", "implemented", "delivered",
+    }
+    if _resume_variant_tokens(text) & action_terms:
+        signals += 0.05
+    scope_terms = {"enterprise", "production", "cross-functional", "global", "cloud", "security"}
+    if _resume_variant_tokens(text) & scope_terms:
+        signals += 0.04
+    return min(signals, 0.15)
+
+
+def _resume_variant_confidence_score(confidence: str) -> float:
+    return {"high": 0.12, "medium": 0.05, "low": -0.05}.get(str(confidence or "").lower(), 0.0)
+
+
+def _resume_variant_requirement_score(
+    bullet_text: str,
+    requirement_text: str,
+    job_tokens: set[str],
+    *,
+    confidence: str = "",
+    evidence_sources: Optional[List[Dict[str, Any]]] = None,
+) -> float:
+    """Score one bullet against one job requirement, not the whole posting."""
+    bullet_tokens = _resume_variant_tokens(bullet_text)
+    requirement_tokens = _resume_variant_tokens(requirement_text)
+    if not bullet_tokens:
+        return 0.0
+    requirement_overlap = (
+        len(bullet_tokens & requirement_tokens) / max(1, len(requirement_tokens))
+        if requirement_tokens
+        else 0.0
+    )
+    job_overlap = len(bullet_tokens & job_tokens) / max(1, len(bullet_tokens))
+    evidence_bonus = min(len(evidence_sources or []) * 0.03, 0.06)
+    score = (
+        requirement_overlap * 0.55
+        + job_overlap * 0.20
+        + _resume_variant_signal_score(bullet_text)
+        + _resume_variant_confidence_score(confidence)
+        + evidence_bonus
+    )
+    return round(score, 4)
+
+
+def _build_resume_swap_analysis(job: Job, prep_payload: Dict[str, Any], source: ResumeSourceSettings) -> Dict[str, Any]:
+    snapshot = _safe_json_loads(getattr(source, "baseline_snapshot_json", None)) or {}
+    bullets = snapshot.get("bullets") if isinstance(snapshot.get("bullets"), list) else []
+    draft_bullets = prep_payload.get("draft_resume_bullets") if isinstance(prep_payload, dict) else []
+    if not bullets:
+        raise ValueError("Sync a Google Docs baseline with ordinary body-list bullets before matching swaps.")
+    if not isinstance(draft_bullets, list) or not draft_bullets:
+        raise ValueError("Application Prep needs at least one grounded draft bullet before matching swaps.")
+
+    job_tokens = _resume_variant_tokens(" ".join([job.title or "", job.desc or "", job.ai_analysis or ""]))
+    confidence_rank = {"high": 0, "medium": 1, "low": 2}
+    ranked_replacements = []
+    for index, item in enumerate(draft_bullets):
+        if not isinstance(item, dict) or not str(item.get("bullet") or "").strip():
+            continue
+        bullet_text = str(item.get("bullet") or "").strip()
+        requirement = str(item.get("job_requirement") or "").strip()
+        confidence = str(item.get("confidence") or "medium").strip().lower()
+        score = _resume_variant_requirement_score(
+            bullet_text,
+            requirement,
+            job_tokens,
+            confidence=confidence,
+            evidence_sources=item.get("evidence_sources") if isinstance(item.get("evidence_sources"), list) else [],
+        )
+        ranked_replacements.append(
+            (
+                -score,
+                confidence_rank.get(confidence, 1),
+                index,
+                item,
+                score,
+            )
+        )
+    ranked_replacements = sorted(ranked_replacements, key=lambda entry: (entry[0], entry[1], entry[2]))[:4]
+    replacement_candidates = []
+    replacement_scores: Dict[str, float] = {}
+    replacement_requirements: Dict[str, str] = {}
+    for _negative_score, _rank, index, item, score in ranked_replacements:
+        candidate_id = f"draft-{index + 1}"
+        replacement_scores[candidate_id] = score
+        replacement_requirements[candidate_id] = str(item.get("job_requirement") or "").strip()
+        replacement_candidates.append(
+            {
+                "candidate_id": candidate_id,
+                "bullet": str(item.get("bullet") or "").strip(),
+                "evidence_sources": item.get("evidence_sources") or [],
+                "job_requirement": str(item.get("job_requirement") or "").strip(),
+                "confidence": str(item.get("confidence") or "medium").strip().lower(),
+                "value_rationale": "Grounded Application Prep draft that directly supports a requirement from this posting.",
+            }
+        )
+
+    best_replacement_overlap = max(replacement_scores.values(), default=0.0)
+    ranked_baseline = []
+    for index, item in enumerate(bullets):
+        if not isinstance(item, dict) or not str(item.get("bullet") or "").strip():
+            continue
+        bullet_text = str(item.get("bullet") or "").strip()
+        best_candidate_id = ""
+        best_baseline_score = 0.0
+        best_improvement = 0.0
+        for candidate in replacement_candidates:
+            candidate_id = candidate["candidate_id"]
+            baseline_score = _resume_variant_requirement_score(
+                bullet_text,
+                replacement_requirements.get(candidate_id, ""),
+                job_tokens,
+            )
+            improvement = replacement_scores.get(candidate_id, 0.0) - baseline_score
+            if improvement > best_improvement:
+                best_candidate_id = candidate_id
+                best_baseline_score = baseline_score
+                best_improvement = improvement
+        if best_candidate_id and best_improvement >= 0.12 and best_baseline_score < best_replacement_overlap:
+            ranked_baseline.append((-best_improvement, best_baseline_score, index, item, best_candidate_id, best_improvement))
+    ranked_baseline = sorted(ranked_baseline, key=lambda entry: (entry[0], entry[1], entry[2]))[:4]
+
+    baseline_candidates = []
+    baseline_scores: Dict[str, float] = {}
+    baseline_best_candidates: Dict[str, str] = {}
+    for _negative_improvement, baseline_score, _index, item, best_candidate_id, improvement in ranked_baseline:
+        bullet = str(item.get("bullet") or "").strip()
+        anchor_id = str(item.get("anchor_id") or item.get("text_hash") or _stable_text_hash(bullet))[:120]
+        baseline_scores[anchor_id] = baseline_score
+        baseline_best_candidates[anchor_id] = best_candidate_id
+        confidence = "high" if improvement >= 0.35 else ("medium" if improvement >= 0.20 else "low")
+        baseline_candidates.append(
+            {
+                "anchor_id": anchor_id,
+                "bullet": bullet,
+                "section": str(item.get("section") or "")[:200],
+                "value_band": "lower_for_job",
+                "confidence": confidence,
+                "lower_value_rationale": "Less directly aligned to a specific job requirement than a grounded replacement candidate.",
+            }
+        )
+
+    suggested_pairs = []
+    used_candidates: set[str] = set()
+    for left in baseline_candidates:
+        candidate_id = baseline_best_candidates.get(left["anchor_id"], "")
+        if not candidate_id or candidate_id in used_candidates:
+            continue
+        if replacement_scores.get(candidate_id, 0.0) <= baseline_scores.get(left["anchor_id"], 0.0):
+            continue
+        right = next((item for item in replacement_candidates if item["candidate_id"] == candidate_id), None)
+        if not right:
+            continue
+        used_candidates.add(candidate_id)
+        suggested_pairs.append(
+            {
+                "anchor_id": left["anchor_id"],
+                "candidate_id": candidate_id,
+                "comparative_rationale": f"This replacement more directly supports: {right['job_requirement'][:180]}",
+            }
+        )
+
+    analysis = {
+        "baseline_candidates": baseline_candidates,
+        "replacement_candidates": replacement_candidates,
+        "suggested_pairs": suggested_pairs,
+        "coverage_summary": f"{len(suggested_pairs)} possible swap(s) found from the synced baseline and grounded Application Prep bullets.",
+        "remaining_gaps": prep_payload.get("fit_gaps") if isinstance(prep_payload.get("fit_gaps"), list) else [],
+    }
+    ok, why = validate_swap_analysis(analysis)
+    if not ok:
+        raise ValueError(why)
+    return analysis
+
+
+def fetch_resume_swap_analysis(job_pk: int) -> Dict[str, Any]:
+    """Build a deterministic first-pass matching board for the selected job."""
+    _ensure_reference_fields_column()
+    job_pk = _to_int(job_pk)
+    if not job_pk:
+        return {"found": False}
+    with SessionLocal() as session:
+        job = session.get(Job, job_pk)
+        if job is None:
+            return {"found": False}
+        context = _application_prep_context(session)
+        prep = getattr(job, "application_prep", None)
+        if _application_prep_status(job, prep, context) != "done":
+            raise ValueError("Application Prep must be ready before matching resume swaps.")
+        source = _get_or_create_resume_source_settings(session)
+        if source.source_mode != RESUME_SOURCE_MODE_GOOGLE_DOC or not source.baseline_hash:
+            raise ValueError("Sync a Google Docs baseline before matching resume swaps.")
+        prep_payload = _safe_json_loads(getattr(prep, "prep_json", None)) or {}
+        analysis = _build_resume_swap_analysis(job, prep_payload, source)
+        return {
+            "found": True,
+            "job_pk": job_pk,
+            "analysis": analysis,
+            "analysis_hash": stable_json_hash(analysis),
+            "resume_source": _format_resume_source_settings(source),
+            "application_prep_hash": stable_json_hash(prep_payload),
+        }
+
+
+def _format_resume_variant(variant: JobResumeVariant) -> Dict[str, Any]:
+    payload = serialize_resume_variant(variant)
+    for key in ("created_at", "updated_at", "generated_at"):
+        payload[key] = _fmt_dt(payload.get(key)) or ""
+    return payload
+
+
+def _resume_variant_slug(value: str, default: str = "resume") -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", str(value or "").lower()).strip("-")
+    return (slug or default)[:80]
+
+
+def _resume_variant_pdf_relative_path(job_pk: int, variant_id: int, site_value: str, title_value: str) -> str:
+    title = _resume_variant_slug(title_value or "job")
+    site = _resume_variant_slug(site_value or "site")
+    return os.path.join(
+        "resume_variants",
+        f"job_{int(job_pk)}",
+        f"{site}-{title}-variant-{int(variant_id)}.pdf",
+    )
+
+
+def _resume_variant_pdf_absolute_path(relative_path: str) -> str:
+    base = os.path.abspath(OUTPUT_DIR)
+    target = os.path.abspath(os.path.join(base, str(relative_path or "")))
+    if os.path.commonpath([base, target]) != base:
+        raise ValueError("resume PDF path is outside the output directory")
+    return target
+
+
+def _write_resume_variant_pdf(relative_path: str, pdf_bytes: bytes) -> str:
+    if not pdf_bytes or not bytes(pdf_bytes).startswith(b"%PDF"):
+        raise ValueError("Google export did not return a readable PDF.")
+    target = _resume_variant_pdf_absolute_path(relative_path)
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    with open(target, "wb") as handle:
+        handle.write(pdf_bytes)
+    return hashlib.sha256(pdf_bytes).hexdigest()
+
+
+def fetch_resume_variants_for_job(job_pk: int) -> Dict[str, Any]:
+    """Return saved swap drafts/generated artifacts for one Application Prep job."""
+    _ensure_reference_fields_column()
+    job_pk = _to_int(job_pk)
+    if not job_pk:
+        return {"found": False, "variants": []}
+    with SessionLocal() as session:
+        job = session.get(Job, job_pk)
+        if job is None:
+            return {"found": False, "variants": []}
+        rows = (
+            session.execute(
+                select(JobResumeVariant)
+                .where(JobResumeVariant.job_pk == job_pk)
+                .order_by(JobResumeVariant.updated_at.desc(), JobResumeVariant.id.desc())
+            )
+            .scalars()
+            .all()
+        )
+        return {
+            "found": True,
+            "job_pk": job_pk,
+            "variants": [_format_resume_variant(row) for row in rows],
+            "resume_source": _format_resume_source_settings(_get_or_create_resume_source_settings(session)),
+        }
+
+
+def create_resume_variant_draft(job_pk: int, data: Dict[str, Any]) -> Dict[str, Any]:
+    """Create a tailored resume PDF from validated, user-approved swaps."""
+    _ensure_reference_fields_column()
+    job_pk = _to_int(job_pk)
+    if not job_pk:
+        return {"found": False, "variant": None}
+
+    variant_id: Optional[int] = None
+    with SessionLocal() as session:
+        job = session.get(Job, job_pk)
+        if job is None:
+            return {"found": False, "variant": None}
+        context = _application_prep_context(session)
+        prep = getattr(job, "application_prep", None)
+        if _application_prep_status(job, prep, context) != "done":
+            raise ValueError("Application Prep must be ready before saving resume swaps.")
+        source = _get_or_create_resume_source_settings(session)
+        if source.source_mode != RESUME_SOURCE_MODE_GOOGLE_DOC or not source.baseline_hash:
+            raise ValueError("Sync a Google Docs baseline before saving resume swaps.")
+        prep_payload = _safe_json_loads(getattr(prep, "prep_json", None)) or {}
+        analysis = _build_resume_swap_analysis(job, prep_payload, source)
+        client_analysis_hash = str(data.get("analysis_hash") or "").strip()
+        server_analysis_hash = stable_json_hash(analysis)
+        if not client_analysis_hash:
+            raise ValueError("analysis_hash is required; load the matching board before saving.")
+        if client_analysis_hash != server_analysis_hash:
+            raise ValueError("Resume swap analysis changed; reload the matching board before saving.")
+
+        approved_pairs = data.get("replacements", [])
+        ok, why, normalized_pairs = validate_approved_pairs(approved_pairs, analysis)
+        if not ok:
+            raise ValueError(why)
+        if not normalized_pairs:
+            raise ValueError("Choose at least one resume swap before creating a PDF.")
+
+        baseline_snapshot = _safe_json_loads(source.baseline_snapshot_json) or {}
+        if not baseline_snapshot:
+            raise ValueError("Sync a Google Docs baseline before creating a PDF.")
+
+        now = utc_now_naive()
+        variant = JobResumeVariant(
+            job_pk=job_pk,
+            host_id=_resume_variant_host_id(),
+            status=RESUME_VARIANT_STATUS_DRAFT,
+            stage=RESUME_VARIANT_STAGE_REVIEW,
+            source_mode=source.source_mode,
+            baseline_document_id=source.google_document_id,
+            baseline_document_name=source.google_document_name,
+            baseline_document_url=source.google_document_url,
+            baseline_folder_id=source.google_folder_id,
+            baseline_revision=source.baseline_revision,
+            baseline_hash=source.baseline_hash,
+            baseline_snapshot_json=source.baseline_snapshot_json,
+            application_prep_hash=stable_json_hash(prep_payload) if prep_payload else "",
+            analysis_json=json.dumps(analysis, ensure_ascii=False, sort_keys=True),
+            replacements_json=json.dumps(normalized_pairs, ensure_ascii=False, sort_keys=True),
+            created_at=now,
+            updated_at=now,
+        )
+        session.add(variant)
+        session.commit()
+        variant_id = int(variant.id)
+        source_document_id = str(source.google_document_id or "")
+        source_baseline_hash = str(source.baseline_hash or "")
+        job_title = str(job.title or "Job")
+        job_site = str(job.site or "site")
+
+    current_baseline = _google_resume_client().document_snapshot(source_document_id)
+    current_snapshot = current_baseline.get("snapshot") or {}
+    current_hash = str(current_snapshot.get("baseline_hash") or "")
+    current_legacy_hash = str(current_snapshot.get("legacy_bullet_hash") or "")
+    current_legacy_render_hash = str(current_snapshot.get("legacy_render_hash") or "")
+    if source_baseline_hash not in {
+        current_hash,
+        current_legacy_hash,
+        current_legacy_render_hash,
+    }:
+        raise ValueError("Baseline Google Doc changed since sync; sync the baseline again before creating a PDF.")
+
+    try:
+        render_snapshot = current_snapshot if current_snapshot.get("blocks") else baseline_snapshot
+        pdf_bytes = render_resume_pdf_bytes(render_snapshot, normalized_pairs)
+        relative_path = _resume_variant_pdf_relative_path(job_pk, variant_id, job_site, job_title)
+        pdf_sha256 = _write_resume_variant_pdf(relative_path, bytes(pdf_bytes or b""))
+        now = utc_now_naive()
+        with SessionLocal() as session:
+            variant = session.get(JobResumeVariant, variant_id)
+            if variant is None:
+                return {"found": False, "variant": None}
+            variant.status = RESUME_VARIANT_STATUS_DONE
+            variant.stage = RESUME_VARIANT_STAGE_COMPLETE
+            variant.error_text = None
+            variant.copied_document_id = ""
+            variant.copied_document_url = ""
+            # Record the exact style-aware snapshot that produced the PDF,
+            # even when the saved baseline came from an older text-only sync.
+            variant.baseline_revision = str(current_snapshot.get("revision") or variant.baseline_revision or "")
+            variant.baseline_hash = current_hash or variant.baseline_hash
+            variant.baseline_snapshot_json = json.dumps(
+                render_snapshot, ensure_ascii=False, sort_keys=True
+            )
+            variant.pdf_relative_path = relative_path
+            variant.pdf_sha256 = pdf_sha256
+            variant.generated_at = now
+            variant.updated_at = now
+            session.commit()
+            payload = _format_resume_variant(variant)
+        return {"found": True, "variant": payload, "can_apply": True}
+    except Exception as exc:
+        with SessionLocal() as session:
+            variant = session.get(JobResumeVariant, variant_id)
+            if variant is not None:
+                variant.status = RESUME_VARIANT_STATUS_FAILED
+                variant.error_text = str(exc)
+                variant.updated_at = utc_now_naive()
+                session.commit()
+        raise
+
+
+def download_resume_variant_pdf(variant_id: int) -> tuple[str, str]:
+    """Resolve one generated PDF to a safe local path and download filename."""
+    _ensure_reference_fields_column()
+    variant_id = _to_int(variant_id)
+    if not variant_id:
+        raise FileNotFoundError("resume variant not found")
+    with SessionLocal() as session:
+        variant = session.get(JobResumeVariant, variant_id)
+        if variant is None or not variant.pdf_relative_path:
+            raise FileNotFoundError("resume PDF not found")
+        path = _resume_variant_pdf_absolute_path(variant.pdf_relative_path)
+        filename = os.path.basename(path)
+    if not os.path.exists(path):
+        raise FileNotFoundError("resume PDF file is missing")
+    return path, filename
 
 
 # ----------------------------------------------------------------------
@@ -3362,6 +3970,69 @@ def api_application_prep_settings():
         return jsonify(error=str(exc)), 500
 
 
+@app.route("/api/resume-source/settings", methods=["GET", "PUT"])
+def api_resume_source_settings():
+    try:
+        if request.method == "GET":
+            return jsonify(fetch_resume_source_settings())
+        return jsonify(save_resume_source_settings(request.get_json(silent=True) or {}))
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
+    except Exception as exc:
+        return jsonify(error=str(exc)), 500
+
+
+@app.route("/api/resume-source/google/status")
+def api_resume_source_google_status():
+    try:
+        return jsonify(google_resume_status())
+    except GoogleResumeError as exc:
+        return jsonify(error=str(exc)), 400
+    except Exception as exc:
+        return jsonify(error=str(exc)), 500
+
+
+@app.route("/api/resume-source/google/config", methods=["PUT"])
+def api_resume_source_google_config():
+    try:
+        return jsonify(save_google_resume_config(request.get_json(silent=True) or {}))
+    except GoogleResumeError as exc:
+        return jsonify(error=str(exc)), 400
+    except Exception as exc:
+        return jsonify(error=str(exc)), 500
+
+
+@app.route("/api/resume-source/google/disconnect", methods=["POST"])
+def api_resume_source_google_disconnect():
+    try:
+        return jsonify(disconnect_google_resume())
+    except GoogleResumeError as exc:
+        return jsonify(error=str(exc)), 400
+    except Exception as exc:
+        return jsonify(error=str(exc)), 500
+
+
+@app.route("/api/resume-source/google/select", methods=["POST"])
+def api_resume_source_google_select():
+    try:
+        document_id = str((request.get_json(silent=True) or {}).get("document_id") or "")
+        return jsonify(sync_google_resume_source(document_id))
+    except GoogleResumeError as exc:
+        return jsonify(error=str(exc)), 400
+    except Exception as exc:
+        return jsonify(error=str(exc)), 500
+
+
+@app.route("/api/resume-source/sync", methods=["POST"])
+def api_resume_source_sync():
+    try:
+        return jsonify(sync_google_resume_source())
+    except GoogleResumeError as exc:
+        return jsonify(error=str(exc)), 400
+    except Exception as exc:
+        return jsonify(error=str(exc)), 500
+
+
 @app.route("/api/application-prep/jobs/<int:job_pk>")
 def api_application_prep_job(job_pk: int):
     try:
@@ -3379,6 +4050,50 @@ def api_application_prep_queue(job_pk: int):
         if not result.get("eligible"):
             return jsonify(error=result.get("reason") or "job is not eligible for Application Prep"), 409
         return jsonify(result)
+    except Exception as exc:
+        return jsonify(error=str(exc)), 500
+
+
+@app.route("/api/application-prep/jobs/<int:job_pk>/resume-variants/swap-analysis")
+def api_application_prep_resume_variant_analysis(job_pk: int):
+    try:
+        result = fetch_resume_swap_analysis(job_pk)
+        if not result.get("found"):
+            return jsonify(error="job not found in database"), 404
+        return jsonify(result)
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 409
+    except Exception as exc:
+        return jsonify(error=str(exc)), 500
+
+
+@app.route("/api/application-prep/jobs/<int:job_pk>/resume-variants", methods=["GET", "POST"])
+def api_application_prep_resume_variants(job_pk: int):
+    try:
+        if request.method == "GET":
+            result = fetch_resume_variants_for_job(job_pk)
+            if not result.get("found"):
+                return jsonify(error="job not found in database", variants=[]), 404
+            return jsonify(result)
+        result = create_resume_variant_draft(job_pk, request.get_json(silent=True) or {})
+        if not result.get("found"):
+            return jsonify(error="job not found in database"), 404
+        return jsonify(result), 201
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
+    except Exception as exc:
+        return jsonify(error=str(exc)), 500
+
+
+@app.route("/api/resume-variants/<int:variant_id>/download")
+def api_resume_variant_download(variant_id: int):
+    try:
+        path, filename = download_resume_variant_pdf(variant_id)
+        return send_file(path, mimetype="application/pdf", as_attachment=True, download_name=filename)
+    except FileNotFoundError as exc:
+        return jsonify(error=str(exc)), 404
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
     except Exception as exc:
         return jsonify(error=str(exc)), 500
 

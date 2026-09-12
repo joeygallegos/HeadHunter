@@ -14,3 +14,10 @@ langchain-ollama==1.1.0
 # The code imports dotenv.load_dotenv from the python-dotenv distribution.
 langchain-core==1.4.0
 python-dotenv==1.2.2
+# Google resume source integration. Pins were checked against Snyk before adding.
+google-api-python-client==2.198.0
+google-auth==2.55.1
+# Used only for encrypted local Google service-account key storage.
+cryptography==50.0.1
+# Local resume PDF rendering. Snyk lists no direct issues for 4.5.1.
+reportlab==4.5.1

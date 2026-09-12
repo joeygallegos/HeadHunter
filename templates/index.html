@@ -41,7 +41,7 @@
                   class="dashboard-tab px-3 py-2 rounded-lg border border-slate-200 text-sm">
             Application Prep
           </button>
-          <button @click="view='settings'; loadApplicationPrepSettings()"
+          <button @click="view='settings'; loadApplicationPrepSettings(); loadResumeSourceSetup()"
                   :class="view==='settings' ? 'bg-indigo-600 text-white' : 'bg-white text-slate-700'"
                   class="dashboard-tab px-3 py-2 rounded-lg border border-slate-200 text-sm">
             Settings
@@ -1034,6 +1034,88 @@
           </section>
 
           <section class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4">
+            <div class="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+              <div>
+                <h2 class="text-sm font-semibold text-slate-800">Google resume baseline</h2>
+                <p class="mt-1 text-xs text-slate-500">Fast setup: paste a service-account key, share the baseline Doc with that email, then sync by Doc ID.</p>
+              </div>
+              <div class="flex flex-wrap gap-2">
+                <button type="button" @click="loadResumeSourceSetup()" :disabled="resumeSourceLoading"
+                        class="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+                        x-text="resumeSourceLoading ? 'Refreshing...' : 'Refresh status'"></button>
+              </div>
+            </div>
+
+            <div class="mt-4 flex flex-wrap items-center gap-2 text-sm" aria-live="polite">
+              <span class="inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 font-medium"
+                    :class="googleResumeStatus.configured ? 'bg-emerald-50 text-emerald-700 ring-1 ring-emerald-100' : 'bg-rose-50 text-rose-700 ring-1 ring-rose-100'">
+                <span class="h-2.5 w-2.5 rounded-full"
+                      :class="googleResumeStatus.configured ? 'bg-emerald-500' : 'bg-rose-500'"></span>
+                <span x-text="googleResumeStatus.configured ? 'Key saved' : 'Key missing'"></span>
+              </span>
+              <span class="inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 font-medium"
+                    :class="googleResumeStatus.connected ? 'bg-emerald-50 text-emerald-700 ring-1 ring-emerald-100' : 'bg-rose-50 text-rose-700 ring-1 ring-rose-100'">
+                <span class="h-2.5 w-2.5 rounded-full"
+                      :class="googleResumeStatus.connected ? 'bg-emerald-500' : 'bg-rose-500'"></span>
+                <span x-text="googleResumeStatus.connected ? 'Service account ready' : 'Service account disabled'"></span>
+              </span>
+              <span class="inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 font-medium"
+                    :class="resumeSource.can_apply ? 'bg-emerald-50 text-emerald-700 ring-1 ring-emerald-100' : 'bg-amber-50 text-amber-700 ring-1 ring-amber-100'">
+                <span class="h-2.5 w-2.5 rounded-full"
+                      :class="resumeSource.can_apply ? 'bg-emerald-500' : 'bg-amber-500'"></span>
+                <span x-text="resumeSource.can_apply ? 'Baseline synced' : 'Baseline not synced'"></span>
+              </span>
+            </div>
+
+            <div class="mt-4 grid grid-cols-1 gap-4 xl:grid-cols-2">
+              <div>
+                <label for="google-service-account-json" class="text-sm font-medium text-slate-700">Service account JSON</label>
+                <textarea id="google-service-account-json" x-model="googleServiceAccountJson" rows="8"
+                          class="mt-1 w-full rounded-lg border border-slate-300 p-3 font-mono text-xs leading-5 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                          placeholder="{ &quot;type&quot;: &quot;service_account&quot;, &quot;client_email&quot;: &quot;...&quot;, &quot;private_key&quot;: &quot;...&quot; }"></textarea>
+                <button type="button" @click="saveGoogleResumeConfig()" :disabled="googleResumeSavingConfig"
+                        class="mt-3 rounded-lg bg-indigo-600 px-3 py-2 text-sm font-medium text-white hover:bg-indigo-700 disabled:opacity-50"
+                        x-text="googleResumeSavingConfig ? 'Saving...' : 'Save service account'"></button>
+                <div class="mt-3 rounded-lg border border-indigo-100 bg-indigo-50 p-3 text-sm text-indigo-900"
+                     x-show="googleResumeStatus.service_account_email">
+                  Share the baseline Google Doc with
+                  <span class="font-mono font-semibold" x-text="googleResumeStatus.service_account_email"></span>
+                  before syncing.
+                </div>
+              </div>
+
+              <div>
+                <label for="google-baseline-document-id" class="text-sm font-medium text-slate-700">Baseline document ID</label>
+                <input id="google-baseline-document-id" x-model="googleBaselineDocumentId"
+                       class="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                       placeholder="Google Docs document ID" />
+                <p class="mt-1 text-xs text-slate-500">For now, copy the ID from the Google Docs URL. A visual picker can sit on top of this later.</p>
+                <div class="mt-3 rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm">
+                  <div class="font-medium text-slate-900" x-text="resumeSource.google_document_name || 'No synced baseline'"></div>
+                  <div class="mt-1 text-xs text-slate-500" x-text="resumeSource.last_synced_at ? `Last synced ${resumeSource.last_synced_at}` : 'Sync a Google Doc before matching swaps.'"></div>
+                  <a class="mt-2 inline-flex text-xs font-medium text-indigo-700 hover:text-indigo-900"
+                     :href="resumeSource.google_document_url || '#'" target="_blank" rel="noreferrer"
+                     x-show="resumeSource.google_document_url">Open baseline</a>
+                </div>
+                <div class="mt-3 flex flex-wrap gap-2">
+                  <button type="button" @click="syncGoogleResumeBaseline()" :disabled="googleResumeSyncing || !googleResumeStatus.connected || !googleResumeStatus.current_request_loopback"
+                          class="rounded-lg bg-indigo-600 px-3 py-2 text-sm font-medium text-white hover:bg-indigo-700 disabled:opacity-50"
+                          x-text="googleResumeSyncing ? 'Syncing...' : 'Sync baseline'"></button>
+                  <button type="button" @click="disconnectGoogleResume()" :disabled="googleResumeDisconnecting || !googleResumeStatus.connected"
+                          class="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+                          x-text="googleResumeDisconnecting ? 'Disconnecting...' : 'Disconnect'"></button>
+                </div>
+              </div>
+            </div>
+
+            <p class="mt-3 text-sm text-amber-700" x-show="!googleResumeStatus.current_request_loopback">
+              Google resume setup only works from http://localhost on the PC.
+            </p>
+            <p class="mt-3 text-sm text-green-700" x-show="googleResumeMessage" x-text="googleResumeMessage"></p>
+            <p class="mt-3 text-sm text-red-700" x-show="googleResumeError" x-text="googleResumeError"></p>
+          </section>
+
+          <section class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4">
             <h2 class="text-sm font-semibold text-slate-800">Responsibilities &amp; Value inventory</h2>
             <p class="mt-1 text-xs text-slate-500">Paste Markdown with responsibilities, scope, outcomes, tools, and metrics. It is used only for eligible Application Prep jobs and every generated bullet cites its source.</p>
             <textarea x-model="responsibilitiesInventoryMarkdown" rows="18"
@@ -1058,7 +1140,7 @@
               <div>
                 <h2 class="text-sm font-semibold text-slate-800">Application Prep</h2>
                 <p class="text-xs text-slate-500 mt-1">
-                  Use this to tailor your resume for one job. Review the suggested bullets, copy the ones you trust, then update your resume manually.
+                  Use this to tailor your resume for one job. Review the fit, match less-targeted resume bullets to stronger grounded bullets, then generate a PDF.
                 </p>
               </div>
               <div class="flex flex-wrap items-center gap-2">
@@ -1081,6 +1163,24 @@
               </div>
             </div>
             <div class="mt-3 text-sm text-red-700" x-show="applicationPrepError" x-text="applicationPrepError"></div>
+          </section>
+
+          <section class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4" x-show="applicationPrepLoaded && !resumeSource.can_apply">
+            <div class="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+              <div>
+                <h3 class="text-sm font-semibold text-slate-800">Baseline resume</h3>
+                <p class="mt-1 text-sm text-slate-600" x-text="resumeSource.can_apply ? `${resumeSource.google_document_name || 'Google Doc'} synced for swap matching.` : 'Sync a Google Docs baseline before matching resume swaps.'"></p>
+                <p class="mt-1 text-xs text-slate-500" x-show="resumeSource.last_synced_at" x-text="`Last synced ${resumeSource.last_synced_at}`"></p>
+              </div>
+              <div class="flex flex-wrap gap-2">
+                <a class="inline-flex items-center justify-center rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 hover:bg-slate-50"
+                   :href="resumeSource.google_document_url || '#'" target="_blank" rel="noreferrer"
+                   x-show="resumeSource.google_document_url">Open baseline</a>
+                <button type="button" @click="view='settings'; loadApplicationPrepSettings(); loadResumeSourceSetup()"
+                        class="rounded-lg bg-slate-900 px-3 py-2 text-sm font-medium text-white hover:bg-slate-800"
+                        x-text="resumeSource.can_apply ? 'Resume settings' : 'Set up baseline'"></button>
+              </div>
+            </div>
           </section>
 
           <section class="grid grid-cols-1 lg:grid-cols-4 gap-4 animate-pulse" x-show="applicationPrepLoading && !applicationPrepLoaded" x-cloak>
@@ -1126,12 +1226,12 @@
           <section class="grid grid-cols-1 lg:grid-cols-4 gap-4" x-show="applicationPrepLoaded">
             <div class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4 lg:col-span-1">
               <div class="flex items-center justify-between">
-                <h3 class="text-sm font-semibold text-slate-800">Deck</h3>
-                <span class="text-xs text-slate-500" x-show="applicationPrepHasActive()">Auto-refreshing</span>
+                <h3 class="text-sm font-semibold text-slate-800">Jobs</h3>
+                <span class="text-xs text-slate-500" x-show="applicationPrepHasActive()">Updating statuses</span>
               </div>
               <div class="mt-3 space-y-2" x-show="applicationPrepJobs.length">
                 <template x-for="job in applicationPrepJobs" :key="job.id">
-                  <button type="button" @click="selectedApplicationPrepJobId = job.id"
+                  <button type="button" @click="selectApplicationPrepJob(job.id)"
                           class="w-full text-left rounded-lg border px-3 py-2 text-sm"
                           :class="selectedApplicationPrepJobId === job.id ? 'border-indigo-400 bg-indigo-50' : 'border-slate-200 bg-white hover:bg-slate-50'">
                     <div class="flex items-start justify-between gap-2">
@@ -1163,16 +1263,55 @@
                     <div>
                       <div class="text-xs font-semibold uppercase text-slate-500" x-text="selectedApplicationPrepJob().site"></div>
                       <h2 class="mt-1 text-xl font-semibold text-slate-900" x-text="selectedApplicationPrepJob().title || '(no title)'"></h2>
-                      <div class="mt-1 text-sm text-slate-600">
-                        <span x-text="`ID ${selectedApplicationPrepJob().id}`"></span>
-                        <span class="ml-2" x-text="`Match ${selectedApplicationPrepJob().ai_match_percentage ?? '-'}%`"></span>
+                      <div class="mt-1 flex flex-wrap items-center gap-2 text-sm text-slate-600">
+                        <span x-text="`Match ${selectedApplicationPrepJob().ai_match_percentage ?? '-'}%`"></span>
+                        <span class="rounded px-2 py-0.5 text-xs font-medium"
+                              :class="applicationPrepStatusClass(selectedApplicationPrepJob().status)"
+                              x-text="applicationPrepStatusLabel(selectedApplicationPrepJob().status)"></span>
+                        <span class="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium"
+                              :class="resumeSource.can_apply ? 'bg-emerald-50 text-emerald-700 ring-1 ring-emerald-100' : 'bg-amber-50 text-amber-700 ring-1 ring-amber-100'">
+                          <span class="h-1.5 w-1.5 rounded-full"
+                                :class="resumeSource.can_apply ? 'bg-emerald-500' : 'bg-amber-500'"></span>
+                          <span x-text="resumeSource.can_apply ? 'Baseline synced' : 'Baseline needed'"></span>
+                        </span>
                       </div>
-                    </div>
+                      <details class="mt-2 text-sm text-slate-600">
+                        <summary class="inline-flex cursor-pointer select-none items-center gap-2 rounded-full border border-slate-200 bg-slate-50 px-2.5 py-1 text-xs font-medium text-slate-600 hover:bg-slate-100">
+                          <span class="inline-flex h-4 w-4 items-center justify-center rounded-full bg-slate-200 text-[10px] font-bold text-slate-700">i</span>
+                          <span>Job and prep details</span>
+                        </summary>
+                        <div class="mt-3 rounded-lg border border-slate-200 bg-slate-50 p-3">
+                          <p x-text="applicationPrepStatusDescription(selectedApplicationPrepJob().status)"></p>
+                          <dl class="mt-3 grid grid-cols-1 gap-2 text-xs sm:grid-cols-2 xl:grid-cols-4">
+                            <div>
+                              <dt class="font-semibold text-slate-500">Job ID</dt>
+                              <dd class="mt-0.5 text-slate-700" x-text="selectedApplicationPrepJob().id || '-'"></dd>
+                            </div>
+                            <div>
+                              <dt class="font-semibold text-slate-500">Queued</dt>
+                              <dd class="mt-0.5 text-slate-700" x-text="selectedApplicationPrepJob().queued_at || '-'"></dd>
+                            </div>
+                            <div>
+                              <dt class="font-semibold text-slate-500">Generated</dt>
+                              <dd class="mt-0.5 text-slate-700" x-text="selectedApplicationPrepJob().generated_at || '-'"></dd>
+                            </div>
+                            <div>
+                              <dt class="font-semibold text-slate-500">Location</dt>
+                              <dd class="mt-0.5 text-slate-700" x-text="selectedApplicationPrepJob().ai_location_policy_match || '-'"></dd>
+                            </div>
+                          </dl>
+                          <p class="mt-2 text-xs text-slate-500" x-show="resumeSource.can_apply && resumeSource.last_synced_at"
+                             x-text="`${resumeSource.google_document_name || 'Google Doc'} synced ${resumeSource.last_synced_at}`"></p>
+                        </div>
+                      </details>
+                      <p class="mt-2 text-sm text-red-700" x-show="selectedApplicationPrepJob().error_text"
+                         x-text="selectedApplicationPrepJob().error_text"></p>
+                      </div>
                     <div class="flex flex-wrap gap-2">
                       <button @click="queueApplicationPrep(selectedApplicationPrepJob().id)"
                               :disabled="applicationPrepSaving || String(selectedApplicationPrepJob().status || '').toLowerCase() === 'ineligible'"
                               class="px-3 py-2 rounded-lg border border-slate-300 bg-white text-sm text-slate-700 hover:bg-slate-50 disabled:opacity-40"
-                              x-text="String(selectedApplicationPrepJob().status || '').toLowerCase() === 'failed' ? 'Try again' : 'Re-run prep'">
+                              x-text="String(selectedApplicationPrepJob().status || '').toLowerCase() === 'failed' ? 'Try again' : 'Regenerate prep'">
                       </button>
                       <a class="inline-flex items-center justify-center px-3 py-2 rounded-lg bg-slate-900 text-white text-sm hover:bg-slate-800"
                          :href="selectedApplicationPrepJob().url || '#'" target="_blank" rel="noreferrer"
@@ -1181,113 +1320,46 @@
                       </a>
                     </div>
                   </div>
-                </section>
-
-                <section class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4">
-                  <div class="flex items-center justify-between gap-3">
-                    <h3 class="text-sm font-semibold text-slate-800">Prep Status</h3>
-                    <span class="rounded px-2 py-0.5 text-xs font-medium"
-                          :class="applicationPrepStatusClass(selectedApplicationPrepJob().status)"
-                          x-text="applicationPrepStatusLabel(selectedApplicationPrepJob().status)"></span>
+                  <div class="mt-4 grid grid-cols-2 gap-2 text-xs md:grid-cols-4" aria-label="Application prep steps">
+                    <div class="rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-emerald-800">1. Review fit</div>
+                    <div class="rounded-lg border px-3 py-2"
+                         :class="resumeSwapAnalysis ? 'border-emerald-200 bg-emerald-50 text-emerald-800' : 'border-slate-200 bg-slate-50 text-slate-600'">2. Match swaps</div>
+                    <div class="rounded-lg border px-3 py-2"
+                         :class="resumeSwapReviewing ? 'border-emerald-200 bg-emerald-50 text-emerald-800' : 'border-slate-200 bg-slate-50 text-slate-600'">3. Review changes</div>
+                    <div class="rounded-lg border px-3 py-2"
+                         :class="resumeSwapVariants.length ? 'border-emerald-200 bg-emerald-50 text-emerald-800' : 'border-slate-200 bg-slate-50 text-slate-600'">4. Generate PDF</div>
                   </div>
-                  <p class="mt-2 text-sm text-slate-600" x-text="applicationPrepStatusDescription(selectedApplicationPrepJob().status)"></p>
-                  <dl class="mt-3 grid grid-cols-1 md:grid-cols-3 gap-3 text-sm">
-                    <div>
-                      <dt class="text-xs text-slate-500">Queued</dt>
-                      <dd x-text="selectedApplicationPrepJob().queued_at || '-'"></dd>
-                    </div>
-                    <div>
-                      <dt class="text-xs text-slate-500">Generated</dt>
-                      <dd x-text="selectedApplicationPrepJob().generated_at || '-'"></dd>
-                    </div>
-                    <div>
-                      <dt class="text-xs text-slate-500">Location</dt>
-                      <dd x-text="selectedApplicationPrepJob().ai_location_policy_match || '-'"></dd>
-                    </div>
-                  </dl>
-                  <p class="mt-3 text-sm text-red-700" x-show="selectedApplicationPrepJob().error_text"
-                     x-text="selectedApplicationPrepJob().error_text"></p>
                 </section>
 
                 <section class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4">
                   <template x-if="selectedApplicationPrepJob().application_prep?.prep">
                     <div class="space-y-4 text-sm text-slate-800">
                       <div>
-                        <h3 class="text-sm font-semibold text-slate-900">1. Positioning</h3>
+                        <h3 class="text-sm font-semibold text-slate-900">Positioning synopsis</h3>
                         <p class="mt-2 leading-6" x-text="selectedApplicationPrepJob().application_prep.prep.positioning_summary || '-'"></p>
                       </div>
-
-                      <div>
-                        <div class="flex flex-col gap-1 sm:flex-row sm:items-end sm:justify-between">
-                          <div>
-                            <h3 class="text-sm font-semibold text-slate-900">2. Suggested resume bullets</h3>
-                            <p class="text-xs text-slate-500">Copy only bullets you trust, then paste them into your resume manually.</p>
-                          </div>
-                        </div>
-                        <div class="mt-2 space-y-3">
-                          <template x-for="item in sortedApplicationPrepBullets()" :key="item.bullet">
-                            <div class="rounded-lg border border-slate-200 bg-slate-50 p-3">
-                              <div class="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
-                                <div class="min-w-0">
-                                  <div class="text-xs font-semibold uppercase text-slate-500">Suggested bullet</div>
-                                  <p class="mt-1 font-medium leading-6 text-slate-950" x-text="item.bullet"></p>
-                                  <p class="mt-2 text-sm text-slate-700">
-                                    <span class="font-medium">Why this fits:</span>
-                                    <span x-text="item.job_requirement || '-'"></span>
-                                  </p>
-                                  <span class="mt-2 inline-flex rounded px-2 py-0.5 text-xs font-medium"
-                                        :class="item.confidence === 'high' ? 'bg-green-100 text-green-800' : (item.confidence === 'low' ? 'bg-amber-100 text-amber-800' : 'bg-slate-100 text-slate-700')"
-                                        x-text="`${item.confidence || 'medium'} confidence`"></span>
-                                </div>
-                                <button type="button"
-                                        @click="copyApplicationPrepBullet(item.bullet)"
-                                        class="shrink-0 rounded-lg bg-indigo-600 px-3 py-2 text-sm font-medium text-white hover:bg-indigo-700"
-                                        x-text="copiedApplicationPrepBullet === item.bullet ? 'Copied' : 'Copy bullet'">
-                                  Copy bullet
-                                </button>
-                              </div>
-                              <details class="mt-3 rounded border border-slate-200 bg-white p-3">
-                                <summary class="cursor-pointer text-xs font-semibold uppercase text-slate-500">Evidence and safety check</summary>
-                                <div class="mt-3 space-y-3">
-                                  <template x-for="source in (item.evidence_sources || [])" :key="source.source + source.evidence">
-                                    <div>
-                                      <div class="text-xs font-semibold text-slate-500" x-text="source.source === 'responsibilities_inventory' ? 'Based on responsibilities & value inventory' : 'Based on resume evidence'"></div>
-                                      <p class="mt-1 text-sm leading-6 text-slate-700" x-text="source.evidence || '-'"></p>
-                                    </div>
-                                  </template>
-                                  <div>
-                                    <div class="text-xs font-semibold text-slate-500">Reviewer note</div>
-                                    <p class="mt-1 text-sm leading-6 text-slate-700" x-text="applicationPrepEvidenceNote(item).note || '-'"></p>
-                                  </div>
-                                </div>
-                              </details>
-                            </div>
-                          </template>
-                          <p class="text-sm text-slate-500" x-show="!(selectedApplicationPrepJob().application_prep.prep.draft_resume_bullets || []).length">
-                            No grounded resume bullets were generated for this job.
+                      <div class="grid grid-cols-1 xl:grid-cols-2 gap-4">
+                        <div class="rounded-lg border border-slate-200 bg-slate-50 p-3">
+                          <h4 class="text-xs font-semibold uppercase text-slate-500">Resume edits to consider</h4>
+                          <ul class="mt-2 list-disc pl-5 space-y-1">
+                            <template x-for="item in (selectedApplicationPrepJob().application_prep.prep.resume_improvements || [])" :key="item">
+                              <li x-text="item"></li>
+                            </template>
+                          </ul>
+                          <p class="mt-2 text-sm text-slate-500" x-show="!(selectedApplicationPrepJob().application_prep.prep.resume_improvements || []).length">
+                            No resume edits were called out.
                           </p>
                         </div>
-                      </div>
-
-                      <div>
-                        <h3 class="text-sm font-semibold text-slate-900">3. Resume edits and gaps</h3>
-                        <div class="mt-2 grid grid-cols-1 xl:grid-cols-2 gap-4">
-                          <div>
-                            <h4 class="text-xs font-semibold uppercase text-slate-500">Resume edits to consider</h4>
-                            <ul class="mt-2 list-disc pl-5 space-y-1">
-                              <template x-for="item in (selectedApplicationPrepJob().application_prep.prep.resume_improvements || [])" :key="item">
-                                <li x-text="item"></li>
-                              </template>
-                            </ul>
-                          </div>
-                          <div>
-                            <h4 class="text-xs font-semibold uppercase text-slate-500">Fit gaps to review</h4>
-                            <ul class="mt-2 list-disc pl-5 space-y-1">
-                              <template x-for="item in (selectedApplicationPrepJob().application_prep.prep.fit_gaps || [])" :key="item">
-                                <li x-text="item"></li>
-                              </template>
-                            </ul>
-                          </div>
+                        <div class="rounded-lg border border-slate-200 bg-slate-50 p-3">
+                          <h4 class="text-xs font-semibold uppercase text-slate-500">Fit gaps to review</h4>
+                          <ul class="mt-2 list-disc pl-5 space-y-1">
+                            <template x-for="item in (selectedApplicationPrepJob().application_prep.prep.fit_gaps || [])" :key="item">
+                              <li x-text="item"></li>
+                            </template>
+                          </ul>
+                          <p class="mt-2 text-sm text-slate-500" x-show="!(selectedApplicationPrepJob().application_prep.prep.fit_gaps || []).length">
+                            No major fit gaps were called out.
+                          </p>
                         </div>
                       </div>
                     </div>
@@ -1295,6 +1367,184 @@
                   <template x-if="!selectedApplicationPrepJob().application_prep?.prep">
                     <p class="text-sm text-slate-500">Prep output is not available yet.</p>
                   </template>
+                </section>
+
+                <section class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4">
+                  <div class="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+                    <div>
+                      <h3 class="text-sm font-semibold text-slate-900">Resume bullet swaps</h3>
+                      <p class="mt-1 text-xs text-slate-500">Match one less-targeted baseline bullet with one stronger grounded bullet, then generate a local PDF.</p>
+                    </div>
+                    <button type="button"
+                            @click="loadResumeSwapWorkspace(selectedApplicationPrepJob().id, true)"
+                            :disabled="resumeSwapLoading || !resumeSource.can_apply || String(selectedApplicationPrepJob().status || '').toLowerCase() !== 'done'"
+                            class="rounded-lg bg-indigo-600 px-3 py-2 text-sm font-medium text-white hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-50"
+                            x-text="resumeSwapLoading ? 'Loading...' : 'Start resume swap review'"></button>
+                  </div>
+                  <p class="mt-3 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800"
+                     x-show="!resumeSource.can_apply">
+                    Sync a Google Docs baseline in Settings before starting resume swap review.
+                  </p>
+                  <p class="mt-3 text-sm text-red-700" x-show="resumeSwapError" x-text="resumeSwapError"></p>
+                  <p class="mt-3 text-sm text-green-700" x-show="resumeSwapMessage" x-text="resumeSwapMessage"></p>
+
+                  <template x-if="resumeSwapAnalysis && !resumeSwapReviewing">
+                    <div class="mt-4 space-y-4">
+                      <div class="rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm text-slate-700">
+                        <div class="font-medium text-slate-900" x-text="resumeSwapAnalysis.coverage_summary || 'Swap analysis ready.'"></div>
+                        <div class="mt-1 text-xs text-slate-500" x-text="`${resumeSwapPairs.length} planned swap(s)`"></div>
+                      </div>
+                      <div class="rounded-lg border border-indigo-100 bg-indigo-50 p-3 text-sm text-indigo-900" aria-live="polite">
+                        <span x-show="!selectedSwapOutAnchorId && !selectedBringForwardCandidateId && !resumeSwapPairs.length">Choose one card from each side to create a swap.</span>
+                        <span x-show="selectedSwapOutAnchorId && !selectedBringForwardCandidateId">Now choose a Bring forward bullet.</span>
+                        <span x-show="!selectedSwapOutAnchorId && selectedBringForwardCandidateId">Now choose a Swap out bullet.</span>
+                        <span x-show="!selectedSwapOutAnchorId && !selectedBringForwardCandidateId && resumeSwapPairs.length" x-text="`${resumeSwapPairs.length} swap(s) added. Review when ready.`"></span>
+                      </div>
+
+                      <div class="grid grid-cols-1 xl:grid-cols-2 gap-4">
+                        <div>
+                          <div class="flex items-end justify-between gap-2">
+                            <div>
+                              <h4 class="text-xs font-semibold uppercase text-slate-500">Swap out</h4>
+                              <p class="text-xs text-slate-500">Less targeted for this job</p>
+                            </div>
+                          </div>
+                          <div class="mt-2 space-y-2">
+                            <template x-for="item in resumeSwapAnalysis.baseline_candidates" :key="item.anchor_id">
+                              <button type="button"
+                                      @click="selectSwapOutCandidate(item.anchor_id)"
+                                      :disabled="isSwapOutPaired(item.anchor_id)"
+                                      class="w-full rounded-lg border p-3 text-left text-sm disabled:cursor-not-allowed disabled:opacity-60"
+                                      :class="selectedSwapOutAnchorId === item.anchor_id ? 'border-indigo-500 bg-indigo-50' : 'border-slate-200 bg-white hover:bg-slate-50'">
+                                <div class="flex items-center justify-between gap-2">
+                                  <span class="text-xs font-semibold text-slate-500" x-text="item.section || 'Resume'"></span>
+                                  <span class="rounded bg-slate-100 px-2 py-0.5 text-xs text-slate-600" x-show="isSwapOutPaired(item.anchor_id)">Paired</span>
+                                </div>
+                                <p class="mt-2 font-medium leading-6 text-slate-950" x-text="item.bullet"></p>
+                                <p class="mt-2 text-xs leading-5 text-slate-600" x-text="item.lower_value_rationale"></p>
+                              </button>
+                            </template>
+                            <p class="rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm text-slate-500"
+                               x-show="!(resumeSwapAnalysis.baseline_candidates || []).length">
+                              No less-targeted baseline bullets were identified for this job.
+                            </p>
+                          </div>
+                        </div>
+
+                        <div>
+                          <div>
+                            <h4 class="text-xs font-semibold uppercase text-slate-500">Bring forward</h4>
+                            <p class="text-xs text-slate-500">Stronger fit for this role</p>
+                          </div>
+                          <div class="mt-2 space-y-2">
+                            <template x-for="item in resumeSwapAnalysis.replacement_candidates" :key="item.candidate_id">
+                              <button type="button"
+                                      @click="selectBringForwardCandidate(item.candidate_id)"
+                                      :disabled="isBringForwardPaired(item.candidate_id)"
+                                      class="w-full rounded-lg border p-3 text-left text-sm disabled:cursor-not-allowed disabled:opacity-60"
+                                      :class="selectedBringForwardCandidateId === item.candidate_id ? 'border-indigo-500 bg-indigo-50' : 'border-slate-200 bg-white hover:bg-slate-50'">
+                                <div class="flex items-center justify-between gap-2">
+                                  <span class="rounded px-2 py-0.5 text-xs font-medium"
+                                        :class="item.confidence === 'high' ? 'bg-green-100 text-green-800' : (item.confidence === 'low' ? 'bg-amber-100 text-amber-800' : 'bg-slate-100 text-slate-700')"
+                                        x-text="`${item.confidence || 'medium'} confidence`"></span>
+                                  <span class="rounded bg-indigo-100 px-2 py-0.5 text-xs text-indigo-800" x-show="isSuggestedSwapCandidate(item.candidate_id)">Suggested</span>
+                                  <span class="rounded bg-slate-100 px-2 py-0.5 text-xs text-slate-600" x-show="isBringForwardPaired(item.candidate_id)">Paired</span>
+                                </div>
+                                <p class="mt-2 font-medium leading-6 text-slate-950" x-text="item.bullet"></p>
+                                <p class="mt-2 text-xs leading-5 text-slate-600" x-text="item.job_requirement"></p>
+                              </button>
+                            </template>
+                            <p class="rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm text-slate-500"
+                               x-show="!(resumeSwapAnalysis.replacement_candidates || []).length">
+                              No grounded replacement bullets are available yet.
+                            </p>
+                          </div>
+                        </div>
+                      </div>
+
+                      <div class="sticky bottom-3 z-10 rounded-lg border border-slate-200 bg-white p-3 shadow-sm">
+                        <div class="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                          <div>
+                            <h4 class="text-sm font-semibold text-slate-900">Your planned swaps</h4>
+                            <p class="text-xs text-slate-500" x-text="resumeSwapPairs.length ? `${resumeSwapPairs.length} ready to review` : 'Choose one card from each side.'"></p>
+                          </div>
+                          <button type="button"
+                                  @click="resumeSwapReviewing = true"
+                                  :disabled="!resumeSwapPairs.length"
+                                  class="rounded-lg bg-slate-900 px-3 py-2 text-sm font-medium text-white hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50">
+                            Review swaps
+                          </button>
+                        </div>
+                        <div class="mt-3 space-y-2" x-show="resumeSwapPairs.length">
+                          <template x-for="pair in resumeSwapPairs" :key="pair.anchor_id + pair.candidate_id">
+                            <div class="flex flex-col gap-2 rounded-lg bg-slate-50 p-3 text-sm sm:flex-row sm:items-center sm:justify-between">
+                              <div class="min-w-0">
+                                <div class="font-medium text-slate-900" x-text="resumeSwapPairLabel(pair)"></div>
+                              </div>
+                              <button type="button" @click="removeResumeSwapPair(pair.anchor_id, pair.candidate_id)"
+                                      class="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs text-slate-700 hover:bg-slate-50">Remove</button>
+                            </div>
+                          </template>
+                        </div>
+                      </div>
+                    </div>
+                  </template>
+
+                  <template x-if="resumeSwapAnalysis && resumeSwapReviewing">
+                    <div class="mt-4 space-y-4">
+                      <div class="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                        <div>
+                          <h4 class="text-sm font-semibold text-slate-900">Review changes</h4>
+                          <p class="text-xs text-slate-500" x-text="`${resumeSwapPairs.length} swap(s) will be rendered into a local PDF without changing Google Drive.`"></p>
+                        </div>
+                        <div class="flex gap-2">
+                          <button type="button" @click="resumeSwapReviewing = false"
+                                  class="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 hover:bg-slate-50">Back</button>
+                          <button type="button" @click="saveResumeSwapDraft()"
+                                  :disabled="resumeSwapSaving || !resumeSwapPairs.length"
+                                  class="rounded-lg bg-indigo-600 px-3 py-2 text-sm font-medium text-white hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-50"
+                                  x-text="resumeSwapSaving ? 'Generating...' : 'Generate PDF'"></button>
+                        </div>
+                      </div>
+                      <div class="space-y-3">
+                        <template x-for="pair in resumeSwapPairs" :key="pair.anchor_id + pair.candidate_id">
+                          <div class="grid grid-cols-1 gap-3 rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm md:grid-cols-2">
+                            <div>
+                              <div class="text-xs font-semibold uppercase text-slate-500">Replace</div>
+                              <p class="mt-1 leading-6 text-slate-800" x-text="resumeSwapBaselineById(pair.anchor_id)?.bullet || '-'"></p>
+                            </div>
+                            <div>
+                              <div class="text-xs font-semibold uppercase text-slate-500">With</div>
+                              <p class="mt-1 font-medium leading-6 text-slate-950" x-text="resumeSwapReplacementById(pair.candidate_id)?.bullet || '-'"></p>
+                            </div>
+                          </div>
+                        </template>
+                      </div>
+                    </div>
+                  </template>
+
+                  <div class="mt-4 rounded-lg border border-slate-200 bg-slate-50 p-3" x-show="resumeSwapVariants.length">
+                    <div class="flex items-center justify-between gap-2">
+                      <h4 class="text-sm font-semibold text-slate-900">Generated PDFs</h4>
+                      <span class="text-xs text-slate-500" x-text="resumeSwapVariants.length"></span>
+                    </div>
+                    <div class="mt-2 space-y-2">
+                      <template x-for="variant in resumeSwapVariants.slice(0, 3)" :key="variant.id">
+                        <div class="flex flex-col gap-1 rounded-lg bg-white px-3 py-2 text-sm sm:flex-row sm:items-center sm:justify-between">
+                          <div>
+                            <span class="font-medium text-slate-900" x-text="resumeVariantStatusLabel(variant)"></span>
+                            <span class="ml-2 text-xs text-slate-500" x-text="variant.updated_at || variant.created_at || ''"></span>
+                          </div>
+                          <div class="flex flex-wrap items-center gap-2">
+                            <span class="text-xs text-slate-500" x-text="`${(variant.replacements || []).length} swap(s)`"></span>
+                            <a class="rounded-lg bg-indigo-600 px-2.5 py-1.5 text-xs font-medium text-white hover:bg-indigo-700"
+                               :href="`/api/resume-variants/${variant.id}/download`"
+                               x-show="variant.has_pdf">Download PDF</a>
+                          </div>
+                        </div>
+                      </template>
+                    </div>
+                  </div>
                 </section>
               </div>
             </template>
@@ -1645,12 +1895,23 @@
           // Application Prep state
           applicationPrepLoaded: false,
           applicationPrepLoading: false,
+          applicationPrepBackgroundLoading: false,
           applicationPrepSaving: false,
           applicationPrepJobs: [],
           selectedApplicationPrepJobId: null,
-          copiedApplicationPrepBullet: '',
           applicationPrepError: '',
           applicationPrepPoller: null,
+          resumeSwapLoading: false,
+          resumeSwapSaving: false,
+          resumeSwapError: '',
+          resumeSwapMessage: '',
+          resumeSwapAnalysis: null,
+          resumeSwapAnalysisHash: '',
+          resumeSwapVariants: [],
+          selectedSwapOutAnchorId: '',
+          selectedBringForwardCandidateId: '',
+          resumeSwapPairs: [],
+          resumeSwapReviewing: false,
 
           // Application Prep settings and source inventory state.
           applicationPrepSettingsLoading: false,
@@ -1660,6 +1921,16 @@
           applicationPrepInventoryMaxTokens: 1200,
           applicationPrepSettingsMessage: '',
           applicationPrepSettingsError: '',
+          resumeSourceLoading: false,
+          resumeSource: {},
+          googleResumeStatus: {configured: false, connected: false, current_request_loopback: true},
+          googleServiceAccountJson: '',
+          googleBaselineDocumentId: '',
+          googleResumeSavingConfig: false,
+          googleResumeSyncing: false,
+          googleResumeDisconnecting: false,
+          googleResumeMessage: '',
+          googleResumeError: '',
 
           // Interesting review state
           interestingLoaded: false,
@@ -2961,10 +3232,120 @@
             }
           },
 
-          async loadApplicationPrep() {
-            this.applicationPrepLoading = true;
-            this.applicationPrepError = '';
+          async loadResumeSourceSetup() {
+            this.resumeSourceLoading = true;
+            this.googleResumeError = '';
             try {
+              const [sourceRes, googleRes] = await Promise.all([
+                fetch('/api/resume-source/settings'),
+                fetch('/api/resume-source/google/status')
+              ]);
+              const sourceData = await sourceRes.json();
+              const googleData = await googleRes.json();
+              if (!sourceRes.ok) throw new Error(sourceData.error || 'Resume source load failed');
+              if (!googleRes.ok) throw new Error(googleData.error || 'Google resume status failed');
+              this.resumeSource = sourceData || {};
+              this.googleResumeStatus = googleData || {};
+              if (!this.googleBaselineDocumentId && sourceData.google_document_id) {
+                this.googleBaselineDocumentId = sourceData.google_document_id;
+              }
+            } catch (err) {
+              this.googleResumeError = err?.message || 'Google resume setup load failed.';
+            } finally {
+              this.resumeSourceLoading = false;
+            }
+          },
+
+          async saveGoogleResumeConfig() {
+            if (this.googleResumeSavingConfig) return;
+            this.googleResumeSavingConfig = true;
+            this.googleResumeError = '';
+            this.googleResumeMessage = '';
+            try {
+              let serviceAccountConfig = {};
+              try {
+                serviceAccountConfig = JSON.parse(this.googleServiceAccountJson || '{}');
+              } catch (_err) {
+                throw new Error('Service account JSON is not valid JSON.');
+              }
+              const res = await fetch('/api/resume-source/google/config', {
+                method: 'PUT',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                  auth_mode: 'service_account',
+                  service_account_config: serviceAccountConfig
+                })
+              });
+              const data = await res.json();
+              if (!res.ok) throw new Error(data.error || 'Google setup save failed');
+              this.googleResumeStatus = data || {};
+              this.googleResumeMessage = `Service account saved. Share the baseline Doc with ${data.service_account_email || 'the service account'}, then sync.`;
+            } catch (err) {
+              this.googleResumeError = err?.message || 'Google setup save failed.';
+            } finally {
+              this.googleResumeSavingConfig = false;
+            }
+          },
+
+          async syncGoogleResumeBaseline() {
+            if (this.googleResumeSyncing) return;
+            this.googleResumeSyncing = true;
+            this.googleResumeError = '';
+            this.googleResumeMessage = '';
+            try {
+              const res = await fetch('/api/resume-source/google/select', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({document_id: this.googleBaselineDocumentId})
+              });
+              const data = await res.json();
+              if (!res.ok) throw new Error(data.error || 'Baseline sync failed');
+              this.resumeSource = data || {};
+              this.googleBaselineDocumentId = data.google_document_id || this.googleBaselineDocumentId;
+              this.googleResumeMessage = `Baseline synced with ${data.baseline_bullet_count || 0} bullet(s).`;
+            } catch (err) {
+              this.googleResumeError = err?.message || 'Baseline sync failed.';
+            } finally {
+              this.googleResumeSyncing = false;
+            }
+          },
+
+          async disconnectGoogleResume() {
+            if (this.googleResumeDisconnecting) return;
+            this.googleResumeDisconnecting = true;
+            this.googleResumeError = '';
+            this.googleResumeMessage = '';
+            try {
+              const res = await fetch('/api/resume-source/google/disconnect', {method: 'POST'});
+              const data = await res.json();
+              if (!res.ok) throw new Error(data.error || 'Google disconnect failed');
+              this.googleResumeStatus = data || {};
+              this.resumeSource = {};
+              this.googleBaselineDocumentId = '';
+              this.resetResumeSwapWorkspace();
+              this.googleResumeMessage = 'Google disconnected.';
+            } catch (err) {
+              this.googleResumeError = err?.message || 'Google disconnect failed.';
+            } finally {
+              this.googleResumeDisconnecting = false;
+            }
+          },
+
+          async loadApplicationPrep(options = {}) {
+            const showLoading = options.showLoading !== false;
+            const refreshSwapWorkspace = options.refreshSwapWorkspace !== false;
+            const preserveActiveSwapWorkspace = this.resumeSwapWorkspaceHasWorkInProgress();
+            if (this.applicationPrepLoading || this.applicationPrepBackgroundLoading) return;
+            if (showLoading) {
+              this.applicationPrepLoading = true;
+              this.applicationPrepError = '';
+            } else {
+              this.applicationPrepBackgroundLoading = true;
+            }
+            try {
+              if (showLoading) {
+                this.loadResumeSourceSetup();
+              }
               const res = await fetch('/api/application-prep/jobs');
               const data = await res.json();
               if (!res.ok) throw new Error(data.error || 'Application prep load failed');
@@ -2980,10 +3361,19 @@
                 this.selectedApplicationPrepJobId = this.applicationPrepJobs.length ? this.applicationPrepJobs[0].id : null;
               }
               this.applicationPrepLoaded = true;
+              if (refreshSwapWorkspace && this.selectedApplicationPrepJobId && !preserveActiveSwapWorkspace) {
+                this.loadResumeSwapWorkspace(this.selectedApplicationPrepJobId, false);
+              }
             } catch (err) {
-              this.applicationPrepError = err?.message || 'Application prep load failed.';
+              if (showLoading || !this.applicationPrepLoaded) {
+                this.applicationPrepError = err?.message || 'Application prep load failed.';
+              }
             } finally {
-              this.applicationPrepLoading = false;
+              if (showLoading) {
+                this.applicationPrepLoading = false;
+              } else {
+                this.applicationPrepBackgroundLoading = false;
+              }
             }
           },
 
@@ -2991,13 +3381,171 @@
             return (this.applicationPrepJobs || []).find(job => job.id === this.selectedApplicationPrepJobId) || null;
           },
 
-          sortedApplicationPrepBullets() {
-            const bullets = this.selectedApplicationPrepJob()?.application_prep?.prep?.draft_resume_bullets || [];
-            const rank = {high: 0, medium: 1, low: 2};
-            // Preserve the model's order when two bullets have the same confidence.
-            return bullets.map((item, index) => ({item, index}))
-              .sort((a, b) => (rank[String(a.item?.confidence || 'medium').toLowerCase()] ?? 1) - (rank[String(b.item?.confidence || 'medium').toLowerCase()] ?? 1) || a.index - b.index)
-              .map(entry => entry.item);
+          resetResumeSwapWorkspace() {
+            this.resumeSwapError = '';
+            this.resumeSwapMessage = '';
+            this.resumeSwapAnalysis = null;
+            this.resumeSwapAnalysisHash = '';
+            this.resumeSwapVariants = [];
+            this.selectedSwapOutAnchorId = '';
+            this.selectedBringForwardCandidateId = '';
+            this.resumeSwapPairs = [];
+            this.resumeSwapReviewing = false;
+          },
+
+          resumeSwapWorkspaceHasWorkInProgress() {
+            return Boolean(
+              this.resumeSwapAnalysis ||
+              this.resumeSwapPairs.length ||
+              this.resumeSwapReviewing ||
+              this.selectedSwapOutAnchorId ||
+              this.selectedBringForwardCandidateId
+            );
+          },
+
+          async loadResumeSwapWorkspace(jobId, forceAnalysis = false) {
+            const id = Number(jobId);
+            if (!Number.isFinite(id) || id <= 0 || this.resumeSwapLoading) return;
+            this.resumeSwapLoading = true;
+            this.resumeSwapError = '';
+            this.resumeSwapMessage = '';
+            try {
+              const variantsRes = await fetch(`/api/application-prep/jobs/${encodeURIComponent(id)}/resume-variants`);
+              const variantsData = await variantsRes.json();
+              if (!variantsRes.ok) throw new Error(variantsData.error || 'Resume variants load failed');
+              this.resumeSwapVariants = variantsData.variants || [];
+              const job = this.selectedApplicationPrepJob();
+              if (!forceAnalysis && String(job?.status || '').toLowerCase() !== 'done') {
+                this.resumeSwapAnalysis = null;
+                this.resumeSwapAnalysisHash = '';
+                this.resumeSwapPairs = [];
+                this.resumeSwapReviewing = false;
+                return;
+              }
+              const analysisRes = await fetch(`/api/application-prep/jobs/${encodeURIComponent(id)}/resume-variants/swap-analysis`);
+              const analysisData = await analysisRes.json();
+              if (!analysisRes.ok) {
+                if (forceAnalysis) throw new Error(analysisData.error || 'Swap analysis failed');
+                this.resumeSwapAnalysis = null;
+                this.resumeSwapAnalysisHash = '';
+                this.resumeSwapPairs = [];
+                this.resumeSwapReviewing = false;
+                return;
+              }
+              this.resumeSwapAnalysis = analysisData.analysis || null;
+              this.resumeSwapAnalysisHash = analysisData.analysis_hash || '';
+              this.resumeSwapPairs = [];
+              this.selectedSwapOutAnchorId = '';
+              this.selectedBringForwardCandidateId = '';
+              this.resumeSwapReviewing = false;
+            } catch (err) {
+              this.resumeSwapError = err?.message || 'Resume swap workspace failed.';
+            } finally {
+              this.resumeSwapLoading = false;
+            }
+          },
+
+          selectApplicationPrepJob(id) {
+            this.selectedApplicationPrepJobId = id;
+            this.resetResumeSwapWorkspace();
+            this.loadResumeSwapWorkspace(id, false);
+          },
+
+          resumeSwapBaselineById(anchorId) {
+            return (this.resumeSwapAnalysis?.baseline_candidates || []).find(item => item.anchor_id === anchorId) || null;
+          },
+
+          resumeSwapReplacementById(candidateId) {
+            return (this.resumeSwapAnalysis?.replacement_candidates || []).find(item => item.candidate_id === candidateId) || null;
+          },
+
+          isSwapOutPaired(anchorId) {
+            return this.resumeSwapPairs.some(pair => pair.anchor_id === anchorId);
+          },
+
+          isBringForwardPaired(candidateId) {
+            return this.resumeSwapPairs.some(pair => pair.candidate_id === candidateId);
+          },
+
+          isSuggestedSwapCandidate(candidateId) {
+            return (this.resumeSwapAnalysis?.suggested_pairs || []).some(pair => pair.candidate_id === candidateId);
+          },
+
+          selectSwapOutCandidate(anchorId) {
+            if (this.isSwapOutPaired(anchorId)) return;
+            this.selectedSwapOutAnchorId = this.selectedSwapOutAnchorId === anchorId ? '' : anchorId;
+            this.maybeCreateResumeSwapPair();
+          },
+
+          selectBringForwardCandidate(candidateId) {
+            if (this.isBringForwardPaired(candidateId)) return;
+            this.selectedBringForwardCandidateId = this.selectedBringForwardCandidateId === candidateId ? '' : candidateId;
+            this.maybeCreateResumeSwapPair();
+          },
+
+          maybeCreateResumeSwapPair() {
+            if (!this.selectedSwapOutAnchorId || !this.selectedBringForwardCandidateId) return;
+            if (this.isSwapOutPaired(this.selectedSwapOutAnchorId) || this.isBringForwardPaired(this.selectedBringForwardCandidateId)) return;
+            this.resumeSwapPairs.push({
+              anchor_id: this.selectedSwapOutAnchorId,
+              candidate_id: this.selectedBringForwardCandidateId
+            });
+            this.selectedSwapOutAnchorId = '';
+            this.selectedBringForwardCandidateId = '';
+          },
+
+          removeResumeSwapPair(anchorId, candidateId) {
+            this.resumeSwapPairs = this.resumeSwapPairs.filter(pair => pair.anchor_id !== anchorId || pair.candidate_id !== candidateId);
+          },
+
+          resumeSwapPairLabel(pair) {
+            const left = this.resumeSwapBaselineById(pair.anchor_id)?.section || 'Resume';
+            const right = this.resumeSwapReplacementById(pair.candidate_id)?.confidence || 'medium';
+            return `${left} → ${right} confidence replacement`;
+          },
+
+          resumeVariantStatusLabel(variant) {
+            const stage = String(variant?.stage || '').replace(/_/g, ' ');
+            const status = String(variant?.status || 'draft');
+            const label = stage || status;
+            return label.charAt(0).toUpperCase() + label.slice(1);
+          },
+
+          async saveResumeSwapDraft() {
+            const jobId = Number(this.selectedApplicationPrepJobId || 0);
+            if (!jobId || !this.resumeSwapAnalysis || this.resumeSwapSaving) return;
+            this.resumeSwapSaving = true;
+            this.resumeSwapError = '';
+            this.resumeSwapMessage = '';
+            try {
+              const replacements = this.resumeSwapPairs.map(pair => {
+                const replacement = this.resumeSwapReplacementById(pair.candidate_id) || {};
+                return {
+                  anchor_id: pair.anchor_id,
+                  candidate_id: pair.candidate_id,
+                  approved_bullet: replacement.bullet || '',
+                  edited: false,
+                  grounding_acknowledged: false
+                };
+              });
+              const res = await fetch(`/api/application-prep/jobs/${encodeURIComponent(jobId)}/resume-variants`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                  analysis_hash: this.resumeSwapAnalysisHash,
+                  replacements
+                })
+              });
+              const data = await res.json();
+              if (!res.ok) throw new Error(data.error || 'Could not generate resume PDF');
+              this.resumeSwapVariants = [data.variant, ...this.resumeSwapVariants].filter(Boolean);
+              this.resumeSwapMessage = data.variant?.has_pdf ? 'Tailored resume PDF generated. Use Download PDF in Generated PDFs.' : 'Resume swaps saved.';
+              this.resumeSwapReviewing = false;
+            } catch (err) {
+              this.resumeSwapError = err?.message || 'Could not generate resume PDF.';
+            } finally {
+              this.resumeSwapSaving = false;
+            }
           },
 
           applicationPrepHasActive() {
@@ -3035,8 +3583,8 @@
             const value = String(status || '').toLowerCase();
             const descriptions = {
               queued: 'Waiting for AI prep.',
-              running: 'Generating resume suggestions.',
-              done: 'Ready to review.',
+              running: 'Preparing resume positioning and swap candidates.',
+              done: 'Ready to review swaps and generate a PDF.',
               stale: 'Resume or job changed since this was generated.',
               failed: 'Prep failed. Review the error and try again.',
               ineligible: 'This job does not meet the current Application Prep match threshold.',
@@ -3045,48 +3593,16 @@
             return descriptions[value] || 'Prep status is unavailable.';
           },
 
-          applicationPrepEvidenceNote(bullet) {
-            const target = String(bullet?.bullet || '');
-            const notes = this.selectedApplicationPrepJob()?.application_prep?.prep?.evidence_notes || [];
-            return notes.find(item => String(item?.draft_bullet || '') === target) || {};
-          },
-
           formatPercent(value) {
             const parsed = Number(value);
             return Number.isFinite(parsed) ? `${Math.round(parsed)}%` : '-';
-          },
-
-          async copyApplicationPrepBullet(text) {
-            const value = String(text || '').trim();
-            if (!value) return;
-            try {
-              if (navigator.clipboard?.writeText) {
-                await navigator.clipboard.writeText(value);
-              } else {
-                const textarea = document.createElement('textarea');
-                textarea.value = value;
-                textarea.setAttribute('readonly', '');
-                textarea.style.position = 'fixed';
-                textarea.style.opacity = '0';
-                document.body.appendChild(textarea);
-                textarea.select();
-                document.execCommand('copy');
-                document.body.removeChild(textarea);
-              }
-              this.copiedApplicationPrepBullet = value;
-              window.setTimeout(() => {
-                if (this.copiedApplicationPrepBullet === value) this.copiedApplicationPrepBullet = '';
-              }, 1800);
-            } catch (err) {
-              this.applicationPrepError = 'Copy failed. Select the bullet text and copy it manually.';
-            }
           },
 
           async queueApplicationPrep(id) {
             if (this.applicationPrepSaving) return;
             const jobId = Number(id);
             if (!Number.isFinite(jobId) || jobId <= 0) return;
-            const confirmed = window.confirm('Regenerate suggestions for this job? This may replace the current prep output.');
+            const confirmed = window.confirm('Regenerate prep for this job? This may replace the current prep output and require reloading swap recommendations.');
             if (!confirmed) return;
             this.applicationPrepSaving = true;
             this.applicationPrepError = '';
@@ -3257,6 +3773,7 @@
               this.loadApplicationPrep();
             } else if (this.view === 'settings') {
               this.loadApplicationPrepSettings();
+              this.loadResumeSourceSetup();
             }
             this.discoveryPoller = setInterval(() => {
               // Only poll while the discovery tab is visible and auto-refresh is still enabled.
@@ -3266,7 +3783,7 @@
             }, 3000);
             this.applicationPrepPoller = setInterval(() => {
               if (this.view === 'applicationPrep' && this.applicationPrepHasActive()) {
-                this.loadApplicationPrep();
+                this.loadApplicationPrep({ showLoading: false, refreshSwapWorkspace: false });
               }
             }, 3000);
           }

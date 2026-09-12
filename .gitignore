@@ -9,6 +9,8 @@ JobScrape.code-workspace
 /tests/*
 !/tests/test_timestamp_consistency.py
 !/tests/test_ollama_fail_fast.py
+!/tests/test_resume_variants.py
+!/tests/test_google_resume.py
 !/scripts/
 /scripts/*
 !/scripts/migrate_timestamps_to_utc.py
@@ -26,10 +28,12 @@ JobScrape.code-workspace
 /config/job_discovery_seeds.json
 /data/
 /google_service_account.json
+/quickstart-*.json
 /resume.txt
 /scheduler/
 /steps.json
 /test.json
+/*-variant-*.pdf
 
 # Pytest artifacts created by local and agent-assisted test runs.
 /.pytest_cache/
