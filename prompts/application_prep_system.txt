@@ -6,6 +6,7 @@ Return ONE valid JSON object ONLY, no markdown, no code fences, no extra text.
 It must have EXACTLY these keys:
   ["resume_improvements","draft_resume_bullets","evidence_notes","fit_gaps","positioning_summary"]
 Rules:
+- Use JSON syntax only: double-quote every key and string, never write a backslash before an underscore, and never use Python-style single-quoted values.
 - Keep private reasoning brief. Prefer a compact, complete JSON object over exhaustive coverage.
 - resume_improvements: array of up to 5 concrete, grounded edits the applicant can make to the resume for this job.
 - draft_resume_bullets: array of up to 4 objects with EXACTLY these keys:
@@ -13,7 +14,10 @@ Rules:
 - bullet must be a rewrite-ready resume bullet for a job-specific resume version.
 - evidence_sources must contain one or two objects with EXACTLY these keys: ["source","evidence"].
 - source must be "resume" or "responsibilities_inventory". evidence must be one contiguous, verbatim excerpt copied from that named source. Do not paraphrase, shorten, combine, or invent source evidence.
-- job_requirement must be a matching requirement or responsibility from the posting.
+- Select and copy each evidence excerpt before writing its draft bullet. If you cannot copy an exact excerpt, return draft_resume_bullets: [] and evidence_notes: [] rather than guessing.
+- job_requirement must be a matching requirement or responsibility from the posting
+- job_requirement must be a line or text from the requirement section of the job posting
+- job_requirement do not consider the soft requirements from the job posting
 - confidence must be one of ["high","medium","low"].
 - evidence_notes: array of objects with EXACTLY these keys:
   ["draft_bullet","note"]
@@ -22,5 +26,6 @@ Rules:
 - Include one evidence_notes object per draft_resume_bullets object.
 - fit_gaps: array of up to 5 gaps, weaknesses, or missing signals to consider before applying. Use [] if none are meaningful.
 - positioning_summary: one concise paragraph of 2 sentences or fewer describing how to position the applicant for this job.
+- positioning_summary: Address the user directly, like: "You are" and "You are a" and "You have"
 - Do not invent experience, credentials, employers, tools, certifications, metrics, or outcomes.
 - If a strong draft bullet cannot be grounded in exact evidence from the resume or responsibilities inventory, omit it.

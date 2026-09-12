@@ -93,7 +93,7 @@
               <span class="ml-2">Updated: <span class="font-semibold" x-text="sum(updated)"></span></span>
               <span class="ml-2">Missing: <span class="font-semibold" x-text="sum(missing)"></span></span>
               <span class="ml-2">Errors: <span class="font-semibold" x-text="sum(error)"></span></span>
-              <span class="ml-2">Baseline Seen: <span class="font-semibold" x-text="sum(total_seen)"></span></span>
+              <span class="ml-2">Peak Daily Baseline Seen: <span class="font-semibold" x-text="max(total_seen)"></span></span>
               <span class="ml-2">Net Δ: <span class="font-semibold" x-text="sum(net_change)"></span></span>
             </div>
           </section>
@@ -169,8 +169,8 @@
               <canvas id="runsRateChart"></canvas>
             </div>
             <p class="mt-2 text-xs text-slate-500">
-              Daily counts deduplicate repeated runs by job. Baseline seen is the largest run total for the day.
-              Change % = (Inserted + Updated + Missing) / Baseline Seen · 100. Net % = (Inserted − Missing) / Baseline Seen · 100.
+              Daily counts deduplicate repeated runs by job. Daily baseline seen is the largest run total for the day, not a cumulative unique-seen count.
+              Change % = (Inserted + Updated + Missing) / Daily Baseline Seen · 100. Net % = (Inserted − Missing) / Daily Baseline Seen · 100.
               Dashed lines show 7-day rolling averages.
             </p>
           </section>
@@ -1683,6 +1683,8 @@
 
           // Add all numeric items in an array, treating missing values as zero.
           sum(arr) { return (arr || []).reduce((a,b)=>a+(b||0), 0); },
+          // Baseline seen is a daily level, so the range summary reports its peak.
+          max(arr) { return (arr || []).reduce((a,b)=>Math.max(a, b || 0), 0); },
 
           // ---------------- RUNS ----------------
           // Fetch the REST summary payload and refresh both run charts.
@@ -1765,9 +1767,9 @@
                 backgroundColor: 'rgba(249, 115, 22, 0.9)', borderColor: 'rgb(249, 115, 22)' }
             ];
 
-            // Overlay the total seen line on top of the stacked bars.
+            // Overlay the daily run baseline on top of the stacked bars.
             const totalDataset = {
-              label: 'Baseline Seen',
+              label: 'Daily Baseline Seen',
               data: this.total_seen,
               type: 'line',
               yAxisID: 'y',

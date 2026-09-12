@@ -374,6 +374,7 @@ The run dashboard visuals hydrate from `GET /api/runs/summary?days=<1-365>`. The
 - Daily counts are unique daily job impact, deduplicated by `(site, job_id_text)` from `job_changes`.
 - If one job has several changes in a day, an insert wins; otherwise the final daily missing state wins; otherwise the job counts as updated.
 - `baseline_total_seen` is the largest `integration_runs.total_seen` value recorded for that local dashboard day, not the sum of repeated runs.
+- The black dashboard line labeled `Daily Baseline Seen` is a per-day baseline, not a cumulative unique-seen total. With only a few runs, it can stay flat even when the missing count looks large because missing jobs are daily change events and unchanged historical job observations are not stored per job.
 - `change_rate_pct` is `(inserted + updated + missing) / baseline_total_seen * 100`.
 - `net_rate_pct` is `(inserted - missing) / baseline_total_seen * 100`.
 - Historical unique unchanged/seen jobs are not exact because unchanged per-job observations are not stored; the dashboard keeps unchanged detail on individual recent runs.
@@ -461,6 +462,7 @@ Important details:
 - Open **Settings** in the dashboard to set Application Prep's minimum reviewed match score (default `75`, allowed range `0`-`100`) and maintain one active Markdown Responsibilities & Value inventory. Jobs below that score, or without a reviewed score, can still be moved forward but never queue or run Application Prep.
 - Draft resume bullets must cite exact source text. Evidence can come from `resume.txt`, the Responsibilities & Value inventory, or one excerpt from each. They are review-ready drafts, not invented experience.
 - The inventory is stored in the database as Markdown. It is sent only to the Application Prep prompt, never to match scoring or Fit Briefs; `APPLICATION_PREP_INVENTORY_MAX_TOKENS` limits the approximate amount sent to Ollama (default `1200`) while retaining the full saved Markdown.
+- Application Prep requests a strict JSON Schema from Ollama in addition to validating the returned evidence against the exact prompt-visible resume or inventory text. When the model cannot copy a defensible evidence excerpt, it is instructed to return no suggested bullets rather than inventing provenance.
 - Status values are `queued`, `running`, `done`, `failed`, `stale`, and `ineligible`. A done prep becomes stale when the resume, Responsibilities & Value inventory, job content, or schema version changes.
 - A standalone job page such as `/job/crowdstrike/R26320` includes **Move to Application Prep**. It records the existing Move forward decision, queues an eligible job, and opens Application Prep focused on that job. Existing eligible prep opens without re-queueing.
 - Process only the Application Prep queue with:
@@ -914,6 +916,8 @@ The task runs `scripts\run-ai-analysis-scheduled.ps1` once per hour through Powe
 The scheduled wrapper relies on the analyzer's best-effort Ollama startup. If preflight cannot reach the local API, the analyzer tries `ollama serve` once before failing. If the prerequisite check still fails, the analyzer exits with code `1`, the wrapper records the failed exit code in `logs\ai-analysis.log`, and no eligible jobs are submitted. Missing models still require `ollama pull <model>`; confirm the configured model with `ollama list` before retrying the task.
 
 The wrapper sets `PYTHONUTF8=1`, `PYTHONIOENCODING=utf-8`, and `PYTHONUNBUFFERED=1` before launching Python. Keep the encoding settings because scraped job titles can contain Unicode characters that crash Windows Task Scheduler output when Python falls back to a legacy console encoding. The analyzer always writes AI processing output to `logs\ai-analysis.log`.
+
+`analyze_jobs_ollama.py` resolves its own repository directory for local `app` imports and `.env` loading, so it can also be launched safely by an absolute path from another working directory.
 
 By default the wrapper uses `C:\Users\Joey\scoop\apps\python312\current\python.exe`; override it before registration if needed. Use `python.exe`, not `pythonw.exe`, because the analyzer needs normal console streams for manual runs and crash diagnostics.
 

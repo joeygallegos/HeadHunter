@@ -28,6 +28,10 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# Scheduled Task can launch this script outside the repository directory. Keep
+# local package imports and the project .env independent of the caller's CWD.
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
 LOG_DIR = os.path.join(BASE_DIR, "logs")
 CANONICAL_AI_LOG_NAME = "ai-analysis.log"
 LOG_FILE = os.path.join(LOG_DIR, CANONICAL_AI_LOG_NAME)
@@ -67,7 +71,7 @@ from nltk.tokenize import sent_tokenize
 try:
     from dotenv import load_dotenv
 
-    load_dotenv()
+    load_dotenv(os.path.join(BASE_DIR, ".env"))
 except Exception:
     pass
 
@@ -584,6 +588,7 @@ def invoke_ollama_json(
     num_predict: Optional[int] = None,
     think: Optional[Any] = None,
     num_ctx: Optional[int] = None,
+    response_format: Any = "json",
 ) -> str:
     """Call Ollama directly so socket timeout failures return to the worker."""
     wire_messages = []
@@ -599,7 +604,7 @@ def invoke_ollama_json(
         "model": OLLAMA_MODEL,
         "messages": wire_messages,
         "stream": False,
-        "format": "json",
+        "format": response_format,
         "think": OLLAMA_THINK if think is None else think,
         "keep_alive": OLLAMA_KEEP_ALIVE,
         "options": {
@@ -1198,6 +1203,74 @@ APPLICATION_PREP_EVIDENCE_KEYS = {
     "draft_bullet",
     "note",
 }
+# Ollama accepts a JSON Schema in the chat ``format`` field. This prevents the
+# model from drifting into Python-style single quotes or adding unexpected keys
+# before the provenance validator evaluates its grounded evidence.
+APPLICATION_PREP_RESPONSE_FORMAT = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": sorted(APPLICATION_PREP_REQUIRED_KEYS),
+    "properties": {
+        "resume_improvements": {
+            "type": "array",
+            "maxItems": 5,
+            "items": {"type": "string"},
+        },
+        "draft_resume_bullets": {
+            "type": "array",
+            "maxItems": 4,
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": sorted(APPLICATION_PREP_BULLET_KEYS),
+                "properties": {
+                    "bullet": {"type": "string"},
+                    "evidence_sources": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 2,
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": sorted(APPLICATION_PREP_SOURCE_KEYS),
+                            "properties": {
+                                "source": {
+                                    "type": "string",
+                                    "enum": sorted(APPLICATION_PREP_EVIDENCE_SOURCE_TYPES),
+                                },
+                                "evidence": {"type": "string"},
+                            },
+                        },
+                    },
+                    "job_requirement": {"type": "string"},
+                    "confidence": {
+                        "type": "string",
+                        "enum": sorted(FIT_BRIEF_CONFIDENCE),
+                    },
+                },
+            },
+        },
+        "evidence_notes": {
+            "type": "array",
+            "maxItems": 4,
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": sorted(APPLICATION_PREP_EVIDENCE_KEYS),
+                "properties": {
+                    "draft_bullet": {"type": "string"},
+                    "note": {"type": "string"},
+                },
+            },
+        },
+        "fit_gaps": {
+            "type": "array",
+            "maxItems": 5,
+            "items": {"type": "string"},
+        },
+        "positioning_summary": {"type": "string"},
+    },
+}
 
 
 def _is_exact_prompt_evidence(evidence_text: str, source_document: str) -> bool:
@@ -1456,9 +1529,12 @@ def application_prep_repair_prompt(raw: str, validation_error: str = "") -> str:
         "with exactly these keys: resume_improvements, draft_resume_bullets, "
         "evidence_notes, fit_gaps, positioning_summary. draft_resume_bullets entries "
         "must have exactly bullet, evidence_sources, job_requirement, confidence. "
+        "Use JSON double quotes for every key and string; never use single-quoted values "
+        "or escape underscores in key names. "
         "evidence_sources must be a list of exact source/evidence objects copied as a "
         "contiguous, verbatim excerpt from the resume or responsibilities inventory. "
-        "Do not summarize, shorten, or combine evidence. evidence_notes "
+        "Do not summarize, shorten, or combine evidence. If you cannot copy exact evidence, "
+        "return empty draft_resume_bullets and evidence_notes arrays. evidence_notes "
         "entries must have exactly draft_bullet and note, and draft_bullet must match one "
         "generated bullet exactly. No markdown or extra text.\n\n"
         f"{validation_note}"
@@ -1490,6 +1566,7 @@ def analyze_application_prep_worker(
                 num_predict=current_num_predict,
                 think=APPLICATION_PREP_THINK,
                 num_ctx=APPLICATION_PREP_NUM_CTX,
+                response_format=APPLICATION_PREP_RESPONSE_FORMAT,
             )
             took += time.time() - t0
             parsed = parse_json_strict(raw) or {}

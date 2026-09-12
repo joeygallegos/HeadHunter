@@ -1434,7 +1434,7 @@ def fetch_runs_summary(days: int) -> Dict[str, Any]:
         "timezone": _get_local_tz_name(),
         "metrics_definition": {
             "daily_counts": "unique daily job impact",
-            "baseline": "max run total_seen for the day",
+            "baseline": "daily baseline seen; max integration_runs.total_seen for the local dashboard day, not a cumulative unique-seen count",
             "change_rate": "(inserted + updated + missing) / baseline",
             "net_rate": "(inserted - missing) / baseline",
         },
