@@ -62,6 +62,7 @@ load_dotenv()
 # NOTE: app/models.py currently prints DATABASE_URL on import. Remove that print.
 from app.models import (  # type: ignore
     APPLICATION_PREP_DEFAULT_MIN_MATCH,
+    AIProcessingStatus,
     ApplicationPrepSettings,
     ResponsibilitiesInventory,
     Base,
@@ -79,6 +80,7 @@ from app.models import (  # type: ignore
     ensure_job_fit_briefs_table,
     ensure_job_application_preps_table,
     ensure_application_prep_settings_table,
+    ensure_ai_processing_status_table,
     ensure_responsibilities_inventory_table,
     ensure_job_resume_variants_table,
     ensure_resume_source_settings_table,
@@ -92,6 +94,16 @@ from app.google_resume import (
     normalize_google_config,
 )
 from app.resume_pdf import render_resume_pdf_bytes
+from app.steps_templates import (
+    build_steps_template,
+    get_steps_template_metadata,
+    list_steps_templates,
+)
+from app.steps_template_events import (
+    append_event as append_template_event,
+    metrics_enabled as template_metrics_enabled,
+    read_recent_events as read_recent_template_events,
+)
 from app.resume_variants import (
     RESUME_SOURCE_MODE_GOOGLE_DOC,
     RESUME_SOURCE_MODE_RESUME_TXT,
@@ -456,6 +468,7 @@ def _ensure_reference_fields_column() -> None:
         ensure_job_fit_briefs_table(bind)
         ensure_job_application_preps_table(bind)
         ensure_application_prep_settings_table(bind)
+        ensure_ai_processing_status_table(bind)
         ensure_responsibilities_inventory_table(bind)
         ensure_resume_source_settings_table(bind)
         ensure_job_resume_variants_table(bind)
@@ -2048,6 +2061,103 @@ def fetch_runs_summary(days: int) -> Dict[str, Any]:
         },
         "daily": daily,
         "recent_runs": _serialize_recent_runs(runs),
+        "ollama_processing": fetch_ollama_processing_report(),
+    }
+
+
+def fetch_ollama_processing_report(limit: int = 25) -> Dict[str, Any]:
+    """Summarize active jobs that have not received the primary AI analysis pass.
+
+    This intentionally mirrors analyze_jobs_ollama.select_job_ids(): an active
+    job is awaiting Ollama when its ai_analysis payload is absent. AI score
+    fields alone are not used because a valid processor pass always stores the
+    payload, while a partial legacy row may not.
+    """
+    pending_filter = or_(Job.ai_analysis.is_(None), func.trim(Job.ai_analysis) == "")
+    content_filter = or_(
+        func.length(func.trim(func.coalesce(Job.title, ""))) > 0,
+        func.length(func.trim(func.coalesce(Job.desc, ""))) > 0,
+    )
+    limit = max(1, min(int(limit or 25), 100))
+
+    with SessionLocal() as session:
+        active_count = session.scalar(
+            select(func.count()).select_from(Job).where(Job.is_active.is_(True))
+        ) or 0
+        awaiting_count = session.scalar(
+            select(func.count()).select_from(Job).where(Job.is_active.is_(True), pending_filter)
+        ) or 0
+        ready_count = session.scalar(
+            select(func.count()).select_from(Job).where(
+                Job.is_active.is_(True), pending_filter, content_filter
+            )
+        ) or 0
+        pending_jobs = (
+            session.execute(
+                select(Job)
+                .where(Job.is_active.is_(True), pending_filter)
+                .order_by(Job.discovery_date.asc(), Job.id.asc())
+                .limit(limit)
+            )
+            .scalars()
+            .all()
+        )
+
+    # The report is diagnostic only; it does not queue or mutate any job.
+    return {
+        "active_count": int(active_count),
+        "processed_count": max(0, int(active_count) - int(awaiting_count)),
+        "awaiting_count": int(awaiting_count),
+        "ready_count": int(ready_count),
+        "missing_content_count": max(0, int(awaiting_count) - int(ready_count)),
+        "jobs": [
+            {
+                "id": job.id,
+                "site": job.site or "",
+                "job_id": job.job_id or "",
+                "title": job.title or "(no title)",
+                "discovery_date": _fmt_dt(job.discovery_date) or "Unknown",
+                "has_content": bool((job.title or "").strip() or (job.desc or "").strip()),
+            }
+            for job in pending_jobs
+        ],
+        "display_limit": limit,
+        "current_run": _read_current_ollama_run(),
+    }
+
+
+def _read_current_ollama_run() -> Dict[str, Any]:
+    """Read the AI worker heartbeat from the shared database.
+
+    The dashboard and GPU host need only share the database; they do not need
+    a shared filesystem. A stale heartbeat is shown as unavailable rather than
+    incorrectly reporting an old in-progress batch as live.
+    """
+    _ensure_reference_fields_column()
+    with SessionLocal() as session:
+        status = session.execute(
+            select(AIProcessingStatus)
+            .where(AIProcessingStatus.worker_name == "primary")
+            .limit(1)
+        ).scalar_one_or_none()
+    if status is None:
+        return {"status": "unavailable", "message": "The AI worker has not published status to the shared database."}
+
+    now = utc_now_naive()
+    heartbeat = status.heartbeat_at
+    is_fresh = bool(heartbeat and (now - heartbeat) <= timedelta(minutes=2))
+    if status.status == "running" and not is_fresh:
+        return {"status": "unavailable", "message": "AI worker heartbeat is stale; its current work is unknown."}
+    try:
+        jobs = json.loads(status.current_jobs_json or "[]")
+    except (TypeError, json.JSONDecodeError):
+        jobs = []
+    return {
+        "status": "processing" if status.status == "running" else status.status,
+        "message": status.message or ("Scheduled AI analysis is running." if status.status == "running" else "No AI analysis run is active."),
+        "started_at": _fmt_dt(status.started_at) or "",
+        "inflight_count": len(jobs),
+        "jobs": jobs if isinstance(jobs, list) else [],
     }
 
 
@@ -2375,12 +2485,12 @@ STATIC_QUERY_COLUMNS: List[Dict[str, str]] = [
     {"key": "run_id", "label": "Run ID", "group": "Core", "type": "number"},
     {"key": "first_seen_run_id", "label": "First Seen Run", "group": "Core", "type": "number"},
     {"key": "last_seen_run_id", "label": "Last Seen Run", "group": "Core", "type": "number"},
-    {"key": "ai_match_percentage", "label": "AI Match %", "group": "AI", "type": "number"},
+    {"key": "ai_match_percentage", "label": "Overall AI Match %", "group": "AI", "type": "number", "description": "Overall fit across skills, experience, responsibilities, domain, location, and compensation."},
     {"key": "ai_salary", "label": "AI Salary", "group": "AI", "type": "text"},
     {"key": "ai_fit_summary", "label": "AI Fit Summary", "group": "AI", "type": "text"},
     {"key": "ai_keywords_overlap", "label": "AI Keywords Overlap", "group": "AI", "type": "text"},
     {"key": "ai_missing_keywords", "label": "AI Missing Keywords", "group": "AI", "type": "text"},
-    {"key": "ai_experience_match", "label": "AI Experience", "group": "AI", "type": "text"},
+    {"key": "ai_experience_match", "label": "Experience Fit", "group": "AI", "type": "text", "description": "Experience fit compares stated experience requirements only; it is one input to the overall AI match, not a hiring decision."},
     {"key": "ai_location_policy_match", "label": "AI Location", "group": "AI", "type": "text"},
     {"key": "ai_analyzed_at", "label": "AI Analyzed", "group": "AI", "type": "datetime"},
     {"key": "fit_brief_generated_at", "label": "Fit Brief Generated", "group": "Fit Brief", "type": "datetime"},
@@ -3774,6 +3884,62 @@ def api_steps():
         return jsonify(error=str(exc)), 500
 
 
+@app.route("/api/steps/templates", methods=["GET", "POST"])
+def api_steps_templates():
+    """List starter templates or build one validated, unsaved recipe."""
+    if request.method == "GET":
+        return jsonify(templates=list_steps_templates())
+
+    data = request.get_json(silent=True) or {}
+    try:
+        metadata = get_steps_template_metadata(data.get("template_id", ""))
+        steps = build_steps_template(metadata["id"], data.get("url", ""))
+        # Reuse the editor's schema validation so templates cannot drift from
+        # the scraper's supported action contract.
+        _validate_steps_editor_schema({"template_preview": steps})
+        template_session_id = uuid.uuid4().hex
+        append_template_event(
+            {
+                "event_type": "generated",
+                "template_session_id": template_session_id,
+                "template_id": metadata["id"],
+            }
+        )
+        return jsonify(
+            template=metadata,
+            steps=steps,
+            template_session_id=template_session_id,
+        )
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
+    except Exception as exc:
+        return jsonify(error=str(exc)), 500
+
+
+@app.route("/api/steps/template-events", methods=["GET", "POST"])
+def api_steps_template_events():
+    """Expose opt-in local aggregate events; never accept job or URL content."""
+    if request.method == "GET":
+        return jsonify(enabled=template_metrics_enabled(), events=read_recent_template_events())
+
+    data = request.get_json(silent=True) or {}
+    try:
+        metadata = get_steps_template_metadata(data.get("template_id", ""))
+        if data.get("event_type") != "client_validation_failed":
+            raise ValueError("Unsupported template event_type")
+        append_template_event(
+            {
+                "event_type": "client_validation_failed",
+                "template_session_id": str(data.get("template_session_id") or "")[:64],
+                "template_id": metadata["id"],
+                "reason": str(data.get("reason") or "invalid_input")[:64],
+            }
+        )
+        return jsonify(recorded=template_metrics_enabled())
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
+
+
 @app.route("/api/steps/preview", methods=["POST"])
 def api_steps_preview():
     data = request.get_json(silent=True) or {}
@@ -3789,7 +3955,22 @@ def api_steps_preview():
 def api_steps_save():
     data = request.get_json(silent=True) or {}
     try:
-        return jsonify(save_steps_editor_content(data.get("content")))
+        result = save_steps_editor_content(data.get("content"))
+        if result.get("saved"):
+            for metric in data.get("template_metrics", []):
+                if not isinstance(metric, dict):
+                    continue
+                metadata = get_steps_template_metadata(metric.get("template_id", ""))
+                append_template_event(
+                    {
+                        "event_type": "saved",
+                        "template_session_id": str(
+                            metric.get("template_session_id") or ""
+                        )[:64],
+                        "template_id": metadata["id"],
+                    }
+                )
+        return jsonify(result)
     except ValueError as exc:
         return jsonify(error=str(exc)), 400
     except Exception as exc:
@@ -3814,6 +3995,12 @@ def api_runs_summary():
     except Exception:
         days = 30
     return jsonify(fetch_runs_summary(days))
+
+
+@app.route("/api/ollama-processing")
+def api_ollama_processing():
+    """Return live AI coverage and worker heartbeat without rebuilding run charts."""
+    return jsonify(fetch_ollama_processing_report())
 
 
 @app.route("/api/jobs")

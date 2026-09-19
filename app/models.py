@@ -271,6 +271,30 @@ class ResponsibilitiesInventory(Base):
     )
 
 
+class AIProcessingStatus(Base):
+    """One shared-worker heartbeat so a remote dashboard can show live AI work."""
+
+    __tablename__ = "ai_processing_status"
+    __table_args__ = (
+        UniqueConstraint("worker_name", name="uq_ai_processing_status_worker_name"),
+        {"mysql_charset": "utf8mb4", "mysql_collate": "utf8mb4_unicode_ci"},
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    worker_name = Column(String(255), nullable=False)
+    status = Column(String(32), nullable=False, default="idle")
+    total_jobs = Column(Integer, nullable=False, default=0)
+    submitted_jobs = Column(Integer, nullable=False, default=0)
+    completed_jobs = Column(Integer, nullable=False, default=0)
+    processed_jobs = Column(Integer, nullable=False, default=0)
+    failed_jobs = Column(Integer, nullable=False, default=0)
+    current_jobs_json = Column(LONGTEXT().with_variant(Text, "sqlite"), nullable=True)
+    message = Column(Text, nullable=True)
+    started_at = Column(DateTime(timezone=False), nullable=True)
+    heartbeat_at = Column(DateTime(timezone=False), nullable=True)
+    finished_at = Column(DateTime(timezone=False), nullable=True)
+
+
 class ResumeSourceSettings(Base):
     """Per-host resume source used by the future resume variant workflow."""
 
@@ -467,6 +491,12 @@ def ensure_responsibilities_inventory_table(bind=None) -> None:
     """Create the one-row responsibilities inventory table when first needed."""
     target = bind or engine
     Base.metadata.tables["responsibilities_inventory"].create(bind=target, checkfirst=True)
+
+
+def ensure_ai_processing_status_table(bind=None) -> None:
+    """Create the cross-host AI worker heartbeat table when first read."""
+    target = bind or engine
+    Base.metadata.tables["ai_processing_status"].create(bind=target, checkfirst=True)
 
 
 def ensure_resume_source_settings_table(bind=None) -> None:

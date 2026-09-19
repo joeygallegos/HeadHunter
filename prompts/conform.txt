@@ -1,125 +1,175 @@
-Your goal is to clear and create a test.json for a new job source.
+You generate `test.json` entries for the local StepScraper. Given a job-board URL,
+discover its real job-data source and return an exact, paste-ready extraction recipe.
 
-Website:
+## Input
 
-Tasks:
+Job board URL: {{JOB_BOARD_URL}}
+Suggested site key (optional): {{SITE_KEY}}
+Known filters/search terms (optional): {{FILTERS}}
 
-1. Investigate how job listings are loaded.
+## Output contract
 
-   * Start by reviewing the current scraper capabilities and examples in test.json / steps.json so you know which actions already exist.
-   * For JavaScript-heavy sites, run browser network capture early with Selenium or Playwright performance logs:
-     * Load the careers page.
-     * Wait for hydration.
-     * Scroll or click "open positions" if needed.
-     * Collect request URLs containing terms like api, jobs, careers, postings, greenhouse, lever, ashby, workday, or graphql.
-   * Try the discovered network endpoints directly before inspecting minified bundles or writing selectors.
-   * Use browser developer tools, Selenium, Playwright, CURL, network inspection, XHR/fetch requests, GraphQL, embedded JSON, or any other method necessary.
-   * Do not assume the jobs are rendered in the initial HTML.
-   * Identify the actual source of truth for the job data.
+- Return ONLY one fenced `json` code block: no explanation before or after it.
+- It must be valid JSON: one top-level, lowercase site-key property whose value is
+  an array of steps. No comments, trailing commas, placeholders, or invented actions.
+- Extract one row per job. Include `JobTitle`, `JobUrl`, `JobID` when available;
+  include `Location` and `JobDesc` when available. Keep useful source fields too.
+- `JobUrl` must be usable and absolute. Direct JSON can only emit URLs already
+  absolute. For a relative DOM link, extract the `href`, redirect using it, then
+  overwrite `JobUrl` after the redirect with `data_type:"current_url"`.
+- If you cannot establish a reliable multi-job source, return an empty step array
+  for the selected site key instead of guessing.
 
-2. Determine the most reliable extraction strategy.
+## Investigation and strategy
 
-   * Prefer direct API/XHR/JSON endpoints over browser scraping.
-   * Prefer `json_set_payload` + `json_data_extract` when the source of truth is a JSON response.
-   * Use `json_html_data_extract` when the API returns HTML fragments inside JSON.
-   * Only use HTML extraction if no structured data source exists.
-   * Inspect static HTML and Next.js embedded data only as quick triage; avoid spending time on minified bundles unless network capture fails.
+1. First inspect local `test.json`, `steps.json`, and `steps.json.example` for
+   conventions already known to work.
+2. Check the built-in starter recipes before investigating from scratch. When
+   `app/steps_templates.py` is available, copy its Workday, Greenhouse, or Lever
+   recipe verbatim and substitute only the starting URL when its platform matches.
+   These are first-pass templates, not proof that every tenant works unchanged.
+3. Find the source of truth. On JavaScript-heavy pages, capture network traffic
+   after hydration, scrolling, and opening jobs. Look for XHR/fetch/GraphQL URLs
+   containing `api`, `jobs`, `careers`, `postings`, `greenhouse`, `lever`, `ashby`,
+   or `workday`. Try discovered endpoints directly before reading minified bundles.
+4. Prefer, in order: (a) a public GET JSON API that this scraper can load,
+   (b) JSON containing an HTML results
+   fragment, then (c) browser-rendered HTML. Do not use HTML when structured data
+   is available.
+5. Only use an API if it is publicly reachable with a normal GET request. This
+   scraper cannot send POST bodies, custom headers, bearer tokens, or API-specific
+   cookies. It cannot parse jobs embedded inside a normal HTML page's JavaScript
+   state object; use the hydrated DOM in that case.
+6. Confirm the chosen list has multiple jobs, then validate all JSON against this
+   exact contract. `xpath` is a legacy name and ALWAYS takes a CSS selector, not XPath.
 
-3. Review the existing test.json patterns and follow the same conventions.
+## Built-in `/steps` template rules
 
-   * Reuse existing actions when possible.
-   * Do not invent new action types unless absolutely required.
-   * Test your JSON by running scraper test with UTF-8 console output `env:PYTHONIOENCODING='utf-8'; python run.py test`
+The dashboard has `workday`, `greenhouse`, and `lever` templates. Prefer their
+maintained recipes from `app/steps_templates.py` over recreating equivalent DOM
+selectors. If that file is unavailable, use the following rules:
 
+- **Workday:** use the `section[data-automation-id='jobResults']>ul[role='list']>li`
+  list selector, `a[data-automation-id='jobTitle']` for title/link, and
+  `div[data-automation-id='jobPostingDescription']` after redirect. Include the
+  supported `click_next` pagination block with `max_pages: 10`, so list pages are
+  collected before detail pages are opened.
+- **Greenhouse and Lever:** use their maintained list/detail starter only as a
+  first test. Verify the list selector produces job rows before returning it.
+- A template does not outrank a verified public GET JSON source. If a compatible
+  structured endpoint is confirmed, return that instead.
 
-4. Generate the exact JSON steps needed to extract:
+## Top-level actions
 
-   * JobTitle
-   * JobUrl
-   * JobID
-   * Location (if available)
-   * JobDesc (if available)
+| Action | Required fields | Use |
+|---|---|---|
+| `load_url` | `url` | Navigate to a page or JSON endpoint. |
+| `sleep` | none | Wait; optional numeric `seconds`, otherwise configured default. |
+| `scroll_to` | `xpath` or `selector` | Scroll a matching browser element into view. |
+| `click_button` | `xpath` or `selector` | Click a browser element to expose results. |
+| `select_checkbox` | `selector` | Select a checkbox if needed. |
+| `type_text` | `selector`; optional `text` | Clear and type into an input. |
+| `data_extract` | `focus_scope`, nonempty `extract_steps` | One job per matching DOM list element. |
+| `json_set_payload` | none | Save current page body as JSON; must follow `load_url`. |
+| `json_replace_text` | `text_find`, `text_replace` | Change saved payload. For JSONP only, use `"__strip_js_wrapper__"` and `""`. |
+| `json_data_extract` | `focus_scope`, nonempty `extract_steps` | One job per object in top-level JSON array. |
+| `json_html_data_extract` | `html_key` or `focus_html_key`, `focus_scope`, nonempty `extract_steps` | Extract from an HTML fragment held in JSON. |
 
-5. Validate that the resulting workflow would return multiple jobs, not just a single posting.
+## Nested actions
 
-Output requirements:
+### Inside `data_extract`
 
-* Return ONLY the new JSON block to add to test.json.
-* The output must be valid JSON.
-* Do not return explanations unless a blocker prevents implementation.
-* Wrap the JSON code block
+| Action | Required fields | Behavior |
+|---|---|---|
+| `extract` | `as_column`, plus `xpath` unless `data_type` is `current_url` | Read text or `attr_target` from the current list item. `data_type:"url"` identifies a link field; `current_url` needs no selector and saves the browser's absolute URL after redirect. |
+| `redirect` | `using_column` or `link_css` | Open a detail page. Prefer `using_column:"JobUrl"`; `wait_css` is optional. Fields after it read the detail page. |
+| `sleep` | none | Optional numeric `seconds`. |
+| `replace_text` | `using_column`, `text_find`, `text_replace` | Literal replacement in an existing field. |
+| `regex_extract` | `using_column`, `as_column`, `regex_pattern` | Store capture group 1; pattern must contain a capture group. |
+| `next` | none | End current job; keep last. |
 
-Schema reference:
+### Inside `json_data_extract`
 
-{
-    "delta": [
-        {
-            "action": "load_url",
-            "url": "https://delta.avature.net/en_US/careers/SearchJobs/?2884=75200&2884_format=3665&listFilterMode=1"
-        },
-        {
-            "action": "data_extract",
-            "focus_scope": "ul.list--jobs > li.list__item",
-            "extract_steps": [
-                {
-                    "action": "extract",
-                    "as_column": "JobTitle",
-                    "xpath": ".list__item__text__title a",
-                    "attr_target": null
-                },
-                {
-                    "action": "extract",
-                    "data_type": "url",
-                    "as_column": "JobUrl",
-                    "xpath": ".list__item__text__title a",
-                    "attr_target": "href"
-                },
-                {
-                    "action": "extract",
-                    "as_column": "Location",
-                    "xpath": ".list__item__text__subtitle span:nth-of-type(1)",
-                    "attr_target": null
-                },
-                {
-                    "action": "extract",
-                    "as_column": "JobID",
-                    "xpath": ".list__item__text__subtitle span:nth-of-type(2)",
-                    "attr_target": null
-                },
-                {
-                    "action": "regex_extract",
-                    "using_column": "JobID",
-                    "as_column": "JobID",
-                    "regex_pattern": "Ref #([0-9]+)"
-                },
-                {
-                    "action": "redirect",
-                    "using_column": "JobUrl",
-                    "wait_css": ".article__content--rich-text[itemprop='description']"
-                },
-                {
-                    "action": "extract",
-                    "as_column": "JobDesc",
-                    "xpath": ".article__content--rich-text[itemprop='description']",
-                    "attr_target": null
-                },
-                {
-                    "action": "extract",
-                    "data_type": "current_url",
-                    "as_column": "JobUrl"
-                },
-                {
-                    "action": "next"
-                }
-            ]
-        }
-    ]
+Only `extract` and `next` are legal. Each `extract` needs `as_column` and `key`.
+`key` is a dot or `>` path relative to each item. Add `"html_to_text":true` only
+when the selected string contains HTML. JSON extraction cannot redirect, regex,
+normalize URLs, or paginate.
+
+```json
+{"action":"extract","as_column":"JobTitle","key":"job.title"}
+```
+
+### Inside `json_html_data_extract`
+
+Allowed nested actions: `extract`, `redirect`, `extract_detail`, `replace_text`,
+`regex_extract`, `next`. List `extract` behaves like DOM extraction. Set top-level
+`base_url` to the absolute site root for relative links. After `redirect`, use
+`extract_detail` for detail fields; it requires `as_column` and `xpath`/`selector`.
+
+## DOM pagination
+
+Only `data_extract` supports pagination, and only for a visible next button:
+
+```json
+"pagination": {
+  "mode": "click_next",
+  "max_pages": 10,
+  "current_page_css": "...",
+  "next_page_css": "...",
+  "next_disabled_css": "...",
+  "page_wait_ms": 1200,
+  "page_as_column": "__page"
 }
+```
 
+Do NOT invent API offset, cursor, query-parameter, or GraphQL pagination. Do not
+output separate static page URLs unless the user explicitly asks for that scope.
 
-Success criteria:
+For DOM pagination, keep all list fields before `redirect` and detail fields after
+it. The scraper first collects every list page and then visits each detail URL.
 
-* Produces one row per job.
-* Captures title and URL at minimum.
-* Uses the site's underlying data source whenever possible.
-* Matches the structure and style of existing test.json entries.
+## Output templates
+
+Direct JSON API:
+
+```json
+{
+  "site_key": [
+    {"action":"load_url","url":"https://example.com/api/jobs"},
+    {"action":"json_set_payload"},
+    {"action":"json_data_extract","focus_scope":"jobs","extract_steps":[
+      {"action":"extract","as_column":"JobID","key":"id"},
+      {"action":"extract","as_column":"JobTitle","key":"title"},
+      {"action":"extract","as_column":"JobUrl","key":"absoluteUrl"},
+      {"action":"extract","as_column":"Location","key":"location.name"},
+      {"action":"extract","as_column":"JobDesc","key":"description","html_to_text":true},
+      {"action":"next"}
+    ]}
+  ]
+}
+```
+
+DOM list plus detail page:
+
+```json
+{
+  "site_key": [
+    {"action":"load_url","url":"https://example.com/careers"},
+    {"action":"data_extract","focus_scope":"[data-job-row]","extract_steps":[
+      {"action":"extract","as_column":"JobID","xpath":"[data-job-id]","attr_target":"data-job-id"},
+      {"action":"extract","as_column":"JobTitle","xpath":"a[data-job-link]"},
+      {"action":"extract","data_type":"url","as_column":"JobUrl","xpath":"a[data-job-link]","attr_target":"href"},
+      {"action":"extract","as_column":"Location","xpath":"[data-location]"},
+      {"action":"redirect","using_column":"JobUrl","wait_css":"main"},
+      {"action":"extract","as_column":"JobDesc","xpath":"[data-job-description]"},
+      {"action":"extract","data_type":"current_url","as_column":"JobUrl"},
+      {"action":"next"}
+    ]}
+  ]
+}
+```
+
+Before returning, ensure source and strategy match, selectors are CSS and properly
+scoped, every regex has capture group 1, JSON recipes use only JSON nested actions,
+the endpoint needs no unsupported request features, and the result is exactly one
+complete JSON object.

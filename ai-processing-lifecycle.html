@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>JobScrape AI processing lifecycle</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.5;
+    }
+
+    body {
+      max-width: 1400px;
+      margin: 0 auto;
+      padding: 2rem;
+    }
+
+    h1 { margin-bottom: 0.25rem; }
+    .lede { margin-top: 0; max-width: 75ch; }
+    .diagram { overflow-x: auto; padding: 1rem 0; }
+    .diagram svg { min-width: 720px; }
+    .diagram-tools { display: flex; align-items: center; flex-wrap: wrap; gap: 0.5rem; }
+    .diagram-tools button, .diagram-tools input { font: inherit; }
+    .diagram-tools output { min-width: 3.5rem; }
+    #analysis-diagram svg { min-width: 1050px; }
+    .notes { max-width: 95ch; }
+    code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>JobScrape AI processing lifecycle</h1>
+    <p class="lede">
+      These diagrams separate deterministic collection and validation from local Ollama inference,
+      and show where user review remains required before an application artifact is created.
+    </p>
+
+    <!-- Mermaid renders this source in the browser; no JobScrape service is required to view it. -->
+    <h2>1. Optional job-board discovery</h2>
+    <div class="diagram">
+      <pre class="mermaid">
+flowchart LR
+    Seeds[Seed sites and search results] --> Fetch[Python fetches pages and extracts links]
+    Resume[Resume text] --> Criteria[Ollama extracts search criteria]
+    Fetch --> Triage[Ollama triages bounded page and link evidence]
+    Criteria --> Triage
+    Triage --> Suggestions[Suggestions and event log]
+    Suggestions --> Review{Human reviews suggestions}
+    Review -->|Apply| Steps[steps.json]
+    Steps --> Scrape[Scrape and normalize jobs]
+    Scrape --> Jobs[(Jobs database)]
+
+    classDef ai fill:#ede9fe,stroke:#7c3aed,color:#111827;
+    classDef data fill:#ccfbf1,stroke:#0f766e,color:#111827;
+    classDef human fill:#fef3c7,stroke:#d97706,color:#111827;
+    class Triage,Criteria ai;
+    class Jobs,Steps,Suggestions data;
+    class Review human;
+      </pre>
+    </div>
+
+    <h2>2. Job analysis and Fit Brief generation</h2>
+    <div class="diagram-tools" aria-label="Analysis diagram zoom controls">
+      <button type="button" data-zoom-action="out" aria-controls="analysis-diagram">Zoom out</button>
+      <label for="analysis-zoom">Zoom</label>
+      <input id="analysis-zoom" type="range" min="70" max="200" value="150" step="10">
+      <output id="analysis-zoom-value" for="analysis-zoom" aria-live="polite">150%</output>
+      <button type="button" data-zoom-action="in" aria-controls="analysis-diagram">Zoom in</button>
+      <button type="button" data-zoom-action="reset" aria-controls="analysis-diagram">Reset</button>
+    </div>
+    <div class="diagram" id="analysis-diagram" aria-label="Job analysis and Fit Brief lifecycle diagram">
+      <pre class="mermaid">
+flowchart LR
+    Jobs[(Jobs database)] --> Select[Select eligible stored jobs]
+    Resume[Resume text] --> Match
+    Select --> Ready{Ollama server and model ready?}
+    Ready -->|No| Stop[Stop batch and log prerequisite failure]
+    Ready -->|Yes| Match[Stage 1: match and structured compensation]
+    Match --> InitialValid{Stage 1 JSON valid?}
+    InitialValid -->|No| Retry[Retry where configured, then record failure]
+    Retry --> Preserve[Keep existing job fields]
+    InitialValid -->|Yes| Review[Stage 2: private review of candidate JSON]
+    Review --> Reviewed{Reviewed JSON valid?}
+    Reviewed -->|Yes| Store[Store final analysis, compensation, and audit change]
+    Reviewed -->|No| Fallback[Keep valid Stage 1 result]
+    Fallback --> Store
+    Store --> Eligible{Active job meets Fit Brief threshold?}
+    Eligible -->|Yes| Brief[Stage 3: generate and validate Fit Brief]
+    Brief --> BriefStore[(job_fit_briefs)]
+    Eligible -->|No| Dashboard[Dashboard review]
+    BriefStore --> Dashboard
+
+    classDef ai fill:#ede9fe,stroke:#7c3aed,color:#111827;
+    classDef data fill:#ccfbf1,stroke:#0f766e,color:#111827;
+    classDef human fill:#fef3c7,stroke:#d97706,color:#111827;
+    class Match,Review,Brief ai;
+    class Jobs,Store,BriefStore data;
+    class Dashboard human;
+      </pre>
+    </div>
+
+    <h2>3. Application Prep and approval</h2>
+    <div class="diagram">
+      <pre class="mermaid">
+flowchart LR
+    Dashboard[Dashboard review] --> Swipe{User action}
+    Swipe -->|Interesting| Saved[Save for later review]
+    Swipe -->|Move forward and match meets threshold| Queue[(Application Prep queue)]
+    Resume[Resume text] --> Input
+    Inventory[Responsibilities and Value inventory] --> Input
+    Queue --> Input[Build grounded Application Prep input]
+    Input --> Prep[Priority AI generation and strict validation]
+    Prep --> PrepStore[(job_application_preps)]
+    PrepStore --> HumanReview{Human reviews grounded drafts}
+    HumanReview -->|Approve selected changes| Variant[Create resume variant and optional PDF]
+    HumanReview -->|Do not approve| Dashboard
+
+    classDef ai fill:#ede9fe,stroke:#7c3aed,color:#111827;
+    classDef data fill:#ccfbf1,stroke:#0f766e,color:#111827;
+    classDef human fill:#fef3c7,stroke:#d97706,color:#111827;
+    class Prep ai;
+    class Queue,PrepStore data;
+    class Dashboard,Swipe,HumanReview human;
+      </pre>
+    </div>
+
+    <section class="notes">
+      <h2>Lifecycle rules captured here</h2>
+      <ul>
+        <li>Python fetches and normalizes external pages; Ollama receives bounded evidence and returns structured JSON.</li>
+        <li>Invalid or unavailable AI output does not overwrite an existing job result. The processor retries where configured, records failures, and preserves the last valid data.</li>
+        <li>Fit Briefs are only generated for active jobs at or above <code>AI_FIT_BRIEF_MIN_MATCH</code> (75 by default).</li>
+        <li>Application Prep is queued by the dashboard but generated only by the separate Ollama-capable processor for eligible Move forward jobs.</li>
+        <li>AI suggestions remain grounded in resume and inventory evidence; a person chooses whether to approve resume changes or create an artifact.</li>
+      </ul>
+    </section>
+  </main>
+
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11.12.1/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({
+      startOnLoad: false,
+      theme: "neutral",
+      securityLevel: "strict",
+      flowchart: { htmlLabels: false, useMaxWidth: true, nodeSpacing: 30, rankSpacing: 40 }
+    });
+
+    await mermaid.run({ nodes: document.querySelectorAll(".mermaid") });
+
+    const analysisDiagram = document.getElementById("analysis-diagram");
+    const analysisZoom = document.getElementById("analysis-zoom");
+    const analysisZoomValue = document.getElementById("analysis-zoom-value");
+    const defaultZoom = 150;
+
+    function setAnalysisZoom(value) {
+      const zoom = Math.max(70, Math.min(200, Number(value)));
+      const svg = analysisDiagram.querySelector("svg");
+      if (!svg) return;
+      svg.style.width = `${zoom}%`;
+      analysisZoom.value = String(zoom);
+      analysisZoomValue.value = `${zoom}%`;
+      analysisZoomValue.textContent = `${zoom}%`;
+    }
+
+    analysisZoom.addEventListener("input", () => setAnalysisZoom(analysisZoom.value));
+    document.querySelectorAll("[data-zoom-action]").forEach((button) => {
+      button.addEventListener("click", () => {
+        const action = button.dataset.zoomAction;
+        const nextZoom = action === "in" ? Number(analysisZoom.value) + 10
+          : action === "out" ? Number(analysisZoom.value) - 10
+          : defaultZoom;
+        setAnalysisZoom(nextZoom);
+      });
+    });
+    setAnalysisZoom(defaultZoom);
+  </script>
+</body>
+</html>

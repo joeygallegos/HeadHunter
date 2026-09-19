@@ -27,7 +27,11 @@ Rules:
 - fit_summary: one short sentence explaining the score (max $FIT_SUMMARY_MAX_CHARS chars, no lists).
 - keywords_overlap: top overlapping skills/tech (array of up to $KEYWORD_LIST_LIMIT strings, deduplicated).
 - missing_keywords: most critical missing skills/tech (array of up to $KEYWORD_LIST_LIMIT strings, deduplicated).
-- experience_match: one of ["underqualified","qualified","overqualified"].
+- experience_match: assess only the candidate's experience against the posting's stated seniority, years, and responsibility requirements. Use one of ["underqualified","qualified","overqualified"]:
+  - "underqualified" when there is a material shortfall against an explicit experience, seniority, or responsibility requirement.
+  - "qualified" when the resume meets the stated experience requirements, including defensible equivalent or transferable experience.
+  - "overqualified" when the resume materially exceeds the stated experience requirements.
+  This is one input to match_percentage, not a hiring decision and not a score cap: a job can have a solid overall score while still being underqualified on experience because other strengths may offset that gap.
 - location_policy_match: one of ["remote","hybrid","onsite","unknown"]; use "hybrid" for any required office presence, "onsite" for fully in-office, "remote" only when the job is fully remote, and "unknown" when the policy is unclear.
 If you cannot analyze, return exactly: {"error":"Insufficient information provided"}
 

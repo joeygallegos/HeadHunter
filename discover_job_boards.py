@@ -26,6 +26,7 @@ from bs4 import BeautifulSoup
 
 from app.event_log import append_event, read_event_log, reset_event_log
 from app.file_utils import read_json_file, read_text, write_json
+from app.steps_templates import build_steps_template as build_known_steps_template
 from app.steps_suggestions import merge_steps_suggestions
 
 try:
@@ -547,95 +548,8 @@ def site_key_from_url(url: str, platform: str) -> str:
 
 def build_steps_template(url: str, platform: str) -> Tuple[List[Dict[str, Any]], bool, str]:
     manual_note = "Generated selector template should be test-run before regular scraping."
-    if platform == "workday":
-        steps = [
-            {"action": "load_url", "url": url},
-            {
-                "action": "data_extract",
-                "focus_scope": "section[data-automation-id='jobResults']>ul[role='list']>li",
-                "extract_steps": [
-                    {
-                        "action": "extract",
-                        "as_column": "JobID",
-                        "xpath": "ul[data-automation-id='subtitle']",
-                        "attr_target": None,
-                    },
-                    {
-                        "action": "extract",
-                        "as_column": "JobTitle",
-                        "xpath": "a[data-automation-id='jobTitle']",
-                        "attr_target": None,
-                    },
-                    {
-                        "action": "extract",
-                        "data_type": "url",
-                        "as_column": "JobUrl",
-                        "xpath": "a[data-automation-id='jobTitle']",
-                        "attr_target": "href",
-                    },
-                    {"action": "redirect", "using_column": "JobUrl"},
-                    {"action": "sleep"},
-                    {
-                        "action": "extract",
-                        "as_column": "JobDesc",
-                        "xpath": "div[data-automation-id='jobPostingDescription']",
-                        "attr_target": None,
-                    },
-                    {"action": "next"},
-                ],
-            },
-        ]
-        return steps, False, manual_note
-
-    if platform == "greenhouse":
-        steps = [
-            {"action": "load_url", "url": url},
-            {
-                "action": "data_extract",
-                "focus_scope": "div.opening, section.opening, tr.job-post",
-                "extract_steps": [
-                    {"action": "extract", "as_column": "JobTitle", "xpath": "a", "attr_target": None},
-                    {
-                        "action": "extract",
-                        "data_type": "url",
-                        "as_column": "JobUrl",
-                        "xpath": "a",
-                        "attr_target": "href",
-                    },
-                    {"action": "regex_extract", "using_column": "JobUrl", "as_column": "JobID", "regex_pattern": r"(\d+|[^/]+)$"},
-                    {"action": "redirect", "using_column": "JobUrl"},
-                    {"action": "sleep"},
-                    {"action": "extract", "as_column": "JobDesc", "xpath": "#content, main, body", "attr_target": None},
-                    {"action": "next"},
-                ],
-            },
-        ]
-        return steps, False, manual_note
-
-    if platform == "lever":
-        steps = [
-            {"action": "load_url", "url": url},
-            {
-                "action": "data_extract",
-                "focus_scope": ".posting, .posting-title, a[href*='/jobs/']",
-                "extract_steps": [
-                    {"action": "extract", "as_column": "JobTitle", "xpath": "a, h5", "attr_target": None},
-                    {
-                        "action": "extract",
-                        "data_type": "url",
-                        "as_column": "JobUrl",
-                        "xpath": "a",
-                        "attr_target": "href",
-                    },
-                    {"action": "regex_extract", "using_column": "JobUrl", "as_column": "JobID", "regex_pattern": r"([^/]+)$"},
-                    {"action": "redirect", "using_column": "JobUrl"},
-                    {"action": "sleep"},
-                    {"action": "extract", "as_column": "JobDesc", "xpath": ".content, main, body", "attr_target": None},
-                    {"action": "next"},
-                ],
-            },
-        ]
-        return steps, False, manual_note
+    if platform in {"workday", "greenhouse", "lever"}:
+        return build_known_steps_template(platform, url), False, manual_note
 
     steps = [
         {"action": "load_url", "url": url},

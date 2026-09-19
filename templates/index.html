@@ -21,7 +21,7 @@
         </div>
 
         <div class="dashboard-nav">
-          <button @click="view='runs'"
+          <button @click="view='runs'; loadRuns()"
                   :class="view==='runs' ? 'bg-indigo-600 text-white' : 'bg-white text-slate-700'"
                   class="dashboard-tab px-3 py-2 rounded-lg border border-slate-200 text-sm">
             Integration Runs
@@ -175,6 +175,25 @@
             </p>
           </section>
 
+          <section class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4" x-show="runsLoaded">
+            <div class="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+              <div><h2 class="text-sm font-semibold text-slate-800">Ollama AI processing coverage</h2><p class="mt-1 text-xs text-slate-500">Active jobs with an empty AI analysis payload are awaiting their primary Ollama pass. Oldest jobs appear first.</p></div>
+              <span class="dashboard-badge dashboard-badge--success" x-text="`${ollamaProcessing.processed_count || 0} processed`"></span>
+            </div>
+            <div class="mt-4 grid gap-3 sm:grid-cols-3">
+              <div class="rounded-lg border border-amber-200 bg-amber-50 p-3"><div class="text-xs font-medium uppercase tracking-wide text-amber-800">Awaiting AI pass</div><div class="mt-1 text-2xl font-semibold text-amber-950" x-text="ollamaProcessing.awaiting_count || 0"></div><div class="mt-1 text-xs text-amber-800"><span x-text="ollamaProcessing.ready_count || 0"></span> ready for Ollama</div></div>
+              <div class="rounded-lg border border-slate-200 bg-slate-50 p-3"><div class="text-xs font-medium uppercase tracking-wide text-slate-600">AI coverage</div><div class="mt-1 text-2xl font-semibold text-slate-900"><span x-text="ollamaProcessing.processed_count || 0"></span><span class="text-base font-medium text-slate-500"> / <span x-text="ollamaProcessing.active_count || 0"></span></span></div><div class="mt-1 text-xs text-slate-600">active jobs processed</div></div>
+              <div class="rounded-lg border border-red-200 bg-red-50 p-3"><div class="text-xs font-medium uppercase tracking-wide text-red-800">Needs source detail</div><div class="mt-1 text-2xl font-semibold text-red-950" x-text="ollamaProcessing.missing_content_count || 0"></div><div class="mt-1 text-xs text-red-800">awaiting jobs without a title or description</div></div>
+            </div>
+            <div class="mt-4 rounded-lg border p-3" :class="ollamaRunClass()">
+              <div class="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between"><div class="text-sm font-medium" x-text="ollamaCurrentRun.message || 'Loading AI worker status…'"></div><div class="text-xs" x-show="ollamaCurrentRun.status === 'processing'">In flight: <span class="font-semibold" x-text="ollamaCurrentRun.inflight_count || 0"></span></div></div>
+              <div class="mt-2 text-xs" x-show="ollamaCurrentRun.status === 'processing' && ollamaCurrentRun.started_at">Started: <span x-text="ollamaCurrentRun.started_at"></span></div>
+              <div class="mt-3 overflow-x-auto" x-show="(ollamaCurrentRun.jobs || []).length"><table class="min-w-full text-sm"><thead class="border-b text-left text-slate-600"><tr><th class="py-2 pr-4">Working on</th><th class="py-2 pr-4">Site</th><th class="py-2">Batch</th></tr></thead><tbody class="divide-y divide-slate-100"><template x-for="job in (ollamaCurrentRun.jobs || [])" :key="job.index"><tr><td class="py-2 pr-4 font-medium text-slate-900" x-text="job.title"></td><td class="py-2 pr-4 text-slate-700" x-text="job.site"></td><td class="py-2 text-slate-700" x-text="`${job.index}/${job.total}`"></td></tr></template></tbody></table></div>
+            </div>
+            <div class="mt-4 overflow-x-auto" x-show="(ollamaProcessing.jobs || []).length"><table class="min-w-full text-sm"><thead class="border-b text-left text-slate-600"><tr><th class="py-2 pr-4">Awaiting AI pass</th><th class="py-2 pr-4">Site</th><th class="py-2 pr-4">Job ID</th><th class="py-2">Discovered</th></tr></thead><tbody class="divide-y divide-slate-100"><template x-for="job in (ollamaProcessing.jobs || [])" :key="job.id"><tr><td class="py-2 pr-4 font-medium text-slate-900"><span x-text="job.title"></span><span x-show="!job.has_content" class="ml-2 dashboard-badge dashboard-badge--danger">No content</span></td><td class="py-2 pr-4 text-slate-700" x-text="job.site"></td><td class="py-2 pr-4 text-slate-700" x-text="job.job_id"></td><td class="py-2 whitespace-nowrap text-slate-700" x-text="job.discovery_date"></td></tr></template></tbody></table><p class="mt-2 text-xs text-slate-500" x-show="ollamaProcessing.awaiting_count > ollamaProcessing.display_limit">Showing the oldest <span x-text="ollamaProcessing.display_limit"></span> of <span x-text="ollamaProcessing.awaiting_count"></span> awaiting jobs.</p></div>
+            <p class="mt-4 text-sm text-slate-500" x-show="!(ollamaProcessing.jobs || []).length">Every active job has an AI analysis payload.</p>
+          </section>
+
         </div>
       </template>
 
@@ -208,6 +227,7 @@
                 <div>
                   <h2 class="text-base font-semibold text-slate-900">Query Builder</h2>
                   <p class="mt-0.5 text-xs text-slate-500">Run a query, then save its filters and column layout for later.</p>
+                  <p class="mt-1 text-xs text-slate-600">Overall AI Match combines several factors. Experience Fit compares only the posting's stated experience requirements, so the two values can differ.</p>
                 </div>
                 <button @click="queryPanelOpen = !queryPanelOpen"
                         class="w-full px-3 py-2 border border-slate-300 bg-white text-sm text-slate-700 hover:bg-slate-50 sm:w-auto"
@@ -308,6 +328,19 @@
                    :class="reportError ? 'border-red-400 bg-red-50 text-red-700' : 'border-indigo-400 bg-indigo-50 text-indigo-700'"
                    x-text="reportMessage"></div>
 
+              <!-- Added fields need a fresh server projection before their values are available. -->
+              <div x-show="hasPendingColumns()"
+                   x-cloak
+                   role="status"
+                   aria-live="polite"
+                   class="dashboard-message flex flex-wrap items-center justify-between gap-2 border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900">
+                <span x-text="pendingColumnsMessage()"></span>
+                <button type="button" @click="loadJobs()" :disabled="queryLoading"
+                        class="shrink-0 border border-amber-400 bg-white px-3 py-1.5 text-sm font-medium text-amber-900 hover:bg-amber-100 disabled:cursor-not-allowed disabled:opacity-50">
+                  Reload results
+                </button>
+              </div>
+
               <div class="flex flex-wrap items-center gap-3 border-t border-slate-100 pt-3 text-xs text-slate-500">
                 <span x-text="queryMessage" :class="queryError ? 'font-medium text-red-700' : ''"></span>
                 <span x-show="jobsLoaded">returned=<span x-text="jobsMeta.returned"></span></span>
@@ -388,6 +421,52 @@
             </div>
           </dialog>
 
+          <!-- Column order has its own focused workspace so it does not compete with filters. -->
+          <dialog x-ref="columnOrderDialog"
+                  @close="$refs.reorderColumnsButton.focus()"
+                  class="w-[calc(100%-2rem)] max-w-2xl border border-slate-200 bg-white p-0 text-slate-900 shadow-xl backdrop:bg-slate-950/45">
+            <div class="p-5">
+              <div class="flex items-start justify-between gap-4">
+                <div>
+                  <h3 class="text-base font-semibold">Reorder columns</h3>
+                  <p class="mt-1 text-sm text-slate-600">Choose the order for this report. Changes preview in the table.</p>
+                </div>
+                <button type="button" @click="$refs.columnOrderDialog.close()"
+                        class="h-8 w-8 shrink-0 text-xl leading-none text-slate-400 hover:text-slate-700"
+                        aria-label="Close column organizer">×</button>
+              </div>
+              <div class="mt-5 flex items-center justify-between gap-3 border-y border-slate-200 py-3">
+                <span class="text-sm text-slate-600"><span class="font-semibold text-slate-900" x-text="selectedColumns.length"></span> selected</span>
+                <button type="button" @click="setDefaultColumns()"
+                        class="px-3 py-2 border border-slate-300 bg-white text-sm text-slate-700 hover:bg-slate-50">Reset default</button>
+              </div>
+              <div x-ref="columnOrderList" tabindex="-1" role="list"
+                   class="mt-3 max-h-[55vh] overflow-auto space-y-2 pr-1 focus:outline-none">
+                <template x-for="(key, index) in selectedColumns" :key="key">
+                  <div role="listitem" class="flex items-center gap-2 border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700">
+                    <span class="w-5 text-right tabular-nums text-slate-400" x-text="index + 1"></span>
+                    <span class="select-none text-slate-400" aria-hidden="true">⠿</span>
+                    <span class="min-w-0 flex-1 truncate font-medium" x-text="columnLabel(key)"></span>
+                    <div class="flex shrink-0 gap-1">
+                      <button type="button" @click="moveColumn(index, -1)"
+                              class="h-8 w-8 border border-slate-300 text-slate-600 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-30"
+                              :disabled="index === 0" :aria-label="`Move ${columnLabel(key)} up`" title="Move up">↑</button>
+                      <button type="button" @click="moveColumn(index, 1)"
+                              class="h-8 w-8 border border-slate-300 text-slate-600 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-30"
+                              :disabled="index === selectedColumns.length - 1" :aria-label="`Move ${columnLabel(key)} down`" title="Move down">↓</button>
+                    </div>
+                  </div>
+                </template>
+                <p class="py-6 text-center text-sm text-slate-500" x-show="selectedColumns.length === 0">No columns selected.</p>
+              </div>
+              <p class="mt-4 text-xs text-slate-500">Changes affect the table, CSV/JSON exports, and saved reports.</p>
+              <div class="mt-5 flex justify-end">
+                <button type="button" @click="$refs.columnOrderDialog.close()"
+                        class="px-3 py-2 bg-indigo-600 text-sm font-medium text-white hover:bg-indigo-700">Done</button>
+              </div>
+            </div>
+          </dialog>
+
           <div class="grid grid-cols-1 xl:grid-cols-[340px_minmax(0,1fr)] gap-3">
             <aside class="bg-white border border-slate-200 p-3 space-y-4" x-show="queryPanelOpen">
               <div class="space-y-2">
@@ -406,7 +485,7 @@
                     <input type="number" x-model.number="jobsLimit" min="1" max="500"
                            class="mt-1 w-full px-2 py-2 border border-slate-300 bg-white text-sm"/>
                   </label>
-                  <label class="text-xs text-slate-600">Min match
+                  <label class="text-xs text-slate-600">Minimum overall AI match
                     <input type="number" x-model.number="minAiMatch" min="0" max="100"
                            class="mt-1 w-full px-2 py-2 border border-slate-300 bg-white text-sm"/>
                   </label>
@@ -437,26 +516,11 @@
                   <button @click="clearColumns()" class="px-2 py-1 border border-slate-300 text-xs">Clear</button>
                   <button @click="selectRawColumns()" class="px-2 py-1 border border-slate-300 text-xs">Raw fields</button>
                 </div>
-                <div class="border border-slate-200">
-                  <div class="flex items-center justify-between gap-2 px-2 py-1 bg-slate-50 text-xs font-semibold text-slate-600">
-                    <span>Selected order</span>
-                    <span class="font-normal text-slate-500"><span x-text="selectedColumns.length"></span> selected</span>
-                  </div>
-                  <div class="max-h-44 overflow-auto p-2 space-y-1">
-                    <template x-for="(key, index) in selectedColumns" :key="key">
-                      <div draggable="true"
-                           @dragstart="dragColumnStart(key)"
-                           @dragover.prevent
-                           @drop.prevent="dropColumn(key)"
-                           class="flex items-center gap-1 border border-slate-200 bg-white px-2 py-1 text-xs text-slate-700 cursor-move hover:border-indigo-200 hover:bg-indigo-50/30">
-                        <span class="select-none text-slate-400" title="Drag to reorder">::</span>
-                        <span class="flex-1 truncate" x-text="columnLabel(key)"></span>
-                        <button type="button" @click="moveColumn(index, -1)" class="h-6 w-6 text-slate-500 hover:text-slate-900 disabled:opacity-30" :disabled="index === 0" title="Move up" aria-label="Move column up">↑</button>
-                        <button type="button" @click="moveColumn(index, 1)" class="h-6 w-6 text-slate-500 hover:text-slate-900 disabled:opacity-30" :disabled="index === selectedColumns.length - 1" title="Move down" aria-label="Move column down">↓</button>
-                        <button type="button" @click="toggleColumn(key)" class="h-6 w-6 text-red-600 hover:text-red-800" title="Remove column" aria-label="Remove column">×</button>
-                      </div>
-                    </template>
-                    <div class="text-xs text-slate-400" x-show="selectedColumns.length === 0">No columns selected.</div>
+                <div class="border border-slate-200 bg-slate-50 p-2">
+                  <div class="flex items-center justify-between gap-2">
+                    <div class="text-xs text-slate-600"><span class="font-semibold text-slate-800" x-text="selectedColumns.length"></span> selected · Table and exports use this order</div>
+                    <button type="button" x-ref="reorderColumnsButton" @click="openColumnOrderDialog()"
+                            class="shrink-0 px-2 py-1 border border-slate-300 bg-white text-xs text-slate-700 hover:bg-slate-50">Reorder columns</button>
                   </div>
                 </div>
                 <template x-for="group in columnGroups()" :key="group.name">
@@ -630,7 +694,8 @@
                           <button type="button"
                                   class="inline-flex items-center gap-1 text-left hover:text-slate-950"
                                   @click="toggleSort(col.key)"
-                                  :aria-label="sortAriaLabel(col.key)">
+                                  :aria-label="sortAriaLabel(col.key)"
+                                  :title="col.description || ''">
                             <span x-text="col.label"></span>
                             <span class="text-[10px] text-slate-500" x-text="sortIndicator(col.key)"></span>
                           </button>
@@ -642,15 +707,19 @@
                     <template x-for="row in jobs" :key="row.id || JSON.stringify(row)">
                       <tr class="border-b border-slate-100 hover:bg-slate-50 align-top">
                         <template x-for="col in visibleColumns()" :key="col.key">
-                          <td class="px-2 py-1.5 max-w-80" :title="cellText(row[col.key])">
-                            <template x-if="col.key === 'id'">
+                          <td class="px-2 py-1.5 max-w-80" :title="isColumnPending(col.key) ? 'Reload results to load this column.' : cellDisplayText(col.key, row[col.key])">
+                            <!-- Pending columns must not be confused with legitimately empty values. -->
+                            <template x-if="isColumnPending(col.key)">
+                              <span class="block max-w-80 italic text-amber-800">Not loaded</span>
+                            </template>
+                            <template x-if="!isColumnPending(col.key) && col.key === 'id'">
                               <button type="button" class="text-indigo-700 hover:underline" @click="openJobDetail(row.id)" x-text="cellText(row[col.key])"></button>
                             </template>
-                            <template x-if="col.key === 'title' && row.url">
+                            <template x-if="!isColumnPending(col.key) && col.key === 'title' && row.url">
                               <a class="block max-w-80 truncate text-indigo-700 hover:underline" :href="row.url" target="_blank" rel="noreferrer" x-text="cellText(row[col.key])"></a>
                             </template>
-                            <template x-if="!(col.key === 'id') && !(col.key === 'title' && row.url)">
-                              <span class="block max-w-80" :class="isLongCell(col.key) ? 'max-h-16 overflow-hidden whitespace-normal leading-5' : 'truncate'" x-text="cellText(row[col.key])"></span>
+                            <template x-if="!isColumnPending(col.key) && !(col.key === 'id') && !(col.key === 'title' && row.url)">
+                              <span class="block max-w-80" :class="isLongCell(col.key) ? 'max-h-16 overflow-hidden whitespace-normal leading-5' : 'truncate'" x-text="cellDisplayText(col.key, row[col.key])"></span>
                             </template>
                           </td>
                         </template>
@@ -1835,6 +1904,9 @@
           net_rate_ma7_pct: [],
           chartCounts: null,
           chartRates: null,
+          ollamaProcessing: {},
+          ollamaCurrentRun: {},
+          ollamaProcessingPoller: null,
 
           // Jobs state
           jobsLoaded: false,
@@ -1851,9 +1923,11 @@
           defaultColumns: [],
           rawColumns: [],
           selectedColumns: [],
+          // The server projects rows to these fields after the last successful query.
+          loadedColumns: [],
+          hasLoadedResult: false,
           sortField: '',
           sortDirection: 'asc',
-          draggedColumnKey: '',
           columnSearch: '',
           operators: [],
           filterRoot: { op: 'and', items: [] },
@@ -1976,6 +2050,8 @@
             this.total_seen = daily.map(row => row.baseline_total_seen || 0);
             this.net_change = daily.map(row => row.net_change || 0);
             this.recentRuns = data.recent_runs || [];
+            this.ollamaProcessing = data.ollama_processing || {};
+            this.ollamaCurrentRun = this.ollamaProcessing.current_run || {};
             this.runsVisibleLimit = 10;
             this.change_rate_pct = daily.map(row => row.change_rate_pct || 0);
             this.net_rate_pct = daily.map(row => row.net_rate_pct || 0);
@@ -1986,6 +2062,25 @@
             this.renderCountsChart();
             this.renderRatesChart();
             this.runsLoaded = true;
+          },
+
+          // Live worker status changes more often than scraper-run charts.
+          async loadOllamaProcessing() {
+            try {
+              const res = await fetch('/api/ollama-processing');
+              if (!res.ok) throw new Error('Unable to load AI worker status.');
+              this.ollamaProcessing = await res.json();
+              this.ollamaCurrentRun = this.ollamaProcessing.current_run || {};
+            } catch (err) {
+              this.ollamaCurrentRun = { status: 'unavailable', message: err?.message || 'Unable to load AI worker status.' };
+            }
+          },
+
+          // Keep the worker state visually distinct from the completed AI coverage figures.
+          ollamaRunClass() {
+            if (this.ollamaCurrentRun.status === 'processing') return 'border-indigo-200 bg-indigo-50 text-indigo-900';
+            if (this.ollamaCurrentRun.status === 'unavailable') return 'border-amber-200 bg-amber-50 text-amber-900';
+            return 'border-slate-200 bg-slate-50 text-slate-700';
           },
 
           // Optionally hide test-mode runs from the recent runs table.
@@ -2295,6 +2390,10 @@
                 cutoff_iso: data.cutoff_iso || ''
               };
               this.jobs = data.jobs || [];
+              // Use the returned schema, not the current selection, because the
+              // user may have changed columns while this background query ran.
+              this.loadedColumns = Array.isArray(data.columns) ? [...data.columns] : [];
+              this.hasLoadedResult = true;
               if (Array.isArray(data.available_columns) && data.available_columns.length) {
                 // Some queries reveal new dynamic reference columns that were not known at page load.
                 this.mergeAvailableColumns(data.available_columns);
@@ -2363,6 +2462,30 @@
             return (this.selectedColumns || []).map(key => byKey.get(key) || {key, label: key});
           },
 
+          // Return selected fields that were not present in the last server response.
+          pendingColumns() {
+            const loaded = new Set(this.loadedColumns || []);
+            return (this.selectedColumns || []).filter(key => !loaded.has(key));
+          },
+
+          // Only show the prompt after at least one successful result exists.
+          hasPendingColumns() {
+            return this.hasLoadedResult && this.pendingColumns().length > 0;
+          },
+
+          // Make the zero-result case clear without implying that visible cells exist.
+          pendingColumnsMessage() {
+            const count = this.pendingColumns().length;
+            const noun = count === 1 ? 'field' : 'fields';
+            if (!this.jobs.length) return `${count} added ${noun} will load on the next query.`;
+            return `${count} added ${noun} need reloading to show values.`;
+          },
+
+          // Keep genuine empty, false, and zero values distinct from unloaded data.
+          isColumnPending(key) {
+            return this.hasLoadedResult && this.pendingColumns().includes(key);
+          },
+
           // Resolve a display label for a column key.
           columnLabel(key) {
             const found = (this.availableColumns || []).find(col => col.key === key);
@@ -2378,28 +2501,10 @@
             }
           },
 
-          // Remember which selected column drag operation just started.
-          dragColumnStart(key) {
-            this.draggedColumnKey = key;
-          },
-
-          // Complete a drag/drop reorder by moving the source column to the target slot.
-          dropColumn(targetKey) {
-            const sourceKey = this.draggedColumnKey;
-            this.draggedColumnKey = '';
-            if (!sourceKey || sourceKey === targetKey) return;
-            this.reorderColumn(sourceKey, targetKey);
-          },
-
-          // Reorder the selected column list using source and target keys.
-          reorderColumn(sourceKey, targetKey) {
-            const columns = [...this.selectedColumns];
-            const from = columns.indexOf(sourceKey);
-            const to = columns.indexOf(targetKey);
-            if (from < 0 || to < 0) return;
-            const [moved] = columns.splice(from, 1);
-            columns.splice(to, 0, moved);
-            this.selectedColumns = columns;
+          // Open a focused workspace for layout edits without competing with filters.
+          openColumnOrderDialog() {
+            this.$refs.columnOrderDialog.showModal();
+            this.$nextTick(() => this.$refs.columnOrderList.focus());
           },
 
           // Move one selected column up or down by one position.
@@ -2725,6 +2830,21 @@
             if (Array.isArray(value)) return value.map(item => typeof item === 'object' ? JSON.stringify(item) : String(item)).join(', ');
             if (typeof value === 'object') return JSON.stringify(value);
             return String(value);
+          },
+
+          // Keep stored values unchanged while making experience fit clear in the table.
+          cellDisplayText(key, value) {
+            if (key === 'ai_experience_match') {
+              const experienceLabels = {
+                // Older/manual rows may contain this legacy spelling.
+                unqualified: 'Below stated experience requirements',
+                underqualified: 'Below stated experience requirements',
+                qualified: 'Meets stated experience requirements',
+                overqualified: 'Above stated experience requirements'
+              };
+              return experienceLabels[value] || this.cellText(value);
+            }
+            return this.cellText(value);
           },
 
           // ---------------- SAVED REPORTS ----------------
@@ -3758,6 +3878,11 @@
 
           // Bootstrap only the data needed by the page's initial view.
           async init() {
+            // Keep one lightweight polling loop available if the user later
+            // switches into Integration Runs from another dashboard view.
+            this.ollamaProcessingPoller = window.setInterval(() => {
+              if (this.view === 'runs') this.loadOllamaProcessing();
+            }, 15000);
             if (this.view === 'runs') {
               this.loadRuns();
             } else if (this.view === 'jobs') {

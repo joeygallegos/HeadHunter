@@ -1,0 +1,38 @@
+# `/steps` Job-board Templates
+
+## Summary
+
+Add a “Create from template” flow to the `/steps` builder. It will create a new, unsaved site from a URL and one of three ATS presets: Workday, Greenhouse, or Lever. Existing sites and the raw JSON editor remain unchanged.
+
+## Implementation Changes
+
+- Create one shared Python template registry for Workday, Greenhouse, and Lever so the `/steps` UI and discovery workflow use the same maintained recipes.
+- Move the existing discovery starter recipes into that registry; preserve current Greenhouse and Lever behavior.
+- Update the Workday recipe to include the existing `click_next` pagination block with a conservative 10-page limit, then hydrate each job’s detail page for `JobDesc`.
+- Add a read-only dashboard endpoint that accepts a template ID and starting URL, returns the generated step array, and validates it with the current StepScraper schema before returning it.
+- In `/steps`, retain “Add blank site” and add a “Create from template” panel with:
+  - template selector;
+  - required site key;
+  - required starting URL;
+  - create button.
+- On creation, reject duplicate site keys locally, insert the returned steps as a new selected site, mark the editor dirty, and show the normal live diff. Nothing is saved until the existing “Save changes” action is used.
+- Add a concise README section documenting the three presets, that Workday paginates up to 10 pages by default, and that every generated recipe should be run with `python run.py test` before scheduled scraping.
+
+## Interfaces
+
+- New read-only API: `POST /api/steps/templates` with `template_id` and `url`; response includes the generated `steps` and template metadata.
+- Supported template IDs: `workday`, `greenhouse`, `lever`.
+- No `steps.json` schema changes and no new dependencies.
+
+## Test Plan
+
+- Unit-test each registry recipe against the existing steps schema.
+- Assert Workday includes the expected pagination configuration and retains list/detail extraction ordering.
+- API-test valid template creation, unsupported template ID, missing/invalid URL, and schema-valid response.
+- Verify the UI’s generated site remains unsaved until the normal save flow, duplicate keys are refused, and existing blank-site creation still works.
+
+## Assumptions
+
+- Templates are starter recipes, not automatic board detection.
+- Workday’s default 10-page cap is intentional; users can adjust it in the builder or raw JSON.
+- Applying templates only creates new sites; it never overwrites an existing site.

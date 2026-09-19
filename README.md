@@ -18,7 +18,7 @@ python run.py steps
 python run.py test
 ```
 
-`python run.py test` is extraction-only. It reads `test.json`, writes raw job snapshots to `output/<site>_job_postings.json`, prints missing-field counts for the fields actually collected, and shows a colored 3-job sample table with jobs as rows and dynamically collected fields as columns in extraction order. Set `NO_COLOR=1` to disable table colors. It does not initialize the database, create an `IntegrationRun`, insert/update jobs, or mark missing jobs.
+`python run.py test` is extraction-only. It reads `test.json`, writes raw job snapshots to `output/<site>_job_postings.json`, prints missing-field counts for the fields actually collected, and shows a colored 3-job sample table with jobs as rows and dynamically collected fields as columns in extraction order. Set `NO_COLOR=1` to disable table colors. It does not initialize the database, create an `IntegrationRun`, insert/update jobs, or mark missing jobs. Validate generated recipes through this command using `test.json` directly; do not create a separate temporary recipe file or custom test harness. Preserve and restore any user-owned `test.json` content after validation.
 
 ## Must-Know Project Setup
 
@@ -36,6 +36,7 @@ python run.py test
 - Fit Brief freshness is controlled by the stored resume hash, job content hash, and Fit Brief schema version. Re-run `python .\analyze_jobs_ollama.py --fit-briefs-only` to fill missing or stale briefs for already analyzed eligible jobs, or add `--force` to regenerate existing briefs. The default `python .\analyze_jobs_ollama.py` flow runs Stage 1, Stage 2, and then Stage 3 for eligible reviewed matches. `--compensation-only` keeps its existing compensation cleanup behavior and does not run Fit Brief generation.
 - Liking a job in Swipe now means `Move forward`: it records the normal `job_swipes` row and queues a separate Application Prep artifact in `job_application_preps` only when the job meets the configurable Application Prep minimum match score (75% by default). The dashboard is queue-only and never starts Ollama; the separate Ollama-capable processor runs the queued work. The `Interesting` swipe action saves a job for later review without queuing Application Prep. Application Prep uses `prompts/application_prep_system.txt`, runs before lower-priority AI backlog work, processes queued jobs newest-first, and returns grounded resume improvements plus draft resume bullets backed by exact resume or Responsibilities & Value inventory evidence.
 - Application Prep has its own Ollama generation settings because it must produce complete JSON rather than a short classification result: `APPLICATION_PREP_THINK=false`, `APPLICATION_PREP_NUM_CTX=65536`, `APPLICATION_PREP_NUM_PREDICT=4096`, and `APPLICATION_PREP_RETRY_NUM_PREDICT` defaults high enough to retry truncation without changing the main analyzer's `OLLAMA_THINK`. The larger Application Prep context window applies only on the Ollama-capable processor, not on the dashboard host or ordinary job-match processing.
+- See [`ai-processing-lifecycle.html`](ai-processing-lifecycle.html) for a standalone Mermaid diagram of the optional discovery flow, the three-stage analyzer, Application Prep, validation, storage, and human review points.
 
 ### Timestamp data migration
 
@@ -379,6 +380,12 @@ The run dashboard visuals hydrate from `GET /api/runs/summary?days=<1-365>`. The
 - `net_rate_pct` is `(inserted - missing) / baseline_total_seen * 100`.
 - Historical unique unchanged/seen jobs are not exact because unchanged per-job observations are not stored; the dashboard keeps unchanged detail on individual recent runs.
 
+#### Ollama processing coverage
+
+The Integration Runs homepage includes an **Ollama AI processing coverage** report. It uses the same eligibility rule as `analyze_jobs_ollama.py`: an active job is awaiting its primary AI pass when `ai_analysis` is empty. The report shows processed versus active jobs, separates jobs ready for analysis from records missing both title and description, and lists the oldest 25 awaiting jobs first.
+
+The AI worker publishes its in-flight batch and heartbeat to the shared `ai_processing_status` database table, so the dashboard host and GPU host do not need a shared filesystem. This is read-only status from the dashboard: it does not start, stop, or queue Ollama work. A heartbeat older than two minutes is shown as unavailable instead of falsely reporting a stale batch as live.
+
 #### Query Builder
 
 Open the Query Builder at `/report`. It searches and filters stored jobs through `/api/jobs/query`.
@@ -388,7 +395,8 @@ Open the Query Builder at `/report`. It searches and filters stored jobs through
 - Date-like columns such as `discovery_date`, `updated_at`, `ai_analyzed_at`, `compensation_analyzed_at`, and `latest_change_at` support relative values like `48`, `14d`, `2w`, or `8h`, plus absolute date/time ranges in the builder.
 - Column headers toggle ascending/descending sort for the current report, and the active sort is shown with an arrow in the table header.
 - Available columns include core job data, AI fields, latest change fields, raw long-text fields, and dynamic `reference_fields` values.
-- Selected columns can be reordered by drag/drop or the Up/Down controls. The same order is used by the table and CSV/JSON exports.
+- **Overall AI Match %** is the model's multidimensional fit score across skills, experience, responsibilities, domain, location, and compensation. **Experience Fit** separately describes whether the resume is below, meets, or exceeds the posting's stated experience requirements; it is one input to the overall score, not a hiring decision. A 75% overall match can therefore have either experience-fit outcome when other strengths or gaps differ.
+- Use **Reorder columns** to adjust the selected-column layout with accessible Up/Down controls. Layout changes preview immediately; newly added fields show `Not loaded` until **Reload results** fetches their values. CSV/JSON exports use the selected order, and a saved report persists it when you save changes.
 - The table returns up to 500 rows; exports return up to 5000 rows.
 - Blank or `0` minimum match includes jobs without an AI score. Values from `1` through `100` require a non-null score at or above the selected minimum.
 - The legacy `/api/jobs` endpoint accepts both `hours=all` and `hours=0` as all-time aliases.
@@ -436,6 +444,20 @@ Important details:
 - The file must remain a top-level JSON object keyed by site name.
 - Saving writes pretty-printed JSON and creates a timestamped `.bak` file next to `steps.json`.
 - If the preview has no changes, saving is skipped and no backup is created.
+
+#### Job-board templates
+
+The sidebar can create a new unsaved site from a Workday, Greenhouse, or Lever starter template. Enter a unique site key and the board's starting URL, then review the generated steps in the builder or Diff Preview before saving. The Workday template follows visible next-page controls for up to 10 pages before it opens detail pages for descriptions; Greenhouse and Lever keep their existing list/detail starter patterns.
+
+Templates are starting points rather than automatic board detection. Always run `python run.py test` against a new template before enabling scheduled scraping.
+
+Set `STEPS_TEMPLATE_METRICS=true` to opt in to local-only aggregate template events at `output/steps_template_events.jsonl`. Events contain template IDs, opaque session IDs, aggregate extraction completeness, and Workday pagination outcomes; they never contain site keys, URLs, job descriptions, or third-party analytics data. Test output now distinguishes zero results from execution errors and reports Workday page count, stop reason, and whether its 10-page cap was reached.
+
+### Generating scraper steps with ChatGPT
+
+Use [`prompts/conform.txt`](prompts/conform.txt) as the copy-ready prompt when asking ChatGPT to generate a `test.json` entry from a job-board URL. It is the authoritative StepScraper contract: supported actions, required fields, source-selection order, URL behavior, built-in `/steps` templates, and pagination limits.
+
+Most important constraints: `xpath` values are CSS selectors, not XPath; direct JSON extraction supports only `extract` and `next`; API recipes must be public GET requests with no special headers or body; direct JSON `JobUrl` values must already be absolute; and automatic API offset/cursor/GraphQL pagination is not supported. The prompt requires one valid top-level JSON object ready to paste into `test.json`.
 
 ### Job Swipe
 

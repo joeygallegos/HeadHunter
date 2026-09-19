@@ -84,6 +84,7 @@ from sqlalchemy import inspect as sa_inspect, or_, select, text as sa_text
 from sqlalchemy.orm import Session
 from app.models import (
     APPLICATION_PREP_DEFAULT_MIN_MATCH,
+    AIProcessingStatus,
     ApplicationPrepSettings,
     ResponsibilitiesInventory,
     SessionLocal,
@@ -406,6 +407,51 @@ class OllamaReachabilityError(OllamaPrerequisiteError):
 # -------------------------------
 # Logging
 # -------------------------------
+AI_STATUS_WORKER_NAME = "primary"
+
+
+def publish_ai_processing_status(
+    *,
+    status: str,
+    total_jobs: int = 0,
+    submitted_jobs: int = 0,
+    completed_jobs: int = 0,
+    processed_jobs: int = 0,
+    failed_jobs: int = 0,
+    current_jobs: Optional[List[Dict[str, Any]]] = None,
+    message: str = "",
+    started_at: Optional[datetime] = None,
+    finished_at: Optional[datetime] = None,
+) -> None:
+    """Publish a small cross-host heartbeat for the dashboard's live AI view."""
+    now = utc_now_naive()
+    try:
+        with SessionLocal() as session:
+            record = session.execute(
+                select(AIProcessingStatus)
+                .where(AIProcessingStatus.worker_name == AI_STATUS_WORKER_NAME)
+                .limit(1)
+            ).scalar_one_or_none()
+            if record is None:
+                record = AIProcessingStatus(worker_name=AI_STATUS_WORKER_NAME)
+                session.add(record)
+            record.status = status
+            record.total_jobs = total_jobs
+            record.submitted_jobs = submitted_jobs
+            record.completed_jobs = completed_jobs
+            record.processed_jobs = processed_jobs
+            record.failed_jobs = failed_jobs
+            record.current_jobs_json = json.dumps(current_jobs or [], ensure_ascii=False)
+            record.message = message
+            record.started_at = started_at
+            record.heartbeat_at = now
+            record.finished_at = finished_at
+            session.commit()
+    except Exception as exc:
+        # Status is observability only and must never interrupt AI processing.
+        log(f"[warn] Could not publish AI worker status: {exc}")
+
+
 def _console_safe_line(line: str) -> str:
     """Return text that can be written to the current Windows console encoding."""
     encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
@@ -1065,6 +1111,8 @@ def review_prompt(candidate_json: str) -> str:
     return (
         "Privately review the candidate JSON below against the original resume, job title, and job description. "
         "Audit score calibration, seniority fit, location policy, compensation accuracy, overlapping skills, missing critical skills, and unsupported keyword claims. "
+        "For experience_match, use underqualified only for a material shortfall against an explicit experience, seniority, or responsibility requirement; use qualified when stated requirements are met, including defensible equivalent experience; and use overqualified when they are materially exceeded. "
+        "Experience_match is one input to the overall match_percentage, not a hiring decision or score cap. "
         "If the candidate is already accurate, return the same values. If it is miscalibrated, return corrected values. "
         "Return ONLY one valid JSON object with EXACTLY the same seven keys and no extra fields, markdown, reasoning, notes, or explanations.\n\n"
         "Candidate JSON:\n"
@@ -2703,6 +2751,7 @@ def main() -> None:
     # Regular analysis also writes the structured compensation columns.
     init_db()
     start = datetime.now()
+    status_started_at = utc_now_naive()
     log("------------------------------------------------------")
     log(f"AI Job Analysis started {start.strftime('%Y-%m-%d %H:%M:%S')}")
     log(
@@ -2770,6 +2819,11 @@ def main() -> None:
         total = len(ids)
         if total == 0:
             log("[ok] No jobs matched filter criteria.")
+            publish_ai_processing_status(
+                status="idle",
+                message="No active jobs are awaiting an AI analysis pass.",
+                finished_at=utc_now_naive(),
+            )
             run_application_prep_generation(
                 resume_text=resume_text,
                 force=False,
@@ -2895,6 +2949,36 @@ def main() -> None:
         future_started_at: Dict[Future, float] = {}
         submitted = 0
 
+        def publish_live_status(message: str = "Scheduled AI analysis is running.") -> None:
+            # The dashboard receives only in-flight job identifiers and titles;
+            # full descriptions remain in the jobs table and never enter status.
+            current_jobs = [
+                {
+                    "index": next(
+                        (item_index for item_index, candidate in enumerate(tasks, start=1) if candidate.id == task.id),
+                        0,
+                    ),
+                    "total": total,
+                    "site": task.site,
+                    "job_id": task.job_id,
+                    "title": task.title or "(no title)",
+                }
+                for task in future_to_task.values()
+            ]
+            publish_ai_processing_status(
+                status="running",
+                total_jobs=total,
+                submitted_jobs=submitted,
+                completed_jobs=completed,
+                processed_jobs=processed,
+                failed_jobs=failures,
+                current_jobs=current_jobs,
+                message=message,
+                started_at=status_started_at,
+            )
+
+        publish_live_status("Preparing the Ollama analysis batch.")
+
         def handle_result(result: JobResult) -> None:
             nonlocal processed, failures, skipped, completed, llm_seconds_total, aborted
             completed += 1
@@ -2976,6 +3060,7 @@ def main() -> None:
                     future_to_task[fut] = task
                     future_started_at[fut] = time.time()
                     submitted += 1
+                    publish_live_status()
 
                 done, _ = wait(
                     futures,
@@ -2997,6 +3082,7 @@ def main() -> None:
                     log(
                         f"[wait] no completion in {AI_WAIT_HEARTBEAT_SEC}s | completed={completed}/{total} submitted={submitted}/{total} inflight={len(futures)} oldest_inflight={oldest:.1f}s rate={rate:.2f}/s"
                     )
+                    publish_live_status("Waiting for Ollama responses.")
                     continue
                 for fut in done:
                     futures.remove(fut)
@@ -3017,6 +3103,7 @@ def main() -> None:
                             index=completed + 1,
                         )
                     handle_result(result)
+                    publish_live_status()
 
                     if aborted:
                         # Cancel work that has not started. Already-running
@@ -3036,6 +3123,18 @@ def main() -> None:
                         log(
                             f"[batch] completed={completed}/{total} processed={processed} failed={failures} skipped={skipped} inflight={len(futures)} rate={rate:.2f}/s avg_llm={avg_llm:.2f}s"
                         )
+
+        publish_ai_processing_status(
+            status="idle",
+            total_jobs=total,
+            submitted_jobs=submitted,
+            completed_jobs=completed,
+            processed_jobs=processed,
+            failed_jobs=failures,
+            message="AI analysis batch finished.",
+            started_at=status_started_at,
+            finished_at=utc_now_naive(),
+        )
 
     run_application_prep_generation(
         resume_text=resume_text,

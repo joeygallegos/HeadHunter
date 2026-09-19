@@ -43,8 +43,8 @@
       <section class="bg-white rounded-xl shadow-sm ring-1 ring-slate-200 p-4" x-show="message || error || saving || loading">
         <div class="text-sm text-slate-600" x-show="loading">Loading steps.json...</div>
         <div class="text-sm text-slate-600" x-show="saving">Saving steps.json...</div>
-        <div class="text-sm text-emerald-700" x-show="message" x-text="message"></div>
-        <div class="text-sm text-red-700" x-show="error" x-text="error"></div>
+        <div class="text-sm text-emerald-700" role="status" aria-live="polite" x-show="message" x-text="message"></div>
+        <div class="text-sm text-red-700" role="alert" x-show="error" x-text="error"></div>
       </section>
 
       <section class="grid grid-cols-1 lg:grid-cols-[18rem_minmax(0,1fr)] gap-4">
@@ -79,6 +79,54 @@
             </button>
           </div>
 
+          <form class="rounded-lg border border-indigo-200 bg-indigo-50/40 p-3 space-y-2" @submit.prevent="createTemplateSite()">
+            <div class="text-sm font-semibold text-slate-800">Create from template</div>
+            <p class="text-xs text-slate-600">Starter recipes should be test-run before scheduled scraping.</p>
+            <label class="block text-sm">
+              <span class="font-medium text-slate-700">Template</span>
+              <select x-model="newTemplateId"
+                      class="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
+                <template x-for="template in templates" :key="template.id">
+                  <option :value="template.id" x-text="template.label"></option>
+                </template>
+              </select>
+            </label>
+            <p class="text-xs text-slate-500" x-text="selectedTemplateDescription()"></p>
+            <label class="block text-sm" for="template-site-key">
+              <span class="font-medium text-slate-700">Job-board key (unique ID)</span>
+              <input id="template-site-key" x-model="newTemplateSiteKey" type="text" required
+                     aria-describedby="template-site-key-help template-form-error"
+                     placeholder="acme_workday"
+                     class="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+              <span id="template-site-key-help" class="mt-1 block text-xs text-slate-500">Used as the local site identifier.</span>
+            </label>
+            <label class="block text-sm" for="template-start-url">
+              <span class="font-medium text-slate-700">Job-board search/listing URL</span>
+              <input id="template-start-url" x-model="newTemplateUrl" type="url" required
+                     aria-describedby="template-url-help template-form-error"
+                     placeholder="https://company.example/careers"
+                     class="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+              <span id="template-url-help" class="mt-1 block text-xs text-slate-500">Use the page that lists multiple open jobs.</span>
+            </label>
+            <p id="template-form-error" class="text-xs text-red-700" x-show="templateError" x-text="templateError"></p>
+            <button type="submit" :disabled="creatingTemplate || templates.length === 0"
+                    class="w-full px-3 py-2 rounded-lg bg-indigo-600 text-white text-sm hover:bg-indigo-700 disabled:opacity-40">
+              <span x-text="creatingTemplate ? 'Creating template...' : 'Create site from template'"></span>
+            </button>
+            <button type="button" @click="loadTemplates()" x-show="templatesError"
+                    class="w-full px-3 py-2 rounded-lg border border-indigo-300 bg-white text-sm text-indigo-800 hover:bg-indigo-50">
+              Retry template loading
+            </button>
+            <p class="text-xs text-red-700" x-show="templatesError" x-text="templatesError"></p>
+          </form>
+
+          <div class="rounded-lg border border-slate-200 p-3 space-y-2" x-show="templateMetricsEnabled && recentTemplateEvents.length">
+            <div class="text-sm font-semibold text-slate-800">Recent template tests</div>
+            <template x-for="event in recentTemplateEvents" :key="`${event.timestamp}-${event.template_session_id}-${event.event_type}`">
+              <p class="text-xs text-slate-600" x-text="formatTemplateEvent(event)"></p>
+            </template>
+          </div>
+
           <div class="text-xs text-slate-500 space-y-1">
             <div :class="isDirty() ? 'text-amber-700' : 'text-slate-500'"
                  x-text="isDirty() ? 'Unsaved edits' : 'Loaded'"></div>
@@ -109,7 +157,7 @@
                @input.debounce.250ms="builderChanged()" @change="builderChanged()">
             <div class="flex flex-col xl:flex-row xl:items-start xl:justify-between gap-3">
               <div>
-                <h2 class="text-lg font-semibold text-slate-900" x-text="selectedSite || 'No site selected'"></h2>
+                <h2 x-ref="siteHeading" tabindex="-1" class="text-lg font-semibold text-slate-900" x-text="selectedSite || 'No site selected'"></h2>
                 <p class="text-sm text-slate-500">
                   Visual editing is add-only for this pass. Use Raw JSON for full-file edits.
                 </p>
@@ -379,6 +427,16 @@
           selectedSite: '',
           siteSearch: '',
           newSiteKey: '',
+          templates: [],
+          templatesError: '',
+          templateError: '',
+          templateSessions: {},
+          templateMetricsEnabled: false,
+          recentTemplateEvents: [],
+          newTemplateId: 'workday',
+          newTemplateSiteKey: '',
+          newTemplateUrl: '',
+          creatingTemplate: false,
           newTopAction: 'load_url',
           topActions: ['load_url', 'data_extract', 'json_set_payload', 'json_replace_text', 'json_data_extract', 'json_html_data_extract', 'sleep'],
           nestedActions: ['extract', 'extract_detail', 'redirect', 'regex_extract', 'replace_text', 'sleep', 'next'],
@@ -415,6 +473,61 @@
           siteStepCount(site) {
             const steps = this.stepsData?.[site];
             return Array.isArray(steps) ? steps.length : 0;
+          },
+
+          selectedTemplateDescription() {
+            const template = this.templates.find(item => item.id === this.newTemplateId);
+            return template?.description || '';
+          },
+
+          async loadTemplates() {
+            this.templatesError = '';
+            try {
+              const res = await fetch('/api/steps/templates');
+              const data = await res.json();
+              if (!res.ok) throw new Error(data.error || 'Could not load templates');
+              this.templates = Array.isArray(data.templates) ? data.templates : [];
+              if (!this.templates.some(template => template.id === this.newTemplateId)) {
+                this.newTemplateId = this.templates[0]?.id || '';
+              }
+            } catch (err) {
+              this.templates = [];
+              this.templatesError = err?.message || 'Templates are unavailable. You can still edit existing sites.';
+            }
+          },
+
+          async loadTemplateEvents() {
+            try {
+              const res = await fetch('/api/steps/template-events');
+              const data = await res.json();
+              if (!res.ok) return;
+              this.templateMetricsEnabled = Boolean(data.enabled);
+              this.recentTemplateEvents = Array.isArray(data.events) ? data.events : [];
+            } catch (_) {
+              // Metrics are optional and must never affect editor availability.
+            }
+          },
+
+          formatTemplateEvent(event) {
+            const label = event.template_id || 'Template';
+            if (event.event_type === 'test_completed') {
+              const rows = `${event.usable_rows || 0}/${event.extracted_rows || 0} usable`;
+              const paging = event.pagination?.hit_max_pages ? ' · page cap reached' : '';
+              return `${label}: ${event.outcome || 'completed'} · ${rows}${paging}`;
+            }
+            return `${label}: ${String(event.event_type || 'updated').replaceAll('_', ' ')}`;
+          },
+
+          recordTemplateValidationFailure(reason) {
+            fetch('/api/steps/template-events', {
+              method: 'POST',
+              headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify({
+                event_type: 'client_validation_failed',
+                template_id: this.newTemplateId,
+                reason
+              })
+            }).catch(() => {});
           },
 
           selectSite(site) {
@@ -543,6 +656,48 @@
             this.message = `Created blank site "${key}".`;
           },
 
+          async createTemplateSite() {
+            const key = (this.newTemplateSiteKey || '').trim();
+            const url = (this.newTemplateUrl || '').trim();
+            this.templateError = '';
+            if (!key || !url) {
+              this.templateError = 'Job-board key and listing URL are required.';
+              this.recordTemplateValidationFailure('missing_required_field');
+              return;
+            }
+            if (Object.prototype.hasOwnProperty.call(this.stepsData, key)) {
+              this.templateError = `Site "${key}" already exists.`;
+              this.recordTemplateValidationFailure('duplicate_site_key');
+              return;
+            }
+            this.creatingTemplate = true;
+            this.message = '';
+            this.error = '';
+            try {
+              const res = await fetch('/api/steps/templates', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({template_id: this.newTemplateId, url})
+              });
+              const data = await res.json();
+              if (!res.ok) throw new Error(data.error || 'Could not create template');
+              this.stepsData[key] = data.steps || [];
+              this.templateSessions[key] = {
+                template_id: data.template?.id || this.newTemplateId,
+                template_session_id: data.template_session_id || ''
+              };
+              this.selectedSite = key;
+              this.newTemplateSiteKey = '';
+              this.builderChanged();
+              this.message = `Created locally — not saved. Review "${key}", open Diff Preview, save changes, then run python run.py test.`;
+              this.$nextTick(() => this.$refs.siteHeading?.focus());
+            } catch (err) {
+              this.templateError = err?.message || 'Could not create template';
+            } finally {
+              this.creatingTemplate = false;
+            }
+          },
+
           supportsExtractSteps(step) {
             return ['data_extract', 'json_data_extract', 'json_html_data_extract'].includes(step?.action);
           },
@@ -668,6 +823,8 @@
               this.resetPreviewState();
               this.parseContentIntoState();
               this.message = 'Loaded steps.json.';
+              await this.loadTemplates();
+              this.loadTemplateEvents();
             } catch (err) {
               this.error = err?.message || 'Could not load steps.json';
             } finally {
@@ -772,7 +929,10 @@
               const res = await fetch('/api/steps/save', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({content: this.previewContent})
+                body: JSON.stringify({
+                  content: this.previewContent,
+                  template_metrics: Object.values(this.templateSessions)
+                })
               });
               const data = await res.json();
               if (!res.ok) throw new Error(data.error || 'Save failed');
@@ -781,8 +941,10 @@
               this.siteCount = data.site_count ?? this.siteCount;
               this.content = data.content || this.previewContent;
               this.originalContent = this.content;
+              this.templateSessions = {};
               this.resetPreviewState();
               this.parseContentIntoState();
+              this.loadTemplateEvents();
               this.message = data.saved
                 ? `Saved steps.json. Backup: ${data.backup_path || 'none'}`
                 : (data.message || 'No changes to save.');

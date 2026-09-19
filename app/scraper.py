@@ -159,6 +159,8 @@ class StepScraper:
             if headless is not None
             else (env_headless.lower() == "true" if env_headless else False)
         )
+        # Diagnostic data is kept separate from raw job rows and persistence.
+        self._last_site_metadata: Dict[str, Any] = {}
 
     # ---------- Driver ----------
     def _make_driver(self) -> webdriver.Chrome:
@@ -547,14 +549,25 @@ class StepScraper:
     # ---------- Public (streaming) ----------
     def run_iter(self) -> Iterator[Tuple[str, List[Dict[str, Any]]]]:
         """Streaming mode: yields (site, jobs) as each site completes scraping."""
+        for site, jobs, _error, _metadata in self.run_iter_results():
+            yield site, jobs
+
+    def run_iter_results(
+        self,
+    ) -> Iterator[Tuple[str, List[Dict[str, Any]], Optional[str], Dict[str, Any]]]:
+        """Yield jobs plus test/reporting diagnostics without changing run_iter."""
         with open(self.steps_path, "r", encoding="utf-8") as f:
             steps_data = json.load(f)
 
         driver = self._make_driver()
         try:
             for site, steps in steps_data.items():
+                started = time.perf_counter()
                 jobs, err = self._run_site(driver, site, steps)
-                yield site, jobs  # allow caller to persist immediately
+                self._last_site_metadata["elapsed_seconds"] = round(
+                    time.perf_counter() - started
+                )
+                yield site, jobs, err, dict(self._last_site_metadata)
         finally:
             self._quit_driver(driver)
 
@@ -566,6 +579,7 @@ class StepScraper:
         jobs: List[Dict[str, Any]] = []
         json_payload: Optional[str] = None
         err: Optional[str] = None
+        self._last_site_metadata = {}
 
         try:
             for step in steps:
@@ -711,12 +725,22 @@ class StepScraper:
         """
         if not focus_scope:
             _dbg("No focus_scope provided for pagination.")
+            self._last_site_metadata["pagination"] = {
+                "pages_visited": 0,
+                "stop_reason": "missing_focus_scope",
+                "hit_max_pages": False,
+            }
             return []
 
         mode = str(pagination.get("mode") or "").lower().strip()
         _dbg(f"Pagination mode: {mode}")
         if mode != "click_next":
             _dbg("Unknown pagination mode, falling back to single page extraction.")
+            self._last_site_metadata["pagination"] = {
+                "pages_visited": 1,
+                "stop_reason": "unsupported_mode",
+                "hit_max_pages": False,
+            }
             return self._extract_from_list(driver, focus_scope, extract_steps)
 
         max_pages = int(pagination.get("max_pages") or 1)
@@ -740,6 +764,8 @@ class StepScraper:
         all_jobs: List[Dict[str, Any]] = []
         seen_page_sigs: set[str] = set()
         detail_base_url = driver.current_url
+        pages_visited = 0
+        stop_reason = "max_pages_reached"
 
         # determine initial page number if possible
         page_num = (
@@ -749,6 +775,7 @@ class StepScraper:
 
         for page_idx in range(max_pages):
             _dbg(f"Extracting page {page_num} (iteration {page_idx+1}/{max_pages})")
+            pages_visited += 1
             # Step 1: read only the current page's list cards/rows.
             page_jobs = self._extract_from_list(
                 driver=driver,
@@ -770,6 +797,7 @@ class StepScraper:
             # hydrate and no next-page signal can be trusted.
             if not page_jobs:
                 _dbg("No jobs found on this page, stopping pagination.")
+                stop_reason = "empty_page"
                 break
 
             # Step 2: record a compact page signature before clicking next. If a
@@ -780,12 +808,14 @@ class StepScraper:
             _dbg(f"Page signature: {sig}")
             if sig in seen_page_sigs:
                 _dbg("Duplicate page signature detected, stopping pagination.")
+                stop_reason = "duplicate_page"
                 break
             seen_page_sigs.add(sig)
 
             # stop if no next / disabled next
             if self._is_next_disabled(driver, next_page_css, next_disabled_css):
                 _dbg("Next button is disabled or not found, stopping pagination.")
+                stop_reason = "next_unavailable"
                 break
 
             # Step 3: capture markers that should change after clicking next.
@@ -798,6 +828,7 @@ class StepScraper:
 
             if not self._click_css(driver, next_page_css):
                 _dbg("Failed to click next button, stopping pagination.")
+                stop_reason = "next_click_failed"
                 break
 
             # Step 4: wait for evidence that the browser is showing the next
@@ -823,6 +854,7 @@ class StepScraper:
                 _dbg(
                     "Timeout waiting for page to advance after clicking next. Stopping pagination."
                 )
+                stop_reason = "page_advance_timeout"
                 break
 
             if page_wait_ms > 0:
@@ -850,6 +882,11 @@ class StepScraper:
                     _sleep_ms(ITEM_DELAY_MS, reason="item delay")
 
         _dbg(f"Pagination complete. Total jobs extracted: {len(all_jobs)}")
+        self._last_site_metadata["pagination"] = {
+            "pages_visited": pages_visited,
+            "stop_reason": stop_reason,
+            "hit_max_pages": stop_reason == "max_pages_reached",
+        }
         return all_jobs
 
     # ---------- List → optional detail ----------

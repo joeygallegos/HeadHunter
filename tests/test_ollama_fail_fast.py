@@ -31,6 +31,22 @@ class _Response:
         return self._body
 
 
+def test_match_prompt_defines_experience_fit_without_a_score_cap() -> None:
+    prompt = analyzer.render_system_prompt()
+
+    assert '"underqualified" when there is a material shortfall' in prompt
+    assert '"qualified" when the resume meets the stated experience requirements' in prompt
+    assert '"overqualified" when the resume materially exceeds' in prompt
+    assert "not a hiring decision and not a score cap" in prompt
+
+
+def test_second_pass_reuses_experience_fit_calibration() -> None:
+    prompt = analyzer.review_prompt('{"match_percentage":75}')
+
+    assert "material shortfall against an explicit experience" in prompt
+    assert "not a hiring decision or score cap" in prompt
+
+
 @pytest.mark.parametrize(
     ("configured", "installed"),
     [("deepseek-r1:8b", "deepseek-r1:8b"), ("gemma3", "gemma3:latest")],

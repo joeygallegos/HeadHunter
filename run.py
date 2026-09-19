@@ -25,6 +25,7 @@ from sqlalchemy.exc import IntegrityError
 
 from app.scraper import StepScraper
 from app.json_writer import save_site_json
+from app.steps_template_events import append_event as append_template_event
 from app.utils import (
     ensure_nltk,
     extract_keywords,
@@ -258,6 +259,50 @@ def _log_test_extraction_summary(
         print(f"[test] {site}: missing_{field}={len(row_numbers)}")
         if row_numbers:
             print(f"[test] {site}: missing_{field}_rows={row_numbers}")
+
+
+def _classify_test_error(error: str | None) -> str:
+    """Map volatile Selenium text to stable, content-free test outcome labels."""
+    if not error:
+        return "success"
+    text = error.lower()
+    if "selector" in text or "no such element" in text:
+        return "selector_failure"
+    if "timeout" in text:
+        return "timeout"
+    if "redirect" in text:
+        return "redirect_failure"
+    if "chrome" in text or "driver" in text:
+        return "browser_failure"
+    return "execution_failure"
+
+
+def _test_quality_summary(
+    jobs_raw: List[Dict[str, Any]], error: str | None, metadata: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Create aggregate-only template test data with no job content or URLs."""
+    core_fields = ("JobID", "JobTitle", "JobUrl", "JobDesc")
+    missing_core = {
+        field: sum(not _norm_text(str(job.get(field, ""))) for job in jobs_raw)
+        for field in core_fields
+    }
+    usable_rows = sum(
+        all(_norm_text(str(job.get(field, ""))) for field in core_fields)
+        for job in jobs_raw
+    )
+    outcome = _classify_test_error(error)
+    if not error and not jobs_raw:
+        outcome = "zero_results"
+    return {
+        "outcome": outcome,
+        "extracted_rows": len(jobs_raw),
+        "usable_rows": usable_rows,
+        "missing_core_fields": missing_core,
+        "pagination": metadata.get("pagination") if isinstance(metadata, dict) else None,
+        "elapsed_seconds": metadata.get("elapsed_seconds")
+        if isinstance(metadata, dict)
+        else None,
+    }
 
 
 def _print_test_extracted_values(site: str, jobs_raw: List[Dict[str, Any]]) -> None:
@@ -747,10 +792,30 @@ def main():
         test_log.info("test extraction only | steps_path=%s", steps_path)
         scraper = StepScraper(steps_path)
         with Timer("scraper.test", logger=test_log):
-            for site, jobs_raw in scraper.run_iter():
+            for site, jobs_raw, error, metadata in scraper.run_iter_results():
                 save_site_json(OUTPUT_DIR, site, jobs_raw)
                 _log_test_extraction_summary(test_log, site, jobs_raw)
                 _print_test_extracted_values(site, jobs_raw)
+                quality = _test_quality_summary(jobs_raw, error, metadata)
+                test_log.info("test extraction quality site=%s quality=%s", site, quality)
+                print(
+                    f"[test] {site}: outcome={quality['outcome']} "
+                    f"usable_rows={quality['usable_rows']}/{quality['extracted_rows']}"
+                )
+                if quality["pagination"]:
+                    print(f"[test] {site}: pagination={quality['pagination']}")
+                template_id = os.getenv("STEPS_TEMPLATE_ID", "").strip().lower()
+                if template_id:
+                    append_template_event(
+                        {
+                            "event_type": "test_completed",
+                            "template_session_id": os.getenv(
+                                "STEPS_TEMPLATE_SESSION_ID", ""
+                            ).strip(),
+                            "template_id": template_id,
+                            **quality,
+                        }
+                    )
         return
 
     commit_mode = os.getenv("DB_COMMIT_MODE", "all_at_end").lower()
