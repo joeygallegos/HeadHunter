@@ -191,6 +191,38 @@ class JobChange(Base):
     job = relationship("Job", back_populates="changes")
 
 
+class JobMatchScreen(Base):
+    """Cache preliminary routing independently of reviewed applicant scores."""
+
+    __tablename__ = "job_match_screens"
+    __table_args__ = {"mysql_charset": "utf8mb4", "mysql_collate": "utf8mb4_unicode_ci"}
+
+    # Keep the job ID as the natural one-row-per-job key without a database
+    # foreign key. Some managed database users can create tables but cannot be
+    # granted REFERENCES, and requiring it would prevent the analyzer from
+    # starting. JobScrape does not delete jobs, so cascade cleanup is not needed.
+    job_pk = Column(Integer, primary_key=True)
+    input_hash = Column(String(64), nullable=False)
+    match_percentage = Column(Integer, nullable=False)
+    experience_match = Column(String(32), nullable=False)
+    screened_at = Column(DateTime(timezone=False), nullable=False, default=utc_now_naive)
+
+
+class JobAnalysisRetry(Base):
+    """Persistent retry state used to keep failed analysis work fair."""
+
+    __tablename__ = "job_analysis_retries"
+    __table_args__ = {"mysql_charset": "utf8mb4", "mysql_collate": "utf8mb4_unicode_ci"}
+
+    # Avoid a foreign key for the same operational reason as JobMatchScreen:
+    # analyzer database users may have CREATE permission without REFERENCES.
+    job_pk = Column(Integer, primary_key=True)
+    input_hash = Column(String(64), nullable=False)
+    failure_count = Column(Integer, nullable=False, default=1)
+    last_failed_at = Column(DateTime(timezone=False), nullable=False, default=utc_now_naive)
+    retry_after = Column(DateTime(timezone=False), nullable=False, index=True)
+
+
 class JobFitBrief(Base):
     __tablename__ = "job_fit_briefs"
     __table_args__ = (

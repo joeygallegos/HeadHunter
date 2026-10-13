@@ -37,7 +37,8 @@
       and show where user review remains required before an application artifact is created.
     </p>
 
-    <!-- Mermaid renders this source in the browser; no JobScrape service is required to view it. -->
+    <!-- These diagrams describe the implemented processor. Future proposals are listed separately.
+         Mermaid renders in the browser; the CDN import requires internet access. -->
     <h2>1. Optional job-board discovery</h2>
     <div class="diagram">
       <pre class="mermaid">
@@ -73,30 +74,47 @@ flowchart LR
     <div class="diagram" id="analysis-diagram" aria-label="Job analysis and Fit Brief lifecycle diagram">
       <pre class="mermaid">
 flowchart LR
-    Jobs[(Jobs database)] --> Select[Select eligible stored jobs]
-    Resume[Resume text] --> Match
-    Select --> Ready{Ollama server and model ready?}
-    Ready -->|No| Stop[Stop batch and log prerequisite failure]
-    Ready -->|Yes| Match[Stage 1: match and structured compensation]
-    Match --> InitialValid{Stage 1 JSON valid?}
-    InitialValid -->|No| Retry[Retry where configured, then record failure]
-    Retry --> Preserve[Keep existing job fields]
-    InitialValid -->|Yes| Review[Stage 2: private review of candidate JSON]
-    Review --> Reviewed{Reviewed JSON valid?}
-    Reviewed -->|Yes| Store[Store final analysis, compensation, and audit change]
-    Reviewed -->|No| Fallback[Keep valid Stage 1 result]
+    Jobs[(Jobs database)] --> Select[Active jobs without final analysis: oldest first]
+    Resume[Configured resume text] --> Fingerprint[Fingerprint evidence, prompt, model and limits]
+    Select --> Fingerprint
+    Fingerprint --> Cached{Fresh screen cached?}
+    Cache[(job_match_screens)] --> Cached
+    Cached -->|Yes| CachedScore{Score meets deep-analysis threshold?}
+    CachedScore -->|Below threshold| Deferred[Defer detail: no model calls]
+    CachedScore -->|At or above threshold| Ready{Ollama server and model ready?}
+    Cached -->|No| Ready
+    Redo[Explicit --redo N: newest first] --> Ready
+    Ready -->|No| Stop[Stop batch: preserve existing final fields]
+    Ready -->|Normal uncached job| Screen[Stage 1: score and experience fit; request thinking off]
+    Ready -->|Cached qualifying job or redo| Match[Stage 2: detailed fit and compensation]
+    Screen --> ScreenValid{Strict screen JSON valid?}
+    ScreenValid -->|No| Retry[At most two attempts; leave failures pending]
+    Retry --> Preserve[Preserve existing final analysis and source Pay]
+    ScreenValid -->|Yes| Route{Score at least AI_DEEP_ANALYSIS_MIN_MATCH?}
+    Route -->|No: default below 75| Deferred
+    Route -->|Yes: default 75 or higher| Match
+    Route -. Valid screen saved with worker result .-> Cache
+    Match --> InitialValid{Detailed JSON valid?}
+    InitialValid -->|No| DetailRetry[Configured detail retries; retain valid screen]
+    DetailRetry --> Preserve
+    InitialValid -->|Yes| Review[Optional private review of detailed JSON]
+    Review --> Reviewed{Valid review available?}
+    Reviewed -->|Yes| Store[Store reviewed analysis, compensation and audit change]
+    Reviewed -->|No| Fallback[Keep valid detailed result]
     Fallback --> Store
-    Store --> Eligible{Active job meets Fit Brief threshold?}
-    Eligible -->|Yes| Brief[Stage 3: generate and validate Fit Brief]
+    Store --> Eligible{Final score meets Fit Brief threshold?}
+    Eligible -->|Yes: default 75 or higher| Brief[Stage 3: generate and validate Fit Brief]
     Brief --> BriefStore[(job_fit_briefs)]
     Eligible -->|No| Dashboard[Dashboard review]
     BriefStore --> Dashboard
+    Deferred --> Searchable[Job remains searchable without a new final score]
+    Searchable --> Dashboard
 
     classDef ai fill:#ede9fe,stroke:#7c3aed,color:#111827;
     classDef data fill:#ccfbf1,stroke:#0f766e,color:#111827;
     classDef human fill:#fef3c7,stroke:#d97706,color:#111827;
-    class Match,Review,Brief ai;
-    class Jobs,Store,BriefStore data;
+    class Screen,Match,Review,Brief ai;
+    class Jobs,Cache,Store,BriefStore data;
     class Dashboard human;
       </pre>
     </div>
@@ -110,7 +128,8 @@ flowchart LR
     Swipe -->|Move forward and match meets threshold| Queue[(Application Prep queue)]
     Resume[Resume text] --> Input
     Inventory[Responsibilities and Value inventory] --> Input
-    Queue --> Input[Build grounded Application Prep input]
+    Queue --> Dequeue[Processor dequeues eligible requests: newest first]
+    Dequeue --> Input[Build grounded Application Prep input]
     Input --> Prep[Priority AI generation and strict validation]
     Prep --> PrepStore[(job_application_preps)]
     PrepStore --> HumanReview{Human reviews grounded drafts}
@@ -126,14 +145,53 @@ flowchart LR
       </pre>
     </div>
 
+    <!-- Priority is checked at batch boundaries; active inference calls are not preempted. -->
+    <h2>4. Priority processing and lower GPU demand</h2>
+    <div class="diagram" aria-label="Priority queue and bounded background processing diagram">
+      <pre class="mermaid">
+flowchart LR
+    Start[Regular processor run] --> Check[Check Application Prep queue]
+    Queue[(Dashboard queues Move forward requests)] --> Check
+    Check --> Priority{Eligible priority work available?}
+    Priority -->|Yes| Prep[Generate queued Application Prep: newest first]
+    Prep --> Background{Background work remains?}
+    Priority -->|No| Background
+    Background -->|Job backlog| Analyze[One bounded screening and detail batch: oldest first]
+    Background -->|Backlog complete; eligible briefs remain| Brief[One bounded Fit Brief batch]
+    Analyze --> Drain[Let active calls finish; drain the batch]
+    Brief --> Drain
+    Drain --> Check
+    Background -->|None| Idle[Run finishes; model expires after idle keep-alive]
+    Limits[Defaults: one worker, one in-flight task, one-minute keep-alive] -.-> Analyze
+    Limits -.-> Brief
+
+    classDef ai fill:#ede9fe,stroke:#7c3aed,color:#111827;
+    classDef data fill:#ccfbf1,stroke:#0f766e,color:#111827;
+    class Prep,Analyze,Brief ai;
+    class Queue data;
+      </pre>
+    </div>
+
     <section class="notes">
-      <h2>Lifecycle rules captured here</h2>
+      <h2>Implemented lifecycle rules</h2>
       <ul>
-        <li>Python fetches and normalizes external pages; Ollama receives bounded evidence and returns structured JSON.</li>
-        <li>Invalid or unavailable AI output does not overwrite an existing job result. The processor retries where configured, records failures, and preserves the last valid data.</li>
-        <li>Fit Briefs are only generated for active jobs at or above <code>AI_FIT_BRIEF_MIN_MATCH</code> (75 by default).</li>
-        <li>Application Prep is queued by the dashboard but generated only by the separate Ollama-capable processor for eligible Move forward jobs.</li>
-        <li>AI suggestions remain grounded in resume and inventory evidence; a person chooses whether to approve resume changes or create an artifact.</li>
+        <li>Regular selection uses active jobs, <code>ONLY_EMPTY</code>, and <code>SITE_FILTER</code>. Never-attempted or changed inputs run FIFO before due retries; repeated failures use persistent bounded exponential backoff. Explicit <code>--redo N</code> runs the newest N jobs and bypasses screening and backoff. Empty title and description do not consume <code>LIMIT</code>.</li>
+        <li>Stage 1 uses the configured resume and job evidence, respecting <code>MAX_RESUME_TOKENS</code> and <code>MAX_JOB_DESC_TOKENS</code>; a value of zero keeps full text. It returns only a provisional <code>match_percentage</code> and <code>experience_match</code>, requests thinking off, and starts with a 512-token output cap. Some installed templates still reason; truncation or invalid JSON can use one bounded 2048-token retry. Screen errors retain safe diagnostic metadata.</li>
+        <li>A valid preliminary score at or above <code>AI_DEEP_ANALYSIS_MIN_MATCH</code> (75 by default, inclusive) receives detailed analysis. Below-threshold jobs stay searchable without overwriting final scores or compensation. The preliminary score controls routing, not hiring decisions.</li>
+        <li><code>job_match_screens</code> stores the score, experience classification, input fingerprint, and UTC screening timestamp separately from final AI fields. The fingerprint includes resume/job evidence, screen prompt/schema version, model, context, and token limits. Fresh below-threshold screens make no further model calls; threshold changes reroute a cached score without rescreening.</li>
+        <li>The coordinator saves valid screens when worker results return, including results whose detailed pass failed. Invalid screens remain pending for retry. A primary batch whose attempted jobs all fail reports failure and skips background Fit Brief generation. An unavailable Ollama server stops new submissions; queued calls are cancelled when possible and running calls finish.</li>
+        <li>Stage 2 assesses the complete detailed contract, including its own experience classification, compensation, fit summary, keywords, and location-policy match. Private review is configurable; invalid or failed reviews preserve the valid detailed result. Ollama outages preserve existing final fields.</li>
+        <li>Fit Briefs require active jobs meeting the final <code>AI_FIT_BRIEF_MIN_MATCH</code> (75 by default). Brief freshness depends on resume/job hashes and schema version.</li>
+        <li>The dashboard only queues Application Prep. The processor checks for it before and between bounded analysis batches and before each Fit Brief batch. Application Prep and Fit Brief stages publish heartbeats during bounded model waits, and completed priority work restores its parent stage and counters. Prep work interrupted by an Ollama outage or coordinator failure returns to <code>queued</code>. Active inference is not interrupted; newly queued work can wait for the current batch or a later run if it arrives as processing ends.</li>
+        <li><code>AI_CONCURRENCY=1</code>, <code>AI_MAX_INFLIGHT=1</code>, and <code>OLLAMA_KEEP_ALIVE=1m</code> are the lower-demand defaults. Existing environment overrides take precedence. The model stays loaded during continuous work; shorter idle retention does not put the PC to sleep.</li>
+        <li><code>LIMIT</code> applies after cached screen-outs, empty postings, and backoff-delayed failures are removed. Fresh work has priority, so with continuous arrivals and <code>LIMIT=1</code>, a due retry can still wait. Use one processor with the existing scheduled-run lock; these queues do not coordinate competing processor instances.</li>
+        <li>Grounded Application Prep drafts still require human approval before resume changes or artifacts are created. The dashboard coverage report includes deferred jobs without final analysis; screening decisions and cache counts are currently available in the processor log.</li>
+      </ul>
+
+      <h2>Future improvements</h2>
+      <ul>
+        <li>Measure wall power, inference time, and false negatives on representative jobs before tuning the threshold or adding an uncertain score band.</li>
+        <li>Show preliminary screening score, freshness, and a per-job <em>Analyze anyway</em> action in the dashboard. The current override is <code>--redo N</code>.</li>
       </ul>
     </section>
   </main>

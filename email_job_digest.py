@@ -13,12 +13,12 @@ from datetime import datetime, time, timedelta, timezone
 from typing import Any, Callable, List, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from sqlalchemy import asc, desc, select
+from sqlalchemy import asc, desc, inspect as sa_inspect, select
 from sqlalchemy.orm import Session
 
 from app.db import resolve_display_timezone
 from app.json_utils import safe_json_list
-from app.models import IntegrationRun, Job, SessionLocal
+from app.models import IntegrationRun, Job, JobMatchScreen, SessionLocal
 
 
 DEFAULT_TOP_N = 25
@@ -125,7 +125,12 @@ def _safe_json_list(value: Any) -> List[str]:
 
 def score_label(job: Job) -> str:
     score = getattr(job, "ai_match_percentage", None)
-    return f"{score}%" if score is not None else "Not analyzed"
+    if score is not None:
+        return f"{score}%"
+    # The screen is historical routing evidence. Do not imply it is a final
+    # assessment or that it is fresh for today's resume and routing threshold.
+    screen = getattr(job, "_digest_screen", None)
+    return f"Last screen: {screen.match_percentage}% (preliminary)" if screen is not None else "Pending analysis"
 
 
 def salary_label(job: Job) -> str:
@@ -135,9 +140,12 @@ def salary_label(job: Job) -> str:
 
 
 def fit_summary(job: Job) -> str:
-    return _clean_text(
-        getattr(job, "ai_fit_summary", None), "No AI summary available yet."
-    )
+    summary = _clean_text(getattr(job, "ai_fit_summary", None))
+    if summary:
+        return summary
+    if getattr(job, "_digest_screen", None) is not None:
+        return "Preliminary screening is available; detailed fit analysis has not been completed."
+    return "Detailed analysis is pending or needs a retry; no final score is available yet."
 
 
 def get_completed_run(session: Session, run_id: int) -> Optional[IntegrationRun]:
@@ -178,7 +186,17 @@ def get_newly_discovered_jobs(session: Session, run_ids: Sequence[int]) -> List[
             desc(Job.id),
         )
     )
-    return list(session.execute(stmt).scalars())
+    jobs = list(session.execute(stmt).scalars())
+    # The digest can run on an older host/database before the new analyzer has
+    # created its cache table. Read it when present; never run inference or DDL.
+    screens = {}
+    if jobs and sa_inspect(session.get_bind()).has_table("job_match_screens"):
+        screens = {screen.job_pk: screen for screen in session.execute(
+            select(JobMatchScreen).where(JobMatchScreen.job_pk.in_([job.id for job in jobs]))
+        ).scalars()}
+    for job in jobs:
+        job._digest_screen = screens.get(job.id)
+    return jobs
 
 
 def run_ids_label(runs: Sequence[IntegrationRun]) -> str:
@@ -200,6 +218,12 @@ def digest_counts(jobs: Sequence[Job]) -> Tuple[int, int, Optional[int]]:
     return analyzed, unanalyzed, max(scores) if scores else None
 
 
+def screened_only_count(jobs: Sequence[Job]) -> int:
+    """Keep cached routing results separate from completed final assessments."""
+    return sum(getattr(job, "ai_match_percentage", None) is None
+               and getattr(job, "_digest_screen", None) is not None for job in jobs)
+
+
 def build_subject(context: DigestContext, total_new: int, top_n: int) -> str:
     return f"Job digest: {total_new} new jobs from {context.label} - top {top_n}"
 
@@ -207,7 +231,8 @@ def build_subject(context: DigestContext, total_new: int, top_n: int) -> str:
 def render_text_digest(context: DigestContext, jobs: Sequence[Job], top_n: int) -> str:
     top_jobs = list(jobs[:top_n])
     analyzed, unanalyzed, highest_score = digest_counts(jobs)
-    highest_label = f"{highest_score}%" if highest_score is not None else "Not analyzed"
+    screened = screened_only_count(jobs)
+    highest_label = f"{highest_score}%" if highest_score is not None else "No final scores yet"
     runs = list(context.runs)
     window_lines = [
         f"Digest date: {context.date_label}",
@@ -235,10 +260,11 @@ def render_text_digest(context: DigestContext, jobs: Sequence[Job], top_n: int) 
         "",
         "Digest summary",
         f"- Analyzed jobs: {analyzed}",
-        f"- Unanalyzed jobs: {unanalyzed}",
+        f"- Screened-only jobs: {screened}",
+        f"- Pending analysis jobs: {unanalyzed - screened}",
         f"- Highest AI score: {highest_label}",
         "",
-        f"Top {len(top_jobs)} jobs to apply for",
+        f"Top {len(top_jobs)} jobs to review",
     ]
 
     if not top_jobs:
@@ -305,7 +331,8 @@ def _keyword_row(label: str, values: Sequence[str], bg: str) -> str:
 def render_html_digest(context: DigestContext, jobs: Sequence[Job], top_n: int) -> str:
     top_jobs = list(jobs[:top_n])
     analyzed, unanalyzed, highest_score = digest_counts(jobs)
-    highest_label = f"{highest_score}%" if highest_score is not None else "Not analyzed"
+    screened = screened_only_count(jobs)
+    highest_label = f"{highest_score}%" if highest_score is not None else "No final scores yet"
     runs = list(context.runs)
     score_badge = (
         "<span style=\"display:inline-block;padding:6px 10px;border-radius:999px;"
@@ -316,11 +343,12 @@ def render_html_digest(context: DigestContext, jobs: Sequence[Job], top_n: int) 
     summary_items = [
         ("New", len(jobs)),
         ("Analyzed", analyzed),
-        ("Unanalyzed", unanalyzed),
-        ("Errors", _sum_run_attr(runs, "error_count")),
+        ("Screened only", screened),
+        ("Pending", unanalyzed - screened),
+        ("Scraper errors", _sum_run_attr(runs, "error_count")),
     ]
     summary_html = "".join(
-        "<td style=\"width:25%;padding:10px 6px;text-align:center\">"
+        "<td style=\"width:20%;padding:10px 6px;text-align:center\">"
         "<div style=\"font-size:20px;font-weight:800;color:#111827;line-height:1.1\">"
         f"{_e(value)}</div>"
         "<div style=\"margin-top:4px;font-size:11px;text-transform:uppercase;"
@@ -390,14 +418,14 @@ def render_html_digest(context: DigestContext, jobs: Sequence[Job], top_n: int) 
         "<body style=\"margin:0;padding:0;background:#f3f4f6;color:#111827;"
         "font-family:Arial,Helvetica,sans-serif;-webkit-text-size-adjust:100%\">"
         "<div style=\"display:none;max-height:0;overflow:hidden;color:#f3f4f6\">"
-        f"{_e(len(jobs))} new jobs, {highest_label} highest AI score.</div>"
+        f"{_e(len(jobs))} new jobs. Highest final AI score: {highest_label}.</div>"
         "<table role=\"presentation\" width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" style=\"border-collapse:collapse;background:#f3f4f6\">"
         "<tr><td align=\"center\" style=\"padding:14px 8px\">"
         "<table role=\"presentation\" width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" "
         "style=\"max-width:680px;border-collapse:collapse\">"
         "<tr><td style=\"padding:22px 18px;border-radius:12px 12px 0 0;background:#111827;color:#ffffff\">"
         "<div style=\"font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:#c7d2fe;font-weight:800\">Job Digest</div>"
-        f"<h1 style=\"margin:6px 0 8px 0;font-size:24px;line-height:1.2;color:#ffffff\">Top {len(top_jobs)} jobs to apply for</h1>"
+        f"<h1 style=\"margin:6px 0 8px 0;font-size:24px;line-height:1.2;color:#ffffff\">Top {len(top_jobs)} jobs to review</h1>"
         f"<div style=\"font-size:14px;line-height:1.45;color:#d1d5db\">{_e(context.label)} · {window_label} · Highest score {score_badge}</div>"
         "</td></tr>"
         "<tr><td style=\"background:#ffffff;border-left:1px solid #e5e7eb;border-right:1px solid #e5e7eb\">"

@@ -68,6 +68,7 @@ from app.models import (  # type: ignore
     Base,
     JobChange,
     JobFitBrief,
+    JobMatchScreen,
     JobApplicationPrep,
     JobResumeVariant,
     ResumeSourceSettings,
@@ -128,6 +129,7 @@ DEFAULT_STEPS_PATH = os.path.join(BASE_DIR, "steps.json")
 DEFAULT_SUGGESTIONS_PATH = os.path.join(OUTPUT_DIR, "steps_suggestions.json")
 RESUME_PATH = os.getenv("RESUME_PATH", os.path.join(BASE_DIR, "resume.txt"))
 DASH_FIT_BRIEF_MIN_MATCH = int(os.getenv("AI_FIT_BRIEF_MIN_MATCH", "75"))
+DASH_DEEP_ANALYSIS_MIN_MATCH = int(os.getenv("AI_DEEP_ANALYSIS_MIN_MATCH", "75"))
 APPLICATION_PREP_SCHEMA_VERSION = 3
 APPLICATION_PREP_INVENTORY_MAX_TOKENS = max(
     0, int(os.getenv("APPLICATION_PREP_INVENTORY_MAX_TOKENS", "1200"))
@@ -2066,14 +2068,8 @@ def fetch_runs_summary(days: int) -> Dict[str, Any]:
 
 
 def fetch_ollama_processing_report(limit: int = 25) -> Dict[str, Any]:
-    """Summarize active jobs that have not received the primary AI analysis pass.
-
-    This intentionally mirrors analyze_jobs_ollama.select_job_ids(): an active
-    job is awaiting Ollama when its ai_analysis payload is absent. AI score
-    fields alone are not used because a valid processor pass always stores the
-    payload, while a partial legacy row may not.
-    """
-    pending_filter = or_(Job.ai_analysis.is_(None), func.trim(Job.ai_analysis) == "")
+    """Summarize final, screened-only, and genuinely pending active jobs."""
+    no_final_filter = or_(Job.ai_analysis.is_(None), func.trim(Job.ai_analysis) == "")
     content_filter = or_(
         func.length(func.trim(func.coalesce(Job.title, ""))) > 0,
         func.length(func.trim(func.coalesce(Job.desc, ""))) > 0,
@@ -2081,21 +2077,50 @@ def fetch_ollama_processing_report(limit: int = 25) -> Dict[str, Any]:
     limit = max(1, min(int(limit or 25), 100))
 
     with SessionLocal() as session:
+        # Older deployments may serve the dashboard before the analyzer has
+        # created its screen cache. In that case every job without a final
+        # payload remains pending, matching the legacy behavior.
+        has_screen_cache = engine.dialect.has_table(
+            session.connection(), JobMatchScreen.__tablename__
+        )
+        screened_filter = (
+            Job.id.in_(
+                select(JobMatchScreen.job_pk).where(
+                    JobMatchScreen.match_percentage < DASH_DEEP_ANALYSIS_MIN_MATCH
+                )
+            )
+            if has_screen_cache
+            else False
+        )
+        awaiting_filter = and_(no_final_filter, ~screened_filter) if has_screen_cache else no_final_filter
+
         active_count = session.scalar(
             select(func.count()).select_from(Job).where(Job.is_active.is_(True))
         ) or 0
+        final_count = session.scalar(
+            select(func.count()).select_from(Job).where(Job.is_active.is_(True), ~no_final_filter)
+        ) or 0
+        screened_count = (
+            session.scalar(
+                select(func.count()).select_from(Job).where(
+                    Job.is_active.is_(True), no_final_filter, screened_filter
+                )
+            ) or 0
+            if has_screen_cache
+            else 0
+        )
         awaiting_count = session.scalar(
-            select(func.count()).select_from(Job).where(Job.is_active.is_(True), pending_filter)
+            select(func.count()).select_from(Job).where(Job.is_active.is_(True), awaiting_filter)
         ) or 0
         ready_count = session.scalar(
             select(func.count()).select_from(Job).where(
-                Job.is_active.is_(True), pending_filter, content_filter
+                Job.is_active.is_(True), awaiting_filter, content_filter
             )
         ) or 0
         pending_jobs = (
             session.execute(
                 select(Job)
-                .where(Job.is_active.is_(True), pending_filter)
+                .where(Job.is_active.is_(True), awaiting_filter)
                 .order_by(Job.discovery_date.asc(), Job.id.asc())
                 .limit(limit)
             )
@@ -2106,7 +2131,9 @@ def fetch_ollama_processing_report(limit: int = 25) -> Dict[str, Any]:
     # The report is diagnostic only; it does not queue or mutate any job.
     return {
         "active_count": int(active_count),
-        "processed_count": max(0, int(active_count) - int(awaiting_count)),
+        "processed_count": int(final_count) + int(screened_count),
+        "final_count": int(final_count),
+        "screened_count": int(screened_count),
         "awaiting_count": int(awaiting_count),
         "ready_count": int(ready_count),
         "missing_content_count": max(0, int(awaiting_count) - int(ready_count)),

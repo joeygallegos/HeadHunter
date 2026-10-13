@@ -22,10 +22,11 @@ import traceback
 import urllib.error
 import urllib.request
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # Scheduled Task can launch this script outside the repository directory. Keep
@@ -92,6 +93,8 @@ from app.models import (
     JobSwipe,
     JobChange,
     JobFitBrief,
+    JobAnalysisRetry,
+    JobMatchScreen,
     JobApplicationPrep,
     init_db,
 )
@@ -196,13 +199,25 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 # Config
 # -------------------------------
 RESUME_PATH = os.getenv("RESUME_PATH", "resume.txt")
+MATCH_SCREEN_PROMPT_PATH = os.path.join(BASE_DIR, "prompts", "stage_1_match_score_system.txt")
+# This threshold controls inference spending; final applicant scores still come
+# from the reviewed detailed pass. A value of zero admits every valid screen.
+AI_DEEP_ANALYSIS_MIN_MATCH = int(os.getenv("AI_DEEP_ANALYSIS_MIN_MATCH", "75"))
+if not 0 <= AI_DEEP_ANALYSIS_MIN_MATCH <= 100:
+    raise ValueError("AI_DEEP_ANALYSIS_MIN_MATCH must be between 0 and 100")
+# Some installed reasoning templates still emit thinking with think=False.
+# Keep the screen cheaper than detail, but allow enough room for final JSON.
+AI_SCREEN_NUM_PREDICT = max(64, int(os.getenv("AI_SCREEN_NUM_PREDICT", "512")))
+AI_SCREEN_RETRY_NUM_PREDICT = max(
+    AI_SCREEN_NUM_PREDICT, int(os.getenv("AI_SCREEN_RETRY_NUM_PREDICT", "2048"))
+)
 AI_SYSTEM_PROMPT_TEMPLATE_PATH = os.getenv(
     "AI_SYSTEM_PROMPT_TEMPLATE_PATH",
-    os.path.join(BASE_DIR, "prompts", "job_match_system.txt"),
+    os.path.join(BASE_DIR, "prompts", "stage_2_detailed_analysis_system.txt"),
 )
 FIT_BRIEF_SYSTEM_PROMPT_PATH = os.getenv(
     "FIT_BRIEF_SYSTEM_PROMPT_PATH",
-    os.path.join(BASE_DIR, "prompts", "fit_brief_system.txt"),
+    os.path.join(BASE_DIR, "prompts", "stage_3_fit_brief_system.txt"),
 )
 APPLICATION_PREP_SYSTEM_PROMPT_PATH = os.getenv(
     "APPLICATION_PREP_SYSTEM_PROMPT_PATH",
@@ -220,6 +235,12 @@ OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip(
 ONLY_EMPTY = os.getenv("ONLY_EMPTY", "true").lower() == "true"
 SITE_FILTER = os.getenv("SITE_FILTER", "").strip()
 LIMIT = int(os.getenv("LIMIT", "0"))
+# Failed jobs remain eligible, but spaced retries avoid repeatedly spending the
+# bounded queue on the same broken input or temporary model failure.
+AI_RETRY_BASE_MINUTES = max(1, int(os.getenv("AI_RETRY_BASE_MINUTES", "15")))
+AI_RETRY_MAX_MINUTES = max(
+    AI_RETRY_BASE_MINUTES, int(os.getenv("AI_RETRY_MAX_MINUTES", "360"))
+)
 TOKEN_THRESHOLD = int(os.getenv("AI_TOKEN_THRESHOLD", "4096"))
 MAX_JOB_DESC_TOKENS = int(os.getenv("MAX_JOB_DESC_TOKENS", "700"))
 MAX_RESUME_TOKENS = int(os.getenv("MAX_RESUME_TOKENS", "500"))
@@ -244,12 +265,12 @@ APPLICATION_PREP_RETRY_NUM_PREDICT = max(
     AI_THINKING_RETRY_NUM_PREDICT,
     int(os.getenv("APPLICATION_PREP_RETRY_NUM_PREDICT", str(APPLICATION_PREP_NUM_PREDICT * 2))),
 )
-OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "30m")
+OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "1m")
 KEYWORD_LIST_LIMIT = int(os.getenv("AI_KEYWORD_LIST_LIMIT", "5"))
 FIT_SUMMARY_MAX_CHARS = int(os.getenv("AI_FIT_SUMMARY_MAX_CHARS", "400"))
-AI_CONCURRENCY = max(1, int(os.getenv("AI_CONCURRENCY", "2")))
+AI_CONCURRENCY = max(1, int(os.getenv("AI_CONCURRENCY", "1")))
 AI_MAX_INFLIGHT = max(
-    AI_CONCURRENCY, int(os.getenv("AI_MAX_INFLIGHT", str(AI_CONCURRENCY * 2)))
+    AI_CONCURRENCY, int(os.getenv("AI_MAX_INFLIGHT", str(AI_CONCURRENCY)))
 )
 AI_BATCH_LOG_EVERY = max(1, int(os.getenv("AI_BATCH_LOG_EVERY", "10")))
 AI_REQUEST_TIMEOUT_SEC = max(10, int(os.getenv("AI_REQUEST_TIMEOUT_SEC", "120")))
@@ -334,6 +355,10 @@ class JobTask:
     pay: str
     run_id: int
     content_hash: Optional[str]
+    screen_input_hash: str = ""
+    retry_input_hash: str = ""
+    cached_screen: Optional[Dict[str, Any]] = None
+    force_detail: bool = False
 
 
 @dataclass
@@ -341,12 +366,14 @@ class JobResult:
     id: int
     site: str
     job_id: str
-    status: str  # ok | skip | llm_error | schema_error | ollama_unavailable
+    status: str  # ok | screened_out | skip | llm_error | schema_error | ollama_unavailable
     payload_json: Optional[str]
     update_params: Optional[Dict[str, Any]]
     llm_seconds: float
     error_text: str
     index: int
+    # Carry a valid screen through detail failures so the coordinator can cache it.
+    screen_payload: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -734,7 +761,10 @@ def render_system_prompt(template_path: str = AI_SYSTEM_PROMPT_TEMPLATE_PATH) ->
     )
 
 
-def build_messages(resume_text: str, title: str, desc: str) -> list:
+def build_messages(
+    resume_text: str, title: str, desc: str,
+    template_path: str = AI_SYSTEM_PROMPT_TEMPLATE_PATH,
+) -> list:
     """Build the LLM messages for one job-fit assessment.
 
     The job description is treated as untrusted data and placed in the human
@@ -742,7 +772,7 @@ def build_messages(resume_text: str, title: str, desc: str) -> list:
     not eliminate prompt-injection risk, but it gives the model a clear priority
     order and the result is still validated before persistence.
     """
-    sys_msg = render_system_prompt()
+    sys_msg = render_system_prompt(template_path)
     user_msg = (
         "<resume>\n"
         f"{clean_text(resume_text)}\n"
@@ -1552,12 +1582,14 @@ def validate_fit_brief_schema(payload: Any, resume_text: str) -> Tuple[bool, str
     return True, ""
 
 
-def fit_brief_repair_prompt(raw: str) -> str:
+def fit_brief_repair_prompt(raw: str, validation_error: str = "") -> str:
     """Build the repair prompt for invalid Fit Brief JSON."""
     return (
         "Your previous Fit Brief response was invalid. Return ONLY one JSON object "
         "with exactly these keys: score_explanation, strongest_matches, "
         "concerns_or_gaps, risk_flags, interview_angle, resume_bullet_matches. "
+        "strongest_matches, concerns_or_gaps and risk_flags must be arrays of strings, not objects. "
+        f"Validation failure: {validation_error or 'invalid JSON'}. "
         "Each resume_bullet_matches item must have exactly resume_bullet, "
         "job_requirement, why_it_matters, confidence. resume_bullet must be exact "
         "text copied from the resume. No markdown or extra text.\n\n"
@@ -1705,7 +1737,7 @@ def analyze_fit_brief_worker(
                 payload = parsed
                 break
             attempts.append(f"attempt {attempt}: {why}; {_payload_debug(parsed, raw)}")
-            current_msgs = msgs + [HumanMessage(content=fit_brief_repair_prompt(raw))]
+            current_msgs = msgs + [HumanMessage(content=fit_brief_repair_prompt(raw, why))]
         except OllamaUnavailableError as exc:
             took += time.time() - t0
             return JobResult(task.id, task.site, task.job_id, "ollama_unavailable", None, None, took, str(exc), index)
@@ -1748,6 +1780,107 @@ def should_expand_thinking_budget(
         and exc.thinking_chars > 0
         and current_num_predict < AI_THINKING_RETRY_NUM_PREDICT
     )
+
+
+def screen_input_hash(resume_text: str, task: JobTask) -> str:
+    """Invalidate the cache when evidence, prompt, model or inference limits change."""
+    # Hash the actual text, not just the scraper hash: some title/description
+    # updates do not change legacy content hashes. Threshold changes only reroute.
+    return stable_text_hash(json.dumps([
+        1, resume_text, task.title, task.desc,
+        render_system_prompt(MATCH_SCREEN_PROMPT_PATH), OLLAMA_MODEL,
+        OLLAMA_NUM_CTX, MAX_JOB_DESC_TOKENS, AI_SCREEN_NUM_PREDICT, AI_SCREEN_RETRY_NUM_PREDICT,
+    ], ensure_ascii=False))
+
+
+def analysis_retry_input_hash(resume_text: str, task: JobTask) -> str:
+    """Identify the evidence and inference contract behind a failed attempt."""
+    return stable_text_hash(json.dumps([
+        1, screen_input_hash(resume_text, task), render_system_prompt(),
+        OLLAMA_NUM_PREDICT, AI_THINKING_RETRY_NUM_PREDICT, AI_MAX_ATTEMPTS,
+        OLLAMA_THINK, AI_SECOND_PASS_REVIEW,
+        AI_REVIEW_MIN_MATCH, AI_REVIEW_MAX_MATCH,
+    ], ensure_ascii=False))
+
+
+def validate_match_screen(payload: Any) -> bool:
+    """Reject malformed scores instead of treating failures as irrelevant jobs."""
+    return (
+        isinstance(payload, dict)
+        and set(payload) == {"match_percentage", "experience_match"}
+        and type(payload["match_percentage"]) is int
+        and 0 <= payload["match_percentage"] <= 100
+        and isinstance(payload["experience_match"], str)
+        and payload["experience_match"] in EXP_ALLOWED
+    )
+
+
+def analyze_routed_job_worker(resume_text: str, task: JobTask, index: int) -> JobResult:
+    """Screen first; reserve detailed analysis and review for relevant jobs."""
+    if not task.title.strip() and not task.desc.strip():
+        return JobResult(task.id, task.site, task.job_id, "skip", None, None, 0.0,
+                         "Empty title+desc", index)
+    if task.force_detail:
+        # An explicit --redo is the escape hatch for a false-negative screen.
+        return analyze_job_worker(resume_text, task, index)
+
+    screen = task.cached_screen
+    took = 0.0
+    if screen is None:
+        desc, _, _ = truncate_to_token_budget(task.desc, MAX_JOB_DESC_TOKENS)
+        msgs = build_messages(resume_text, task.title, desc, MATCH_SCREEN_PROMPT_PATH)
+        errors: List[str] = []
+        current_num_predict = AI_SCREEN_NUM_PREDICT
+        current_msgs = list(msgs)
+        # A small screen budget can be exhausted by reasoning even when thinking
+        # was disabled. Allow only one bounded retry, independent of detail's
+        # larger reasoning budget, and never classify a failed screen as rejection.
+        for attempt in range(1, min(AI_MAX_ATTEMPTS, 2) + 1):
+            started = time.monotonic()
+            try:
+                raw = invoke_ollama_json(current_msgs, num_predict=current_num_predict, think=False)
+                candidate = parse_json_strict(raw)
+                if validate_match_screen(candidate):
+                    screen = candidate
+                    break
+                errors.append(f"attempt {attempt}: invalid screen JSON (response_chars={len(raw)}, num_predict={current_num_predict})")
+                current_num_predict = AI_SCREEN_RETRY_NUM_PREDICT
+                current_msgs = msgs + [HumanMessage(content=(
+                    "Return only the required JSON object: match_percentage must be an integer "
+                    "0-100 and experience_match must be underqualified, qualified or overqualified."
+                ))]
+            except OllamaUnavailableError as exc:
+                return JobResult(task.id, task.site, task.job_id, "ollama_unavailable",
+                                 None, None, took + time.monotonic() - started, str(exc), index)
+            except OllamaEmptyContentError as exc:
+                # These are response metadata only; never log reasoning or input
+                # text. The old generic error concealed 128-token exhaustion.
+                reason = exc.done_reason if exc.done_reason in ("length", "stop") else "unknown"
+                eval_count = exc.eval_count if type(exc.eval_count) is int else "unknown"
+                errors.append(f"attempt {attempt}: empty screen output (done_reason={reason}, thinking_chars={exc.thinking_chars}, eval_count={eval_count}, num_predict={current_num_predict})")
+                if exc.done_reason == "length":
+                    current_num_predict = AI_SCREEN_RETRY_NUM_PREDICT
+            except Exception as exc:
+                # Arbitrary exception messages can contain provider response or
+                # personal evidence. Keep only the category and a known HTTP code.
+                cause = exc.__cause__
+                category = f"HTTP {cause.code}" if isinstance(cause, urllib.error.HTTPError) else type(exc).__name__
+                errors.append(f"attempt {attempt}: screen request failed ({category})")
+            finally:
+                took += time.monotonic() - started
+        if screen is None:
+            return JobResult(task.id, task.site, task.job_id, "schema_error",
+                             None, None, took, " | ".join(errors), index)
+
+    if screen["match_percentage"] < AI_DEEP_ANALYSIS_MIN_MATCH:
+        return JobResult(task.id, task.site, task.job_id, "screened_out", None, None,
+                         took, "Below deep-analysis threshold", index, screen)
+    result = analyze_job_worker(resume_text, task, index)
+    # Persist a successful screen even if the subsequent detailed pass fails;
+    # the next run retries detail without paying for the same screen again.
+    result.screen_payload = screen
+    result.llm_seconds += took
+    return result
 
 
 def analyze_job_worker(resume_text: str, task: JobTask, index: int) -> JobResult:
@@ -1886,7 +2019,10 @@ def analyze_job_worker(resume_text: str, task: JobTask, index: int) -> JobResult
 # -------------------------------
 # Query helpers
 # -------------------------------
-def select_job_ids(session: Session, redo: Optional[int] = None) -> List[int]:
+def select_job_ids(
+    session: Session,
+    redo: Optional[int] = None,
+) -> List[int]:
     """Return candidate job primary keys based on filters and optional redo mode."""
     where = ["is_active = 1"]
     params: Dict[str, Any] = {}
@@ -1905,12 +2041,56 @@ def select_job_ids(session: Session, redo: Optional[int] = None) -> List[int]:
     if redo is not None:
         params["redo"] = redo
         limit_sql = " ORDER BY discovery_date DESC, id DESC LIMIT :redo"
+    elif not ONLY_EMPTY:
+        # Reprocessing mode is a rotating queue: pending jobs lead, followed by
+        # the least recently analyzed rows. Otherwise a small LIMIT would run
+        # the same oldest successful jobs forever.
+        limit_sql = (
+            " ORDER BY CASE WHEN ai_analysis IS NULL OR ai_analysis = '' THEN 0 ELSE 1 END, "
+            "ai_analyzed_at ASC, discovery_date ASC, id ASC"
+        )
     else:
-        limit_sql = f" LIMIT {LIMIT}" if LIMIT > 0 else ""
-    # SITE_FILTER values are bound parameters; LIMIT is parsed as int at import.
+        limit_sql = " ORDER BY discovery_date ASC, id ASC"
+    # SITE_FILTER values are bound; the coordinator applies LIMIT after cache filtering.
     sql = f"SELECT id FROM jobs WHERE {where_sql}{limit_sql}"
     rows = session.execute(sa_text(sql), params).fetchall()
     return [r[0] for r in rows]
+
+
+def record_analysis_failure(
+    session: Session,
+    job_pk: int,
+    input_hash: str,
+    failed_at: Optional[datetime] = None,
+) -> JobAnalysisRetry:
+    """Persist a bounded exponential retry delay without storing error content."""
+    failure_time = failed_at or utc_now_naive()
+    retry = session.get(JobAnalysisRetry, job_pk)
+    # Changed evidence or inference instructions deserve a fresh attempt rather
+    # than inheriting backoff from a failure that may no longer reproduce.
+    same_input = retry is not None and retry.input_hash == input_hash
+    failure_count = (retry.failure_count if same_input else 0) + 1
+    # Cap both the exponent and final delay so a long-lived bad row remains
+    # retryable and an unbounded failure count cannot produce huge integers.
+    exponent = min(failure_count - 1, 16)
+    delay_minutes = min(AI_RETRY_BASE_MINUTES * (2 ** exponent), AI_RETRY_MAX_MINUTES)
+    if retry is None:
+        retry = JobAnalysisRetry(job_pk=job_pk)
+    retry.input_hash = input_hash
+    retry.failure_count = failure_count
+    retry.last_failed_at = failure_time
+    retry.retry_after = failure_time + timedelta(minutes=delay_minutes)
+    session.add(retry)
+    session.commit()
+    return retry
+
+
+def clear_analysis_failure(session: Session, job_pk: int) -> None:
+    """Remove retry state after a terminal or successful processing result."""
+    retry = session.get(JobAnalysisRetry, job_pk)
+    if retry is not None:
+        session.delete(retry)
+        session.commit()
 
 
 def build_compensation_messages(title: str, desc: str) -> List[Any]:
@@ -2373,12 +2553,27 @@ def run_fit_brief_generation(
         )
         if not tasks:
             log(f"Stage 3 Fit Brief complete: {totals}")
+            now = utc_now_naive()
+            publish_ai_processing_status(
+                status="idle",
+                message="No Stage 3 Fit Briefs need generation.",
+                started_at=now,
+                finished_at=now,
+            )
             return totals
 
         if preflight:
             try:
                 check_ollama_prerequisites()
             except OllamaPrerequisiteError as exc:
+                publish_ai_processing_status(
+                    status="failed",
+                    total_jobs=len(tasks),
+                    failed_jobs=len(tasks),
+                    message="Stage 3 Fit Brief generation could not start because Ollama is unavailable.",
+                    started_at=utc_now_naive(),
+                    finished_at=utc_now_naive(),
+                )
                 log(f"[fatal] {exc}")
                 raise SystemExit(1) from exc
 
@@ -2387,11 +2582,55 @@ def run_fit_brief_generation(
         submitted = 0
         aborted = False
 
+        status_started_at = utc_now_naive()
+
+        def publish_fit_brief_status(message: str) -> None:
+            current_jobs = [
+                {
+                    "index": next(
+                        (index for index, candidate in enumerate(tasks, start=1) if candidate.id == task.id),
+                        0,
+                    ),
+                    "total": len(tasks),
+                    "site": task.site,
+                    "job_id": task.job_id,
+                    "title": task.title or "(no title)",
+                    "stage": "fit_brief",
+                }
+                for task in future_to_task.values()
+            ]
+            publish_ai_processing_status(
+                status="running",
+                total_jobs=len(tasks),
+                submitted_jobs=submitted,
+                completed_jobs=totals["processed"] + totals["failed"] + totals["skipped"],
+                processed_jobs=totals["processed"],
+                failed_jobs=totals["failed"],
+                current_jobs=current_jobs,
+                message=message,
+                started_at=status_started_at,
+            )
+
+        publish_fit_brief_status("Stage 3 Fit Brief generation is starting.")
+
         with ThreadPoolExecutor(max_workers=AI_CONCURRENCY) as executor:
             while (not aborted and submitted < len(tasks)) or futures:
+                # Fit Briefs also yield between bounded batches, so Application
+                # Prep arriving after the main analysis stage still takes priority.
+                if not futures and not aborted:
+                    session.rollback()
+                    run_application_prep_generation(
+                        resume_text=resume_text,
+                        force=False,
+                        preflight=False,
+                        restore_status=lambda: publish_fit_brief_status(
+                            "Resuming Stage 3 Fit Brief generation after priority Application Prep."
+                        ),
+                    )
+                batch_end = min(len(tasks), submitted + AI_MAX_INFLIGHT) if not futures else submitted
                 while (
                     not aborted
-                    and submitted < len(tasks)
+                    and submitted < batch_end
                     and len(futures) < AI_MAX_INFLIGHT
                 ):
                     task = tasks[submitted]
@@ -2404,6 +2643,7 @@ def run_fit_brief_generation(
                     futures.add(future)
                     future_to_task[future] = task
                     submitted += 1
+                    publish_fit_brief_status("Stage 3 Fit Brief generation is running.")
 
                 done, _ = wait(
                     futures,
@@ -2414,6 +2654,9 @@ def run_fit_brief_generation(
                     log(
                         f"[wait] fit-briefs submitted={submitted}/{len(tasks)} "
                         f"inflight={len(futures)}"
+                    )
+                    publish_fit_brief_status(
+                        "Stage 3 Fit Brief generation is waiting for Ollama responses."
                     )
                     continue
 
@@ -2479,11 +2722,34 @@ def run_fit_brief_generation(
                         continue
                     totals["processed"] += 1
                     log(f"[ok] Fit Brief committed {result.site}:{result.job_id} in {result.llm_seconds:.1f}s")
+                    publish_fit_brief_status("Stage 3 Fit Brief generation is running.")
 
         totals["unsubmitted"] = len(tasks) - submitted
         log(f"Stage 3 Fit Brief complete: {totals}")
         if aborted:
+            publish_ai_processing_status(
+                status="failed",
+                total_jobs=len(tasks),
+                submitted_jobs=submitted,
+                completed_jobs=totals["processed"] + totals["failed"] + totals["skipped"],
+                processed_jobs=totals["processed"],
+                failed_jobs=totals["failed"],
+                message="Stage 3 Fit Brief generation stopped because Ollama became unavailable.",
+                started_at=status_started_at,
+                finished_at=utc_now_naive(),
+            )
             raise SystemExit(1)
+        publish_ai_processing_status(
+            status="idle",
+            total_jobs=len(tasks),
+            submitted_jobs=submitted,
+            completed_jobs=totals["processed"] + totals["failed"] + totals["skipped"],
+            processed_jobs=totals["processed"],
+            failed_jobs=totals["failed"],
+            message="Stage 3 Fit Brief generation finished.",
+            started_at=status_started_at,
+            finished_at=utc_now_naive(),
+        )
         return totals
 
 
@@ -2539,6 +2805,7 @@ def run_application_prep_generation(
     resume_text: Optional[str] = None,
     force: bool = False,
     preflight: bool = True,
+    restore_status: Optional[Callable[[], None]] = None,
 ) -> Dict[str, int]:
     """Run high-priority application prep for liked move-forward jobs."""
     init_db()
@@ -2610,27 +2877,118 @@ def run_application_prep_generation(
         )
         if not tasks:
             log(f"Application Prep complete: {totals}")
+            if restore_status is None:
+                now = utc_now_naive()
+                publish_ai_processing_status(
+                    status="idle",
+                    message="Application Prep queue is empty.",
+                    started_at=now,
+                    finished_at=now,
+                )
             return totals
 
-        if preflight:
-            try:
-                check_ollama_prerequisites()
-            except OllamaPrerequisiteError as exc:
-                for task in tasks:
-                    prep = session.get(JobApplicationPrep, task.prep_id)
-                    if prep is not None:
-                        prep.status = "failed"
-                        prep.error_text = str(exc)
-                session.commit()
-                log(f"[fatal] {exc}")
-                raise SystemExit(1) from exc
-
+        status_started_at = utc_now_naive()
         futures: Set[Future] = set()
         future_to_task: Dict[Future, ApplicationPrepTask] = {}
         submitted = 0
         aborted = False
 
-        with ThreadPoolExecutor(max_workers=AI_CONCURRENCY) as executor:
+        def publish_application_prep_status(message: str) -> None:
+            # Heartbeats run on the coordinator and publish through a fresh
+            # SessionLocal. Model workers never receive or share this session.
+            current_jobs = [
+                {
+                    "index": task_index,
+                    "total": len(tasks),
+                    "site": task.site,
+                    "job_id": task.job_id,
+                    "title": task.title or "(no title)",
+                    "stage": "application_prep",
+                }
+                for task in future_to_task.values()
+                for task_index in (
+                    next(
+                        (
+                            index
+                            for index, candidate in enumerate(tasks, start=1)
+                            if candidate.id == task.id
+                        ),
+                        0,
+                    ),
+                )
+            ]
+            publish_ai_processing_status(
+                status="running",
+                total_jobs=len(tasks),
+                submitted_jobs=submitted,
+                completed_jobs=totals["processed"] + totals["failed"] + totals["skipped"],
+                processed_jobs=totals["processed"],
+                failed_jobs=totals["failed"],
+                current_jobs=current_jobs,
+                message=message,
+                started_at=status_started_at,
+            )
+
+        def reset_running_application_preps() -> None:
+            # Every selected row is marked running before bounded submission.
+            # Return work that never completed to the durable queue after an
+            # Ollama outage so a later scheduled run can claim it again.
+            for task in tasks:
+                prep = session.get(JobApplicationPrep, task.prep_id)
+                if prep is not None and prep.status == "running":
+                    prep.status = "queued"
+                    prep.started_at = None
+            session.commit()
+
+        @contextmanager
+        def requeue_unfinished_application_preps():
+            """Make catchable coordinator failures leave durable work retryable."""
+            try:
+                yield
+            except Exception:
+                try:
+                    reset_running_application_preps()
+                except Exception:
+                    session.rollback()
+                    # Preserve the original coordinator exception and avoid
+                    # leaking database details through the processing log.
+                    log("[warn] Could not requeue unfinished Application Prep work")
+                publish_ai_processing_status(
+                    status="failed",
+                    total_jobs=len(tasks),
+                    submitted_jobs=submitted,
+                    completed_jobs=totals["processed"] + totals["failed"] + totals["skipped"],
+                    processed_jobs=totals["processed"],
+                    failed_jobs=totals["failed"],
+                    message="Application Prep stopped because its coordinator failed.",
+                    started_at=status_started_at,
+                    finished_at=utc_now_naive(),
+                )
+                raise
+            else:
+                reset_running_application_preps()
+
+        publish_application_prep_status("Application Prep is preparing priority jobs.")
+
+        if preflight:
+            try:
+                check_ollama_prerequisites()
+            except OllamaPrerequisiteError as exc:
+                reset_running_application_preps()
+                publish_ai_processing_status(
+                    status="failed",
+                    total_jobs=len(tasks),
+                    failed_jobs=len(tasks),
+                    message="Application Prep could not start because Ollama is unavailable.",
+                    started_at=status_started_at,
+                    finished_at=utc_now_naive(),
+                )
+                log(f"[fatal] {exc}")
+                raise SystemExit(1) from exc
+
+        with requeue_unfinished_application_preps(), ThreadPoolExecutor(
+            max_workers=AI_CONCURRENCY
+        ) as executor:
             while (not aborted and submitted < len(tasks)) or futures:
                 while (
                     not aborted
@@ -2647,6 +3005,9 @@ def run_application_prep_generation(
                     futures.add(future)
                     future_to_task[future] = task
                     submitted += 1
+                    publish_application_prep_status(
+                        "Application Prep is generating priority materials."
+                    )
 
                 done, _ = wait(
                     futures,
@@ -2657,6 +3018,9 @@ def run_application_prep_generation(
                     log(
                         f"[wait] application-prep submitted={submitted}/{len(tasks)} "
                         f"inflight={len(futures)}"
+                    )
+                    publish_application_prep_status(
+                        "Application Prep is waiting for Ollama responses."
                     )
                     continue
 
@@ -2686,8 +3050,9 @@ def run_application_prep_generation(
 
                     if result.status == "ollama_unavailable":
                         totals["failed"] += 1
-                        prep.status = "failed"
-                        prep.error_text = result.error_text
+                        prep.status = "queued"
+                        prep.started_at = None
+                        prep.error_text = None
                         session.commit()
                         if not aborted:
                             aborted = True
@@ -2730,11 +3095,41 @@ def run_application_prep_generation(
                         continue
                     totals["processed"] += 1
                     log(f"[ok] Application Prep committed {result.site}:{result.job_id} in {result.llm_seconds:.1f}s")
+                    publish_application_prep_status(
+                        "Application Prep is processing the priority queue."
+                    )
 
         totals["unsubmitted"] = len(tasks) - submitted
         log(f"Application Prep complete: {totals}")
         if aborted:
+            publish_ai_processing_status(
+                status="failed",
+                total_jobs=len(tasks),
+                submitted_jobs=submitted,
+                completed_jobs=totals["processed"] + totals["failed"] + totals["skipped"],
+                processed_jobs=totals["processed"],
+                failed_jobs=totals["failed"],
+                message="Application Prep stopped because Ollama became unavailable.",
+                started_at=status_started_at,
+                finished_at=utc_now_naive(),
+            )
             raise SystemExit(1)
+        if restore_status is not None:
+            # Priority work temporarily owns the single dashboard heartbeat;
+            # hand it back immediately so the outer stage remains accurate.
+            restore_status()
+        else:
+            publish_ai_processing_status(
+                status="idle",
+                total_jobs=len(tasks),
+                submitted_jobs=submitted,
+                completed_jobs=totals["processed"] + totals["failed"] + totals["skipped"],
+                processed_jobs=totals["processed"],
+                failed_jobs=totals["failed"],
+                message="Application Prep finished.",
+                started_at=status_started_at,
+                finished_at=utc_now_naive(),
+            )
         return totals
 
 
@@ -2817,11 +3212,68 @@ def main() -> None:
 
         ids = select_job_ids(s, redo=args.redo)
         total = len(ids)
+        jobs = list(s.execute(select(Job).where(Job.id.in_(ids))).scalars()) if ids else []
+        jobs_by_id = {job.id: job for job in jobs}
+        # SQL IN does not preserve priority order. Keep the selector's FIFO
+        # order (or newest-first redo) when building the bounded work queue.
+        fresh_tasks: List[JobTask] = []
+        retry_tasks: List[JobTask] = []
+        screens = {screen.job_pk: screen for screen in s.execute(
+            select(JobMatchScreen).where(JobMatchScreen.job_pk.in_(ids))
+        ).scalars()} if ids else {}
+        retries = {retry.job_pk: retry for retry in s.execute(
+            select(JobAnalysisRetry).where(JobAnalysisRetry.job_pk.in_(ids))
+        ).scalars()} if ids else {}
+        cached_out = 0
+        empty_deferred = 0
+        retry_backoff = 0
+        selection_time = utc_now_naive()
+        for job_id in ids:
+            j = jobs_by_id[job_id]
+            task = JobTask(j.id, j.site or "", j.job_id or "", j.title or "",
+                           j.desc or "", j.pay or "", j.run_id, j.content_hash)
+            task.force_detail = args.redo is not None
+            # Empty evidence is still left pending for a future scraper update,
+            # but it must not occupy the head of a bounded inference queue.
+            if not task.title.strip() and not task.desc.strip():
+                empty_deferred += 1
+                continue
+            task.screen_input_hash = screen_input_hash(bounded_resume_text, task)
+            task.retry_input_hash = analysis_retry_input_hash(bounded_resume_text, task)
+            screen = screens.get(task.id)
+            if not task.force_detail and screen and screen.input_hash == task.screen_input_hash:
+                task.cached_screen = {"match_percentage": screen.match_percentage,
+                                      "experience_match": screen.experience_match}
+                if validate_match_screen(task.cached_screen):
+                    if screen.match_percentage < AI_DEEP_ANALYSIS_MIN_MATCH:
+                        cached_out += 1
+                        continue
+                else:
+                    task.cached_screen = None
+            retry = retries.get(task.id)
+            if task.force_detail or retry is None or retry.input_hash != task.retry_input_hash:
+                fresh_tasks.append(task)
+            elif retry.retry_after <= selection_time:
+                retry_tasks.append(task)
+            else:
+                retry_backoff += 1
+        # Fresh inputs get one attempt before known failures. Eligible retries
+        # remain FIFO within their lower-priority tier.
+        tasks = fresh_tasks + retry_tasks
+        # Apply the work limit after removing cached screen-outs, so an old
+        # rejected job cannot starve new postings on every scheduled run.
+        if args.redo is None and LIMIT > 0:
+            tasks = tasks[:LIMIT]
+        total = len(tasks)
+        log(
+            f"Screen cache: deferred={cached_out} | empty_deferred={empty_deferred} | "
+            f"retry_backoff={retry_backoff} | deep_min_match={AI_DEEP_ANALYSIS_MIN_MATCH}"
+        )
         if total == 0:
             log("[ok] No jobs matched filter criteria.")
             publish_ai_processing_status(
                 status="idle",
-                message="No active jobs are awaiting an AI analysis pass.",
+                message="No jobs need processing; fresh below-threshold screens are deferred.",
                 finished_at=utc_now_naive(),
             )
             run_application_prep_generation(
@@ -2831,21 +3283,6 @@ def main() -> None:
             )
             run_fit_brief_generation(resume_text, force=False, preflight=True)
             return
-
-        jobs = list(s.execute(select(Job).where(Job.id.in_(ids))).scalars())
-        tasks: List[JobTask] = [
-            JobTask(
-                id=j.id,
-                site=j.site or "",
-                job_id=j.job_id or "",
-                title=j.title or "",
-                desc=j.desc or "",
-                pay=j.pay or "",
-                run_id=j.run_id,
-                content_hash=j.content_hash,
-            )
-            for j in jobs
-        ]
 
         try:
             check_ollama_prerequisites()
@@ -2979,9 +3416,52 @@ def main() -> None:
 
         publish_live_status("Preparing the Ollama analysis batch.")
 
+        def mark_for_retry(job_pk: int) -> None:
+            try:
+                retry = record_analysis_failure(
+                    s, job_pk, task_by_id[job_pk].retry_input_hash,
+                )
+                log(
+                    f"[retry] failure_count={retry.failure_count} "
+                    f"eligible_after={retry.retry_after.isoformat(sep=' ', timespec='seconds')}"
+                )
+            except Exception:
+                s.rollback()
+                # Retry metadata is operational state; keep provider output and
+                # database details out of logs if this best-effort write fails.
+                log("[err] Could not save retry state; job remains pending")
+
+        def clear_retry(job_pk: int) -> None:
+            try:
+                clear_analysis_failure(s, job_pk)
+            except Exception:
+                s.rollback()
+                log("[warn] Could not clear retry state")
+
         def handle_result(result: JobResult) -> None:
             nonlocal processed, failures, skipped, completed, llm_seconds_total, aborted
             completed += 1
+            # An outage must stop submissions even if caching this screen fails.
+            if result.status == "ollama_unavailable":
+                aborted = True
+            # Only the coordinator writes screening cache rows. Worker threads
+            # never share the batch SQLAlchemy session or final score fields.
+            if result.screen_payload is not None:
+                task = task_by_id[result.id]
+                try:
+                    s.merge(JobMatchScreen(
+                        job_pk=task.id, input_hash=task.screen_input_hash,
+                        match_percentage=result.screen_payload["match_percentage"],
+                        experience_match=result.screen_payload["experience_match"],
+                        screened_at=utc_now_naive(),
+                    ))
+                    s.commit()
+                except Exception:
+                    s.rollback()
+                    failures += 1
+                    log("[err] Could not save preliminary screen; job remains retryable")
+                    mark_for_retry(result.id)
+                    return
             llm_seconds_total += result.llm_seconds
             log(f"----- [Job {result.index}/{total}] {result.site}:{result.job_id} -----")
 
@@ -2989,10 +3469,18 @@ def main() -> None:
                 failures += 1
                 aborted = True
                 log(f"[fatal] {result.error_text}; aborting batch")
+                mark_for_retry(result.id)
+                return
+
+            if result.status == "screened_out":
+                skipped += 1
+                clear_retry(result.id)
+                log(f"[screened_out] preliminary match={result.screen_payload['match_percentage']}%; detailed analysis deferred")
                 return
 
             if result.status == "skip":
                 skipped += 1
+                clear_retry(result.id)
                 log("[skip] Empty title+desc")
                 return
 
@@ -3011,6 +3499,7 @@ def main() -> None:
                     if update_result.rowcount == 0:
                         s.rollback()
                         skipped += 1
+                        clear_retry(result.id)
                         log("[skip] Job became inactive before AI write")
                         return
                     task = task_by_id[result.id]
@@ -3026,6 +3515,9 @@ def main() -> None:
                             "changed_fields": ai_changed_fields(result.update_params),
                         },
                     )
+                    retry = s.get(JobAnalysisRetry, result.id)
+                    if retry is not None:
+                        s.delete(retry)
                     s.commit()
                     processed += 1
                     log(f"[ok] committed in {result.llm_seconds:.1f}s")
@@ -3037,6 +3529,7 @@ def main() -> None:
                     s.rollback()
                     failures += 1
                     log(f"[err] DB commit failed: {e}")
+                    mark_for_retry(result.id)
                 return
 
             failures += 1
@@ -3044,18 +3537,35 @@ def main() -> None:
                 log(f"[err] LLM call failed: {result.error_text}")
             else:
                 log(f"[err] Invalid after retry: {result.error_text}")
+            mark_for_retry(result.id)
 
         with ThreadPoolExecutor(max_workers=AI_CONCURRENCY) as executor:
             while (not aborted and submitted < total) or futures:
+                # Drain one bounded batch before checking the DB priority queue.
+                # Active calls finish normally; no new background work jumps
+                # ahead of Application Prep queued while this batch was running.
+                if not futures and not aborted and submitted:
+                    # Release the MySQL read snapshot before another session
+                    # checks priority requests queued since this batch began.
+                    s.rollback()
+                    run_application_prep_generation(
+                        resume_text=resume_text,
+                        force=False,
+                        preflight=False,
+                        restore_status=lambda: publish_live_status(
+                            "Resuming scheduled AI analysis after priority Application Prep."
+                        ),
+                    )
+                batch_end = min(total, submitted + AI_MAX_INFLIGHT) if not futures else submitted
                 while (
                     not aborted
-                    and submitted < total
+                    and submitted < batch_end
                     and len(futures) < AI_MAX_INFLIGHT
                 ):
                     task = tasks[submitted]
                     idx = submitted + 1
                     log(f"[submit] [Job {idx}/{total}] {task.site}:{task.job_id} title={task.title[:80]!r}")
-                    fut = executor.submit(analyze_job_worker, bounded_resume_text, task, idx)
+                    fut = executor.submit(analyze_routed_job_worker, bounded_resume_text, task, idx)
                     futures.add(fut)
                     future_to_task[fut] = task
                     future_started_at[fut] = time.time()
@@ -3124,24 +3634,31 @@ def main() -> None:
                             f"[batch] completed={completed}/{total} processed={processed} failed={failures} skipped={skipped} inflight={len(futures)} rate={rate:.2f}/s avg_llm={avg_llm:.2f}s"
                         )
 
+        # Schema/request errors must not make an entirely failed run look like
+        # a successful no-op to the scheduler. Valid screen-outs remain success.
+        all_failed = completed > 0 and failures == completed
         publish_ai_processing_status(
-            status="idle",
+            status="failed" if aborted or all_failed else "idle",
             total_jobs=total,
             submitted_jobs=submitted,
             completed_jobs=completed,
             processed_jobs=processed,
             failed_jobs=failures,
-            message="AI analysis batch finished.",
+            message="AI analysis failed; jobs remain retryable." if aborted or all_failed else "AI analysis batch finished.",
             started_at=status_started_at,
             finished_at=utc_now_naive(),
         )
 
-    run_application_prep_generation(
-        resume_text=resume_text,
-        force=False,
-        preflight=False,
-    )
-    run_fit_brief_generation(resume_text, force=False, preflight=False)
+    if not aborted:
+        run_application_prep_generation(
+            resume_text=resume_text,
+            force=False,
+            preflight=False,
+        )
+        # Avoid spending additional background inference on briefs when the
+        # primary batch failed completely; priority Application Prep still runs.
+        if not all_failed:
+            run_fit_brief_generation(resume_text, force=False, preflight=False)
 
     end = datetime.now()
     log("------------------------------------------------------")
@@ -3157,7 +3674,7 @@ def main() -> None:
     )
     log(f"Total runtime: {(end-start).total_seconds()/60:.2f} min")
     log("------------------------------------------------------")
-    if aborted:
+    if aborted or all_failed:
         raise SystemExit(1)
 
 

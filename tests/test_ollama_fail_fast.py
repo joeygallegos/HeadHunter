@@ -208,7 +208,7 @@ def test_job_worker_does_not_retry_unavailable_ollama(
     monkeypatch.setattr(analyzer, "build_messages", lambda *_args: [])
     task = analyzer.JobTask(1, "site", "job", "Engineer", "Description", "", 1, None)
 
-    result = analyzer.analyze_job_worker("resume", task, 1)
+    result = analyzer.analyze_routed_job_worker("resume", task, 1)
 
     assert result.status == "ollama_unavailable"
     assert calls == 1
@@ -311,7 +311,7 @@ def test_regular_preflight_failure_exits_before_worker_submission(
         raise AssertionError("worker must not be submitted after failed preflight")
 
     monkeypatch.setattr(analyzer, "check_ollama_prerequisites", failed_preflight)
-    monkeypatch.setattr(analyzer, "analyze_job_worker", unexpected_worker)
+    monkeypatch.setattr(analyzer, "analyze_routed_job_worker", unexpected_worker)
 
     with pytest.raises(SystemExit) as exc_info:
         analyzer.main()
@@ -360,7 +360,7 @@ def test_regular_preflight_auto_start_failure_exits_before_worker_submission(
     monkeypatch.setattr(analyzer, "OLLAMA_STARTUP_TIMEOUT_SEC", 1)
     monkeypatch.setattr(analyzer.time, "time", lambda: next(clock))
     monkeypatch.setattr(analyzer.time, "sleep", lambda *_args: None)
-    monkeypatch.setattr(analyzer, "analyze_job_worker", unexpected_worker)
+    monkeypatch.setattr(analyzer, "analyze_routed_job_worker", unexpected_worker)
     monkeypatch.setattr(analyzer, "log", messages.append)
     monkeypatch.setattr(
         analyzer,
@@ -423,7 +423,7 @@ def test_regular_run_aborts_before_submitting_remaining_jobs(
     monkeypatch.setattr(analyzer, "RESUME_PATH", str(resume))
     monkeypatch.setattr(analyzer, "init_db", lambda: None)
     monkeypatch.setattr(analyzer, "check_ollama_prerequisites", lambda: None)
-    monkeypatch.setattr(analyzer, "analyze_job_worker", unavailable_worker)
+    monkeypatch.setattr(analyzer, "analyze_routed_job_worker", unavailable_worker)
     monkeypatch.setattr(analyzer, "AI_CONCURRENCY", 1)
     monkeypatch.setattr(analyzer, "AI_MAX_INFLIGHT", 2)
     monkeypatch.setattr(analyzer, "log", messages.append)
@@ -554,3 +554,248 @@ def test_compensation_run_aborts_before_submitting_remaining_jobs(
     assert calls < 5
     assert any("'unsubmitted':" in message for message in messages)
     assert any("aborting batch" in message for message in messages)
+
+
+@pytest.mark.parametrize("score", [0, 74, 75, 100])
+def test_screen_routes_only_relevant_jobs_to_detail(monkeypatch, score):
+    calls = []
+    monkeypatch.setattr(analyzer, "AI_DEEP_ANALYSIS_MIN_MATCH", 75)
+
+    def invoke(messages, **options):
+        calls.append(options)
+        return json.dumps({"match_percentage": score, "experience_match": "qualified"})
+
+    def detailed(resume, task, index):
+        calls.append("detail")
+        return analyzer.JobResult(task.id, task.site, task.job_id, "ok", "{}", {}, 1, "", index)
+
+    monkeypatch.setattr(analyzer, "invoke_ollama_json", invoke)
+    monkeypatch.setattr(analyzer, "analyze_job_worker", detailed)
+    task = analyzer.JobTask(1, "site", "job", "Engineer", "Requirements", "", 1, None)
+    result = analyzer.analyze_routed_job_worker("resume", task, 1)
+    assert calls[0] == {"num_predict": analyzer.AI_SCREEN_NUM_PREDICT, "think": False}
+    assert ("detail" in calls) == (score >= 75)
+    assert result.status == ("ok" if score >= 75 else "screened_out")
+    assert result.screen_payload["match_percentage"] == score
+
+
+@pytest.mark.parametrize("payload", [
+    {"match_percentage": True, "experience_match": "qualified"},
+    {"match_percentage": 101, "experience_match": "qualified"},
+    {"match_percentage": "74", "experience_match": "qualified"},
+    {"match_percentage": 74, "experience_match": []},
+    {"match_percentage": 74, "experience_match": "unknown"},
+    {"match_percentage": 74, "experience_match": "qualified", "extra": 1},
+    {"error": "Insufficient information provided"},
+    [],
+])
+def test_invalid_screen_remains_retryable(monkeypatch, payload):
+    calls = []
+    monkeypatch.setattr(analyzer, "AI_MAX_ATTEMPTS", 4)
+    monkeypatch.setattr(analyzer, "invoke_ollama_json", lambda *a, **kw: calls.append(kw) or json.dumps(payload))
+    monkeypatch.setattr(analyzer, "analyze_job_worker", lambda *a: pytest.fail("invalid screen must not deepen"))
+    task = analyzer.JobTask(1, "site", "job", "Engineer", "Requirements", "", 1, None)
+    result = analyzer.analyze_routed_job_worker("resume", task, 1)
+    assert result.status == "schema_error"
+    assert result.screen_payload is None
+    assert len(calls) == 2
+
+
+def test_cached_screen_retries_detail_without_model_screen(monkeypatch):
+    monkeypatch.setattr(analyzer, "AI_DEEP_ANALYSIS_MIN_MATCH", 75)
+    monkeypatch.setattr(analyzer, "invoke_ollama_json", lambda *a, **kw: pytest.fail("cache should avoid screening"))
+    monkeypatch.setattr(analyzer, "analyze_job_worker", lambda resume, task, index:
+                        analyzer.JobResult(task.id, task.site, task.job_id, "schema_error", None, None, 1, "invalid detail", index))
+    task = analyzer.JobTask(1, "site", "job", "Engineer", "Requirements", "", 1, None,
+                            cached_screen={"match_percentage": 80, "experience_match": "qualified"})
+    result = analyzer.analyze_routed_job_worker("resume", task, 1)
+    assert result.status == "schema_error"
+    assert result.screen_payload == task.cached_screen
+
+
+def test_screen_hash_tracks_evidence_but_not_routing_threshold(monkeypatch):
+    task = analyzer.JobTask(1, "site", "job", "Engineer", "Requirements", "", 1, "unchanged")
+    original = analyzer.screen_input_hash("resume", task)
+    assert analyzer.screen_input_hash("updated resume", task) != original
+    monkeypatch.setattr(analyzer, "AI_DEEP_ANALYSIS_MIN_MATCH", 25)
+    assert analyzer.screen_input_hash("resume", task) == original
+    task.desc = "New requirements"
+    assert analyzer.screen_input_hash("resume", task) != original
+    task.desc = "Requirements"
+    monkeypatch.setattr(analyzer, "OLLAMA_MODEL", "different-model")
+    assert analyzer.screen_input_hash("resume", task) != original
+
+
+def _configure_screen_run(monkeypatch, tmp_path):
+    factory = _temporary_session_factory(tmp_path)
+    resume = tmp_path / "resume.txt"
+    resume.write_text("resume", encoding="utf-8")
+    monkeypatch.setattr(analyzer, "SessionLocal", factory)
+    monkeypatch.setattr(analyzer, "RESUME_PATH", str(resume))
+    monkeypatch.setattr(analyzer, "init_db", lambda: None)
+    monkeypatch.setattr(analyzer, "publish_ai_processing_status", lambda **kw: None)
+    monkeypatch.setattr(analyzer, "run_application_prep_generation", lambda **kw: {})
+    monkeypatch.setattr(analyzer, "run_fit_brief_generation", lambda *a, **kw: {})
+    monkeypatch.setattr(analyzer, "parse_args", lambda: SimpleNamespace(compensation_only=False, redo=None))
+    monkeypatch.setattr(analyzer, "AI_CONCURRENCY", 1)
+    monkeypatch.setattr(analyzer, "AI_MAX_INFLIGHT", 1)
+    monkeypatch.setattr(analyzer, "AI_DEEP_ANALYSIS_MIN_MATCH", 75)
+    monkeypatch.setattr(analyzer, "LIMIT", 0)
+    monkeypatch.setattr(analyzer, "ONLY_EMPTY", True)
+    monkeypatch.setattr(analyzer, "SITE_FILTER", "")
+    return factory, resume
+
+
+def test_screen_cache_schema_does_not_require_references_privilege():
+    from app.models import JobMatchScreen
+
+    table = JobMatchScreen.__table__
+    assert table.c.job_pk.primary_key is True
+    assert not table.foreign_keys
+
+
+def test_screen_cache_persists_without_overwriting_final_fields(monkeypatch, tmp_path):
+    from app.models import JobMatchScreen
+    factory, resume = _configure_screen_run(monkeypatch, tmp_path)
+    with factory() as session:
+        job = Job(site="site", job_id="job", title="Engineer", desc="Requirements", pay="$100,000", run_id=1)
+        session.add(job)
+        session.commit()
+        job_id = job.id
+    calls = []
+    monkeypatch.setattr(analyzer, "check_ollama_prerequisites", lambda: calls.append("preflight"))
+    monkeypatch.setattr(analyzer, "invoke_ollama_json", lambda *a, **kw: calls.append("screen") or
+                        '{"match_percentage":30,"experience_match":"underqualified"}')
+    analyzer.main()
+    with factory() as session:
+        assert session.get(JobMatchScreen, job_id).match_percentage == 30
+        job = session.get(Job, job_id)
+        assert job.ai_analysis is None
+        assert job.ai_match_percentage is None
+        assert job.pay == "$100,000"
+    analyzer.main()
+    assert calls == ["preflight", "screen"]
+    resume.write_text("updated resume", encoding="utf-8")
+    analyzer.main()
+    assert calls == ["preflight", "screen", "preflight", "screen"]
+
+
+def test_limit_does_not_starve_jobs_after_cached_screen_out(monkeypatch, tmp_path):
+    from app.models import JobMatchScreen
+    factory, _ = _configure_screen_run(monkeypatch, tmp_path)
+    monkeypatch.setattr(analyzer, "LIMIT", 1)
+    with factory() as session:
+        first = Job(site="site", job_id="first", title="Engineer", desc="Requirements", run_id=1)
+        second = Job(site="site", job_id="second", title="Engineer", desc="Requirements", run_id=1)
+        session.add_all([first, second])
+        session.commit()
+        task = analyzer.JobTask(first.id, "site", "first", "Engineer", "Requirements", "", 1, None)
+        session.add(JobMatchScreen(job_pk=first.id, input_hash=analyzer.screen_input_hash("resume", task),
+                                  match_percentage=30, experience_match="qualified"))
+        session.commit()
+    processed = []
+    monkeypatch.setattr(analyzer, "check_ollama_prerequisites", lambda: None)
+    monkeypatch.setattr(analyzer, "analyze_routed_job_worker", lambda resume, task, index:
+                        processed.append(task.job_id) or analyzer.JobResult(task.id, task.site, task.job_id,
+                            "skip", None, None, 0, "", index))
+    analyzer.main()
+    assert processed == ["second"]
+
+
+def test_priority_queue_is_checked_between_background_batches(monkeypatch, tmp_path):
+    factory, _ = _configure_screen_run(monkeypatch, tmp_path)
+    with factory() as session:
+        session.add_all([Job(site="site", job_id=str(i), title="Engineer", desc="Requirements", run_id=1)
+                         for i in range(3)])
+        session.commit()
+    events = []
+    monkeypatch.setattr(analyzer, "check_ollama_prerequisites", lambda: None)
+    monkeypatch.setattr(analyzer, "run_application_prep_generation", lambda **kw: events.append("priority") or {})
+    monkeypatch.setattr(analyzer, "analyze_routed_job_worker", lambda resume, task, index:
+                        events.append(task.job_id) or analyzer.JobResult(task.id, task.site, task.job_id,
+                            "skip", None, None, 0, "", index))
+    analyzer.main()
+    assert events == ["priority", "0", "priority", "1", "priority", "2", "priority"]
+
+
+def test_explicit_redo_bypasses_screen(monkeypatch):
+    monkeypatch.setattr(analyzer, "invoke_ollama_json", lambda *a, **kw: pytest.fail("redo should bypass screening"))
+    monkeypatch.setattr(analyzer, "analyze_job_worker", lambda resume, task, index:
+                        analyzer.JobResult(task.id, task.site, task.job_id, "ok", "{}", {}, 0, "", index))
+    task = analyzer.JobTask(1, "site", "job", "Engineer", "Requirements", "", 1, None, force_detail=True)
+    assert analyzer.analyze_routed_job_worker("resume", task, 1).status == "ok"
+
+
+def test_routed_analysis_stores_reviewed_score_separately_from_screen(monkeypatch, tmp_path):
+    from app.models import JobMatchScreen
+    factory, _ = _configure_screen_run(monkeypatch, tmp_path)
+    with factory() as session:
+        job = Job(site="site", job_id="job", title="Engineer", desc="Requirements", run_id=1)
+        session.add(job)
+        session.commit()
+        job_id = job.id
+    compensation = {key: None for key in analyzer.COMPENSATION_KEYS}
+    compensation["multiple_pay_ranges"] = False
+    detail = {"match_percentage": 90, "compensation": compensation,
+              "fit_summary": "A strong match for the stated requirements.",
+              "keywords_overlap": [], "missing_keywords": [],
+              "experience_match": "qualified", "location_policy_match": "unknown"}
+    reviewed = {**detail, "match_percentage": 92}
+    responses = [json.dumps({"match_percentage": 80, "experience_match": "qualified"}),
+                 json.dumps(detail), json.dumps(reviewed)]
+    monkeypatch.setattr(analyzer, "check_ollama_prerequisites", lambda: None)
+    monkeypatch.setattr(analyzer, "AI_SECOND_PASS_REVIEW", True)
+    monkeypatch.setattr(analyzer, "AI_REVIEW_MIN_MATCH", None)
+    monkeypatch.setattr(analyzer, "AI_REVIEW_MAX_MATCH", None)
+    monkeypatch.setattr(analyzer, "invoke_ollama_json", lambda *a, **kw: responses.pop(0))
+    analyzer.main()
+    assert responses == []
+    with factory() as session:
+        assert session.get(JobMatchScreen, job_id).match_percentage == 80
+        assert session.get(Job, job_id).ai_match_percentage == 92
+
+
+def test_lower_threshold_reuses_screen_without_rescreening(monkeypatch, tmp_path):
+    from app.models import JobMatchScreen
+    factory, _ = _configure_screen_run(monkeypatch, tmp_path)
+    with factory() as session:
+        job = Job(site="site", job_id="job", title="Engineer", desc="Requirements", run_id=1)
+        session.add(job)
+        session.commit()
+        task = analyzer.JobTask(job.id, "site", "job", "Engineer", "Requirements", "", 1, None)
+        session.add(JobMatchScreen(job_pk=job.id, input_hash=analyzer.screen_input_hash("resume", task),
+                                  match_percentage=70, experience_match="qualified"))
+        session.commit()
+    monkeypatch.setattr(analyzer, "AI_DEEP_ANALYSIS_MIN_MATCH", 65)
+    monkeypatch.setattr(analyzer, "check_ollama_prerequisites", lambda: None)
+    monkeypatch.setattr(analyzer, "invoke_ollama_json", lambda *a, **kw: pytest.fail("fresh score should reroute without inference"))
+    calls = []
+    monkeypatch.setattr(analyzer, "analyze_job_worker", lambda resume, task, index:
+                        calls.append(task.job_id) or analyzer.JobResult(task.id, task.site, task.job_id,
+                            "schema_error", None, None, 0, "detail failure", index))
+    with pytest.raises(SystemExit) as exc:
+        analyzer.main()
+    assert exc.value.code == 1
+    assert calls == ["job"]
+
+
+def test_fit_brief_batches_yield_to_application_prep(monkeypatch, tmp_path):
+    factory = _temporary_session_factory(tmp_path)
+    with factory() as session:
+        session.add_all([Job(site="site", job_id=str(i), title="Engineer", desc="Requirements",
+                             run_id=1, ai_match_percentage=90, ai_analysis="{}") for i in range(3)])
+        session.commit()
+    events = []
+    monkeypatch.setattr(analyzer, "SessionLocal", factory)
+    monkeypatch.setattr(analyzer, "init_db", lambda: None)
+    monkeypatch.setattr(analyzer, "AI_FIT_BRIEF_MIN_MATCH", 75)
+    monkeypatch.setattr(analyzer, "AI_CONCURRENCY", 1)
+    monkeypatch.setattr(analyzer, "AI_MAX_INFLIGHT", 1)
+    monkeypatch.setattr(analyzer, "run_application_prep_generation", lambda **kw: events.append("priority") or {})
+    monkeypatch.setattr(analyzer, "analyze_fit_brief_worker", lambda resume, task, index:
+                        events.append(task.job_id) or analyzer.JobResult(task.id, task.site, task.job_id,
+                            "schema_error", None, None, 0, "brief failure", index))
+    analyzer.run_fit_brief_generation("resume", preflight=False)
+    # Fit Brief selection remains highest-score, newest-first; each batch gives
+    # newly queued Application Prep the next available inference slot.
+    assert events == ["priority", "2", "priority", "1", "priority", "0"]
