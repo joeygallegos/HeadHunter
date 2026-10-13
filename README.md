@@ -690,6 +690,38 @@ A primary batch in which every attempted job fails exits with code `1`, publishe
 
 Before submitting eligible jobs, the analyzer calls Ollama's `/api/tags` endpoint and requires both a reachable server and the configured `OLLAMA_MODEL`. If the local API is not reachable, it tries to start Ollama once with `ollama serve`, waits up to `OLLAMA_STARTUP_TIMEOUT_SEC`, and then retries the prerequisite check. If the model is missing, run `ollama pull <model>`; models are not downloaded automatically. A prerequisite failure submits no jobs and exits with code `1`. If Ollama becomes unavailable during a batch, new submissions stop, queued work is cancelled when possible, active requests are drained, and the process exits with code `1` after reporting cancelled and unsubmitted counts. A run with no eligible jobs remains a successful no-op and does not require Ollama.
 
+### High-match market signal report
+
+`analyze_market_signals.py` creates a read-only report from jobs whose final AI match score meets an inclusive threshold. It defaults to active jobs at 75% or higher, counts each normalized signal at most once per job, and separates resume strengths, growth opportunities, and mixed evidence. It does not update jobs or create database tables.
+
+The optional Ollama pass may group clear aliases such as `Go`, `Golang`, and `Go language`. Python validates those groups and recomputes all counts from the underlying job IDs. Broader and narrower concepts such as `Python` and `Python automation` remain separate. If Ollama is unavailable or its response fails validation, the script safely writes the deterministic report with a warning.
+
+Default output files:
+
+- `output/market_signals.html` — visual report with supporting job details
+- `output/market_signals.md` — compact ranked summary
+- `output/market_signals.json` — complete raw and grouped evidence
+
+Run the active 75%+ report with Ollama alias cleanup:
+
+```powershell
+python .\analyze_market_signals.py
+```
+
+Generate the deterministic report without Ollama:
+
+```powershell
+python .\analyze_market_signals.py --no-ollama
+```
+
+Include historical inactive postings or change the threshold:
+
+```powershell
+python .\analyze_market_signals.py --include-inactive --min-match 80
+```
+
+Use `--ollama-max-terms N` to bound how many of the most prevalent labels are considered for grouping and `--display-limit N` to control the Markdown and HTML length. JSON always retains every signal and evidence row. The report describes the analyzed JobScrape cohort, not the entire labor market, and the stored overlap/missing fields contain only the top signals selected during each job's detailed analysis.
+
 ### Personalized Interesting jobs trend report
 
 `analyze_interesting_job_trends.py` creates a read-only action report from jobs saved with the dashboard `Interesting` swipe action. It reads the configured database and `resume.txt`, builds deterministic market and fit signals, asks Ollama for a personalized synthesis when available, and writes report artifacts under `output/`. It does not update job rows, swipe rows, application prep rows, or schema.
