@@ -807,7 +807,9 @@
                       <span class="font-medium" x-text="selectedJob().job_id"></span>
                       <span class="ml-2 text-slate-500" x-text="`ID ${selectedJob().id}`"></span>
                       <span class="ml-2" :class="selectedJob().is_active ? 'text-green-700' : 'text-red-700'"
-                            x-text="selectedJob().is_active ? 'Active' : 'Inactive'"></span>
+                            x-text="selectedJob().is_active ? 'Active' : 'Inactive'"></span><span class="text-red-700"
+                            x-show="selectedJob().application_prep_eligibility?.reason"
+                            x-text="` - ${selectedJob().application_prep_eligibility.reason}`"></span>
                     </div>
                   </div>
                   <div class="flex flex-wrap gap-2">
@@ -829,9 +831,6 @@
                     </button>
                   </div>
                 </div>
-                <p class="mt-3 text-sm text-red-700"
-                   x-show="selectedJob().application_prep_eligibility && !selectedJob().application_prep_eligibility.eligible"
-                   x-text="selectedJob().application_prep_eligibility?.reason"></p>
                 <p class="mt-3 text-sm text-green-700" x-show="detailApplicationPrepMessage" x-text="detailApplicationPrepMessage"></p>
 
                 <dl class="mt-4 grid grid-cols-1 md:grid-cols-3 gap-3 text-sm">

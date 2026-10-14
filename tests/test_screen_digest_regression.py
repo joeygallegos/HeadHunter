@@ -123,6 +123,39 @@ def test_dashboard_separates_screened_jobs_from_pending(monkeypatch, tmp_path):
     assert {job["job_id"] for job in report["jobs"]} == {"detail-retry", "pending"}
 
 
+def test_dashboard_lookup_view_renders_valid_initial_ui_state():
+    response = dashboard.app.test_client().get("/?view=lookup")
+
+    assert response.status_code == 200
+    body = response.get_data(as_text=True)
+    assert 'view: "lookup",' in body
+    assert "jobDetailPage: false," in body
+    assert "initialJob: null," in body
+    assert "initialApplicationPrepJobId: 0," in body
+
+
+def test_job_detail_status_and_reason_share_one_inline_element():
+    template = dashboard.app.jinja_loader.get_source(
+        dashboard.app.jinja_env,
+        "index.html",
+    )[0]
+    status_start = template.index('<div class="mt-1 text-sm text-slate-600">')
+    status_end = template.index("</div>", status_start)
+    status_markup = template[status_start:status_end]
+
+    assert "selectedJob().is_active ? 'Active' : 'Inactive'" in status_markup
+    assert 'class="text-red-700"' in status_markup
+    assert (
+        'x-show="selectedJob().application_prep_eligibility?.reason"'
+        in status_markup
+    )
+    assert 'x-text="` - ${selectedJob().application_prep_eligibility.reason}`"' in status_markup
+    assert (
+        'x-text="selectedJob().application_prep_eligibility?.reason"'
+        not in template
+    )
+
+
 def test_digest_distinguishes_screened_final_and_pending_without_inference(tmp_path):
     _, factory = _database(tmp_path)
     with factory() as session:
