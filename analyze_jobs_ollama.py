@@ -21,6 +21,7 @@ import time
 import traceback
 import urllib.error
 import urllib.request
+import uuid
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -81,7 +82,7 @@ from langchain_ollama import ChatOllama
 from langchain_core.messages import HumanMessage, SystemMessage
 
 # DB
-from sqlalchemy import inspect as sa_inspect, or_, select, text as sa_text
+from sqlalchemy import and_, inspect as sa_inspect, or_, select, text as sa_text, update
 from sqlalchemy.orm import Session
 from app.models import (
     APPLICATION_PREP_DEFAULT_MIN_MATCH,
@@ -94,9 +95,16 @@ from app.models import (
     JobChange,
     JobFitBrief,
     JobAnalysisRetry,
+    JobAIRefreshRequest,
     JobMatchScreen,
     JobApplicationPrep,
     init_db,
+)
+from app.ai_profiles import (
+    OllamaProfile,
+    generation_config_hash,
+    load_ollama_profile,
+    parse_ollama_think,
 )
 from app.db import utc_now_naive
 from app.compensation import (
@@ -252,6 +260,7 @@ APPLICATION_PREP_NUM_CTX = max(
     OLLAMA_NUM_CTX, int(os.getenv("APPLICATION_PREP_NUM_CTX", "65536"))
 )
 OLLAMA_NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT", "300"))
+OLLAMA_TEMPERATURE = float(os.getenv("OLLAMA_TEMPERATURE", "0.2"))
 AI_THINKING_RETRY_NUM_PREDICT = max(
     OLLAMA_NUM_PREDICT,
     int(os.getenv("AI_THINKING_RETRY_NUM_PREDICT", str(OLLAMA_NUM_PREDICT * 3))),
@@ -293,20 +302,10 @@ AI_REVIEW_MAX_MATCH = (
     int(_AI_REVIEW_MAX_MATCH_RAW) if _AI_REVIEW_MAX_MATCH_RAW not in {None, ""} else None
 )
 AI_FIT_BRIEF_MIN_MATCH = int(os.getenv("AI_FIT_BRIEF_MIN_MATCH", "75"))
-
-
-def parse_ollama_think(value: str) -> Any:
-    """Parse Ollama's boolean or level-based thinking control."""
-    normalized = (value or "").strip().lower()
-    if normalized in {"", "0", "false", "no", "off"}:
-        return False
-    if normalized in {"1", "true", "yes", "on"}:
-        return True
-    if normalized in {"low", "medium", "high", "max"}:
-        return normalized
-    raise ValueError(
-        "OLLAMA_THINK must be one of false, true, low, medium, high, or max"
-    )
+AI_REFRESH_LEASE_MINUTES = max(5, int(os.getenv("AI_REFRESH_LEASE_MINUTES", "30")))
+AI_REFRESH_HEARTBEAT_SECONDS = max(
+    1, min(60, (AI_REFRESH_LEASE_MINUTES * 60) // 3)
+)
 
 
 OLLAMA_THINK = parse_ollama_think(os.getenv("OLLAMA_THINK", "false"))
@@ -314,6 +313,77 @@ APPLICATION_PREP_THINK = parse_ollama_think(os.getenv("APPLICATION_PREP_THINK", 
 APPLICATION_PREP_INVENTORY_MAX_TOKENS = max(
     0, int(os.getenv("APPLICATION_PREP_INVENTORY_MAX_TOKENS", "1200"))
 )
+
+
+def _profile_baseline(**overrides: Any) -> Dict[str, Any]:
+    """Build pass defaults from the legacy settings to preserve existing deployments."""
+    baseline: Dict[str, Any] = {
+        "model": OLLAMA_MODEL,
+        "think": OLLAMA_THINK,
+        "num_ctx": OLLAMA_NUM_CTX,
+        "num_predict": OLLAMA_NUM_PREDICT,
+        "retry_num_predict": AI_THINKING_RETRY_NUM_PREDICT,
+        "temperature": OLLAMA_TEMPERATURE,
+        "timeout_sec": AI_REQUEST_TIMEOUT_SEC,
+        "max_attempts": AI_MAX_ATTEMPTS,
+    }
+    baseline.update(overrides)
+    return baseline
+
+
+def get_ai_profile(name: str) -> OllamaProfile:
+    """Resolve one pass profile, with pass variables overriding legacy globals."""
+    definitions = {
+        "screen": (
+            "AI_SCREEN",
+            _profile_baseline(
+                think=False,
+                num_predict=AI_SCREEN_NUM_PREDICT,
+                retry_num_predict=AI_SCREEN_RETRY_NUM_PREDICT,
+            ),
+        ),
+        "detail": ("AI_DETAIL", _profile_baseline()),
+        "review": ("AI_REVIEW", _profile_baseline()),
+        "compensation": ("AI_COMPENSATION", _profile_baseline()),
+        "fit_brief": ("AI_FIT_BRIEF", _profile_baseline()),
+        "application_prep": (
+            "APPLICATION_PREP",
+            _profile_baseline(
+                think=APPLICATION_PREP_THINK,
+                num_ctx=APPLICATION_PREP_NUM_CTX,
+                num_predict=APPLICATION_PREP_NUM_PREDICT,
+                retry_num_predict=APPLICATION_PREP_RETRY_NUM_PREDICT,
+            ),
+        ),
+    }
+    try:
+        prefix, baseline = definitions[name]
+    except KeyError as exc:
+        raise ValueError(f"Unknown AI profile: {name}") from exc
+    return load_ollama_profile(name, prefix, baseline)
+
+
+def get_ai_profiles() -> Dict[str, OllamaProfile]:
+    """Return every configured job-processing profile keyed by pass name."""
+    names = (
+        "screen",
+        "detail",
+        "review",
+        "compensation",
+        "fit_brief",
+        "application_prep",
+    )
+    return {name: get_ai_profile(name) for name in names}
+
+
+def profile_log_label(profile: OllamaProfile) -> str:
+    """Render safe operational settings without including prompt or job content."""
+    return (
+        f"model={profile.model} think={profile.think!r} num_ctx={profile.num_ctx} "
+        f"num_predict={profile.num_predict}/{profile.retry_num_predict} "
+        f"temperature={profile.temperature:g} timeout={profile.timeout_sec}s "
+        f"attempts={profile.max_attempts}"
+    )
 
 REQUIRED_KEYS = {
     "match_percentage",
@@ -505,17 +575,18 @@ def _handle_sigint(signum, frame) -> None:
         os._exit(130)
 
 
-def build_llm() -> ChatOllama:
+def build_llm(profile: Optional[OllamaProfile] = None) -> ChatOllama:
     """Create a ChatOllama client with the current runtime settings."""
+    profile = profile or get_ai_profile("detail")
     return ChatOllama(
-        model=OLLAMA_MODEL,
+        model=profile.model,
         format="json",
-        temperature=0.2,
+        temperature=profile.temperature,
         keep_alive=OLLAMA_KEEP_ALIVE,
-        sync_client_kwargs={"timeout": AI_REQUEST_TIMEOUT_SEC},
+        sync_client_kwargs={"timeout": profile.timeout_sec},
         options={
-            "num_ctx": OLLAMA_NUM_CTX,
-            "num_predict": OLLAMA_NUM_PREDICT,
+            "num_ctx": profile.num_ctx,
+            "num_predict": profile.num_predict,
         },
     )
 
@@ -617,7 +688,7 @@ def _start_ollama_and_wait() -> None:
 
 
 def check_ollama_prerequisites() -> None:
-    """Require a reachable Ollama API and the configured local model."""
+    """Require a reachable Ollama API and every configured profile model."""
     tags_url = f"{OLLAMA_BASE_URL}/api/tags"
     try:
         body = _read_ollama_tags()
@@ -647,23 +718,28 @@ def check_ollama_prerequisites() -> None:
             if isinstance(value, str) and value.strip():
                 installed.update(_model_name_variants(value))
 
-    if not (_model_name_variants(OLLAMA_MODEL) & installed):
-        raise OllamaPrerequisiteError(
-            f"Ollama model '{OLLAMA_MODEL}' is not installed. "
-            f"Run 'ollama pull {OLLAMA_MODEL}' and retry."
-        )
+    configured_models = sorted({profile.model for profile in get_ai_profiles().values()})
+    for model in configured_models:
+        if not (_model_name_variants(model) & installed):
+            raise OllamaPrerequisiteError(
+                f"Ollama model '{model}' is not installed. "
+                f"Run 'ollama pull {model}' and retry."
+            )
 
-    log(f"[ok] Ollama ready at {OLLAMA_BASE_URL} | model={OLLAMA_MODEL}")
+    model_label = configured_models[0] if len(configured_models) == 1 else ",".join(configured_models)
+    log(f"[ok] Ollama ready at {OLLAMA_BASE_URL} | model={model_label}")
 
 
 def invoke_ollama_json(
     messages: list,
+    profile: Optional[OllamaProfile] = None,
     num_predict: Optional[int] = None,
     think: Optional[Any] = None,
     num_ctx: Optional[int] = None,
     response_format: Any = "json",
 ) -> str:
     """Call Ollama directly so socket timeout failures return to the worker."""
+    profile = profile or get_ai_profile("detail")
     wire_messages = []
     for msg in messages:
         role = "user"
@@ -671,19 +747,19 @@ def invoke_ollama_json(
             role = "system"
         wire_messages.append({"role": role, "content": str(msg.content)})
 
-    effective_num_predict = num_predict or OLLAMA_NUM_PREDICT
-    effective_num_ctx = num_ctx or OLLAMA_NUM_CTX
+    effective_num_predict = num_predict or profile.num_predict
+    effective_num_ctx = num_ctx or profile.num_ctx
     payload = {
-        "model": OLLAMA_MODEL,
+        "model": profile.model,
         "messages": wire_messages,
         "stream": False,
         "format": response_format,
-        "think": OLLAMA_THINK if think is None else think,
+        "think": profile.think if think is None else think,
         "keep_alive": OLLAMA_KEEP_ALIVE,
         "options": {
             "num_ctx": effective_num_ctx,
             "num_predict": effective_num_predict,
-            "temperature": 0.2,
+            "temperature": profile.temperature,
         },
     }
     req = urllib.request.Request(
@@ -693,10 +769,10 @@ def invoke_ollama_json(
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=AI_REQUEST_TIMEOUT_SEC) as resp:
+        with urllib.request.urlopen(req, timeout=profile.timeout_sec) as resp:
             body = resp.read().decode("utf-8", "replace")
     except TimeoutError as exc:
-        raise TimeoutError(f"Ollama request timed out after {AI_REQUEST_TIMEOUT_SEC}s") from exc
+        raise TimeoutError(f"Ollama request timed out after {profile.timeout_sec}s") from exc
     except urllib.error.HTTPError as exc:
         if exc.code in {502, 503, 504}:
             raise OllamaUnavailableError(
@@ -706,7 +782,7 @@ def invoke_ollama_json(
     except urllib.error.URLError as exc:
         if isinstance(exc.reason, TimeoutError):
             raise TimeoutError(
-                f"Ollama request timed out after {AI_REQUEST_TIMEOUT_SEC}s"
+                f"Ollama request timed out after {profile.timeout_sec}s"
             ) from exc
         raise OllamaUnavailableError(
             f"Ollama became unavailable at {OLLAMA_BASE_URL}: {exc.reason}"
@@ -1158,8 +1234,12 @@ def run_second_pass_review(
         return payload, 0.0, ""
 
     candidate_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    profile = get_ai_profile("review")
     t0 = time.time()
-    raw = invoke_ollama_json(base_msgs + [HumanMessage(content=review_prompt(candidate_json))])
+    raw = invoke_ollama_json(
+        base_msgs + [HumanMessage(content=review_prompt(candidate_json))],
+        profile=profile,
+    )
     took = time.time() - t0
     reviewed = parse_json_strict(raw) or {}
     ok, why = validate_schema(reviewed)
@@ -1361,17 +1441,41 @@ def stable_text_hash(text_value: str) -> str:
     return hashlib.sha256((text_value or "").encode("utf-8", "ignore")).hexdigest()
 
 
+def downstream_job_hash(
+    title: str, desc: str, ai_analysis: str, content_hash: Optional[str]
+) -> str:
+    """Fingerprint all prompt evidence, including freshly generated analysis."""
+    return stable_text_hash(
+        json.dumps(
+            [content_hash or "", title or "", desc or "", ai_analysis or ""],
+            ensure_ascii=False,
+        )
+    )
+
+
 def fit_brief_job_hash(task: FitBriefTask) -> str:
-    """Use scraper content hash when available, otherwise hash core prompt input."""
-    if task.content_hash:
-        return task.content_hash
-    return stable_text_hash("|".join([task.title or "", task.desc or "", task.ai_analysis or ""]))
+    """Fingerprint every job field supplied to the Fit Brief prompt."""
+    return downstream_job_hash(task.title, task.desc, task.ai_analysis, task.content_hash)
 
 
 def application_prep_job_hash(task: ApplicationPrepTask) -> str:
-    if task.content_hash:
-        return task.content_hash
-    return stable_text_hash("|".join([task.title or "", task.desc or "", task.ai_analysis or ""]))
+    return downstream_job_hash(task.title, task.desc, task.ai_analysis, task.content_hash)
+
+
+def fit_brief_config_hash() -> str:
+    """Identify the prompt, schema, and resolved profile used for Fit Briefs."""
+    return generation_config_hash(
+        get_ai_profile("fit_brief"), FIT_BRIEF_SYSTEM_PROMPT_PATH, FIT_BRIEF_SCHEMA_VERSION
+    )
+
+
+def application_prep_config_hash() -> str:
+    """Identify the prompt, schema, and resolved profile used for Application Prep."""
+    return generation_config_hash(
+        get_ai_profile("application_prep"),
+        APPLICATION_PREP_SYSTEM_PROMPT_PATH,
+        APPLICATION_PREP_SCHEMA_VERSION,
+    )
 
 
 def render_fit_brief_system_prompt(
@@ -1631,21 +1735,21 @@ def analyze_application_prep_worker(
 
     msgs = build_application_prep_messages(resume_text, task)
     current_msgs = list(msgs)
-    current_num_predict = APPLICATION_PREP_NUM_PREDICT
+    profile = get_ai_profile("application_prep")
+    current_num_predict = profile.num_predict
     took = 0.0
     attempts: List[str] = []
     payload: Dict[str, Any] = {}
     ok = False
 
-    for attempt in range(1, AI_MAX_ATTEMPTS + 1):
+    for attempt in range(1, profile.max_attempts + 1):
         raw = ""
         t0 = time.time()
         try:
             raw = invoke_ollama_json(
                 current_msgs,
+                profile=profile,
                 num_predict=current_num_predict,
-                think=APPLICATION_PREP_THINK,
-                num_ctx=APPLICATION_PREP_NUM_CTX,
                 response_format=APPLICATION_PREP_RESPONSE_FORMAT,
             )
             took += time.time() - t0
@@ -1666,10 +1770,10 @@ def analyze_application_prep_worker(
             if (
                 exc.done_reason == "length"
                 and exc.thinking_chars > 0
-                and current_num_predict < APPLICATION_PREP_RETRY_NUM_PREDICT
-                and attempt < AI_MAX_ATTEMPTS
+                and current_num_predict < profile.retry_num_predict
+                and attempt < profile.max_attempts
             ):
-                current_num_predict = APPLICATION_PREP_RETRY_NUM_PREDICT
+                current_num_predict = profile.retry_num_predict
                 detail += f"; retrying with num_predict={current_num_predict}"
                 attempts.append(detail)
                 current_msgs = list(msgs)
@@ -1705,6 +1809,7 @@ def analyze_application_prep_worker(
         "resume_hash": stable_text_hash(resume_text),
         "responsibilities_hash": task.responsibilities_hash,
         "job_content_hash": application_prep_job_hash(task),
+        "generation_config_hash": application_prep_config_hash(),
         "generated_at": utc_now_naive(),
         "schema_version": APPLICATION_PREP_SCHEMA_VERSION,
     }
@@ -1719,17 +1824,18 @@ def analyze_fit_brief_worker(
         return JobResult(task.id, task.site, task.job_id, "skip", None, None, 0.0, "Empty title+desc", index)
 
     msgs = build_fit_brief_messages(resume_text, task)
+    profile = get_ai_profile("fit_brief")
     current_msgs = list(msgs)
     took = 0.0
     attempts: List[str] = []
     payload: Dict[str, Any] = {}
     ok = False
 
-    for attempt in range(1, AI_MAX_ATTEMPTS + 1):
+    for attempt in range(1, profile.max_attempts + 1):
         raw = ""
         t0 = time.time()
         try:
-            raw = invoke_ollama_json(current_msgs)
+            raw = invoke_ollama_json(current_msgs, profile=profile)
             took += time.time() - t0
             parsed = parse_json_strict(raw) or {}
             ok, why = validate_fit_brief_schema(parsed, resume_text)
@@ -1764,6 +1870,7 @@ def analyze_fit_brief_worker(
         "brief_json": payload_json,
         "resume_hash": stable_text_hash(resume_text),
         "job_content_hash": fit_brief_job_hash(task),
+        "generation_config_hash": fit_brief_config_hash(),
         "generated_at": utc_now_naive(),
         "schema_version": FIT_BRIEF_SCHEMA_VERSION,
     }
@@ -1772,13 +1879,16 @@ def analyze_fit_brief_worker(
 
 
 def should_expand_thinking_budget(
-    exc: OllamaEmptyContentError, current_num_predict: int
+    exc: OllamaEmptyContentError,
+    current_num_predict: int,
+    retry_num_predict: Optional[int] = None,
 ) -> bool:
     """Return whether a reasoning-only response should get a larger retry."""
+    retry_num_predict = retry_num_predict or AI_THINKING_RETRY_NUM_PREDICT
     return (
         exc.done_reason == "length"
         and exc.thinking_chars > 0
-        and current_num_predict < AI_THINKING_RETRY_NUM_PREDICT
+        and current_num_predict < retry_num_predict
     )
 
 
@@ -1788,8 +1898,8 @@ def screen_input_hash(resume_text: str, task: JobTask) -> str:
     # updates do not change legacy content hashes. Threshold changes only reroute.
     return stable_text_hash(json.dumps([
         1, resume_text, task.title, task.desc,
-        render_system_prompt(MATCH_SCREEN_PROMPT_PATH), OLLAMA_MODEL,
-        OLLAMA_NUM_CTX, MAX_JOB_DESC_TOKENS, AI_SCREEN_NUM_PREDICT, AI_SCREEN_RETRY_NUM_PREDICT,
+        render_system_prompt(MATCH_SCREEN_PROMPT_PATH),
+        get_ai_profile("screen").fingerprint(), MAX_JOB_DESC_TOKENS,
     ], ensure_ascii=False))
 
 
@@ -1797,8 +1907,8 @@ def analysis_retry_input_hash(resume_text: str, task: JobTask) -> str:
     """Identify the evidence and inference contract behind a failed attempt."""
     return stable_text_hash(json.dumps([
         1, screen_input_hash(resume_text, task), render_system_prompt(),
-        OLLAMA_NUM_PREDICT, AI_THINKING_RETRY_NUM_PREDICT, AI_MAX_ATTEMPTS,
-        OLLAMA_THINK, AI_SECOND_PASS_REVIEW,
+        get_ai_profile("detail").fingerprint(), get_ai_profile("review").fingerprint(),
+        AI_SECOND_PASS_REVIEW,
         AI_REVIEW_MIN_MATCH, AI_REVIEW_MAX_MATCH,
     ], ensure_ascii=False))
 
@@ -1815,6 +1925,59 @@ def validate_match_screen(payload: Any) -> bool:
     )
 
 
+def analyze_match_screen_worker(resume_text: str, task: JobTask, index: int) -> JobResult:
+    """Run a fresh Stage 1 screen without applying the normal routing threshold."""
+    profile = get_ai_profile("screen")
+    desc, _, _ = truncate_to_token_budget(task.desc, MAX_JOB_DESC_TOKENS)
+    messages = build_messages(resume_text, task.title, desc, MATCH_SCREEN_PROMPT_PATH)
+    current_messages = list(messages)
+    current_num_predict = profile.num_predict
+    took = 0.0
+    for attempt in range(1, min(profile.max_attempts, 2) + 1):
+        started = time.monotonic()
+        try:
+            raw = invoke_ollama_json(
+                current_messages, profile=profile, num_predict=current_num_predict
+            )
+            candidate = parse_json_strict(raw)
+            if validate_match_screen(candidate):
+                return JobResult(
+                    task.id,
+                    task.site,
+                    task.job_id,
+                    "screened_out",
+                    None,
+                    None,
+                    took + time.monotonic() - started,
+                    "",
+                    index,
+                    candidate,
+                )
+            current_num_predict = profile.retry_num_predict
+            current_messages = messages + [HumanMessage(content=(
+                "Return only the required JSON object: match_percentage must be an integer "
+                "0-100 and experience_match must be underqualified, qualified or overqualified."
+            ))]
+        except OllamaUnavailableError:
+            return JobResult(
+                task.id, task.site, task.job_id, "ollama_unavailable", None, None,
+                took + time.monotonic() - started, "Ollama is unavailable", index,
+            )
+        except OllamaEmptyContentError as exc:
+            if exc.done_reason == "length":
+                current_num_predict = profile.retry_num_predict
+        except Exception:
+            current_messages = messages + [HumanMessage(content=(
+                "Return only the required JSON object with the exact required keys."
+            ))]
+        finally:
+            took += time.monotonic() - started
+    return JobResult(
+        task.id, task.site, task.job_id, "schema_error", None, None, took,
+        "Screen response did not match the required schema", index,
+    )
+
+
 def analyze_routed_job_worker(resume_text: str, task: JobTask, index: int) -> JobResult:
     """Screen first; reserve detailed analysis and review for relevant jobs."""
     if not task.title.strip() and not task.desc.strip():
@@ -1827,24 +1990,27 @@ def analyze_routed_job_worker(resume_text: str, task: JobTask, index: int) -> Jo
     screen = task.cached_screen
     took = 0.0
     if screen is None:
+        profile = get_ai_profile("screen")
         desc, _, _ = truncate_to_token_budget(task.desc, MAX_JOB_DESC_TOKENS)
         msgs = build_messages(resume_text, task.title, desc, MATCH_SCREEN_PROMPT_PATH)
         errors: List[str] = []
-        current_num_predict = AI_SCREEN_NUM_PREDICT
+        current_num_predict = profile.num_predict
         current_msgs = list(msgs)
         # A small screen budget can be exhausted by reasoning even when thinking
         # was disabled. Allow only one bounded retry, independent of detail's
         # larger reasoning budget, and never classify a failed screen as rejection.
-        for attempt in range(1, min(AI_MAX_ATTEMPTS, 2) + 1):
+        for attempt in range(1, min(profile.max_attempts, 2) + 1):
             started = time.monotonic()
             try:
-                raw = invoke_ollama_json(current_msgs, num_predict=current_num_predict, think=False)
+                raw = invoke_ollama_json(
+                    current_msgs, profile=profile, num_predict=current_num_predict
+                )
                 candidate = parse_json_strict(raw)
                 if validate_match_screen(candidate):
                     screen = candidate
                     break
                 errors.append(f"attempt {attempt}: invalid screen JSON (response_chars={len(raw)}, num_predict={current_num_predict})")
-                current_num_predict = AI_SCREEN_RETRY_NUM_PREDICT
+                current_num_predict = profile.retry_num_predict
                 current_msgs = msgs + [HumanMessage(content=(
                     "Return only the required JSON object: match_percentage must be an integer "
                     "0-100 and experience_match must be underqualified, qualified or overqualified."
@@ -1859,7 +2025,7 @@ def analyze_routed_job_worker(resume_text: str, task: JobTask, index: int) -> Jo
                 eval_count = exc.eval_count if type(exc.eval_count) is int else "unknown"
                 errors.append(f"attempt {attempt}: empty screen output (done_reason={reason}, thinking_chars={exc.thinking_chars}, eval_count={eval_count}, num_predict={current_num_predict})")
                 if exc.done_reason == "length":
-                    current_num_predict = AI_SCREEN_RETRY_NUM_PREDICT
+                    current_num_predict = profile.retry_num_predict
             except Exception as exc:
                 # Arbitrary exception messages can contain provider response or
                 # personal evidence. Keep only the category and a known HTTP code.
@@ -1906,6 +2072,7 @@ def analyze_job_worker(resume_text: str, task: JobTask, index: int) -> JobResult
         # description budget otherwise keeps only the beginning of a long post.
         bounded_desc = f"{bounded_desc}\nCompensation evidence: {evidence}"
     msgs = build_messages(resume_text, task.title, bounded_desc)
+    profile = get_ai_profile("detail")
 
     took = 0.0
     attempts: List[str] = []
@@ -1913,13 +2080,15 @@ def analyze_job_worker(resume_text: str, task: JobTask, index: int) -> JobResult
     data: Dict[str, Any] = {}
     ok = False
     current_msgs = list(msgs)
-    current_num_predict = OLLAMA_NUM_PREDICT
+    current_num_predict = profile.num_predict
 
-    for attempt in range(1, AI_MAX_ATTEMPTS + 1):
+    for attempt in range(1, profile.max_attempts + 1):
         raw = ""
         t0 = time.time()
         try:
-            raw = invoke_ollama_json(current_msgs, num_predict=current_num_predict)
+            raw = invoke_ollama_json(
+                current_msgs, profile=profile, num_predict=current_num_predict
+            )
             took += time.time() - t0
             parsed = parse_json_strict(raw) or {}
             ok, why = validate_schema(parsed)
@@ -1934,8 +2103,10 @@ def analyze_job_worker(resume_text: str, task: JobTask, index: int) -> JobResult
         except OllamaEmptyContentError as e:
             took += time.time() - t0
             detail = f"attempt {attempt}: {e}"
-            if should_expand_thinking_budget(e, current_num_predict) and attempt < AI_MAX_ATTEMPTS:
-                current_num_predict = AI_THINKING_RETRY_NUM_PREDICT
+            if should_expand_thinking_budget(
+                e, current_num_predict, profile.retry_num_predict
+            ) and attempt < profile.max_attempts:
+                current_num_predict = profile.retry_num_predict
                 detail += f"; retrying with num_predict={current_num_predict}"
                 attempts.append(detail)
                 warnings.append(detail)
@@ -2149,14 +2320,15 @@ def analyze_compensation_worker(task: JobTask, index: int) -> JobResult:
             index=index,
         )
     messages = build_compensation_messages(task.title, task.desc)
+    profile = get_ai_profile("compensation")
     attempts = []
     took = 0.0
     current = list(messages)
-    for attempt in range(1, AI_MAX_ATTEMPTS + 1):
+    for attempt in range(1, profile.max_attempts + 1):
         started = time.time()
         raw = ""
         try:
-            raw = invoke_ollama_json(current)
+            raw = invoke_ollama_json(current, profile=profile)
             took += time.time() - started
             payload = parse_json_strict(raw) or {}
             ok, why = validate_compensation(payload)
@@ -2310,6 +2482,7 @@ def run_compensation_backfill(args: argparse.Namespace) -> None:
             f"Compensation-only jobs={len(tasks)} dry_run={args.dry_run} "
             f"force={args.force} schema_version={COMPENSATION_SCHEMA_VERSION}"
         )
+        log(f"Ollama profile compensation: {profile_log_label(get_ai_profile('compensation'))}")
 
         if not tasks:
             log(f"Compensation-only complete: {totals}")
@@ -2485,6 +2658,7 @@ def select_fit_brief_jobs(
 ) -> List[Tuple[Job, Optional[JobFitBrief]]]:
     """Select active reviewed matches that need an applicant-facing Fit Brief."""
     resume_hash = stable_text_hash(resume_text)
+    config_hash = fit_brief_config_hash()
     stmt = (
         select(Job, JobFitBrief)
         .outerjoin(JobFitBrief, JobFitBrief.job_pk == Job.id)
@@ -2500,8 +2674,8 @@ def select_fit_brief_jobs(
 
     selected: List[Tuple[Job, Optional[JobFitBrief]]] = []
     for job, brief in rows:
-        current_job_hash = job.content_hash or stable_text_hash(
-            "|".join([job.title or "", job.desc or "", job.ai_analysis or ""])
+        current_job_hash = downstream_job_hash(
+            job.title or "", job.desc or "", job.ai_analysis or "", job.content_hash
         )
         if brief is None:
             selected.append((job, brief))
@@ -2509,6 +2683,7 @@ def select_fit_brief_jobs(
         if (
             brief.resume_hash != resume_hash
             or brief.job_content_hash != current_job_hash
+            or brief.generation_config_hash != config_hash
             or brief.schema_version != FIT_BRIEF_SCHEMA_VERSION
         ):
             selected.append((job, brief))
@@ -2520,6 +2695,7 @@ def run_fit_brief_generation(
     *,
     force: bool = False,
     preflight: bool = True,
+    yield_to_ai_refreshes: bool = False,
 ) -> Dict[str, int]:
     """Run Stage 3 Fit Brief generation for eligible high-match jobs."""
     init_db()
@@ -2581,6 +2757,7 @@ def run_fit_brief_generation(
         future_to_task: Dict[Future, FitBriefTask] = {}
         submitted = 0
         aborted = False
+        priority_refreshed_job_ids: Set[int] = set()
 
         status_started_at = utc_now_naive()
 
@@ -2619,10 +2796,18 @@ def run_fit_brief_generation(
                 # Prep arriving after the main analysis stage still takes priority.
                 if not futures and not aborted:
                     session.rollback()
+                    if yield_to_ai_refreshes:
+                        drain_priority_refresh_queue(
+                            resume_text,
+                            preflight=False,
+                            completed_job_ids=priority_refreshed_job_ids,
+                        )
+                        session.expire_all()
                     run_application_prep_generation(
                         resume_text=resume_text,
                         force=False,
                         preflight=False,
+                        yield_to_ai_refreshes=yield_to_ai_refreshes,
                         restore_status=lambda: publish_fit_brief_status(
                             "Resuming Stage 3 Fit Brief generation after priority Application Prep."
                         ),
@@ -2635,6 +2820,14 @@ def run_fit_brief_generation(
                 ):
                     task = tasks[submitted]
                     index = submitted + 1
+                    if task.id in priority_refreshed_job_ids:
+                        submitted += 1
+                        totals["skipped"] += 1
+                        log(
+                            f"[skip] Fit Brief {task.site}:{task.job_id} "
+                            "was completed by a priority AI refresh"
+                        )
+                        continue
                     log(
                         f"[submit] [Fit Brief {index}/{len(tasks)}] "
                         f"{task.site}:{task.job_id} title={task.title[:80]!r}"
@@ -2645,6 +2838,8 @@ def run_fit_brief_generation(
                     submitted += 1
                     publish_fit_brief_status("Stage 3 Fit Brief generation is running.")
 
+                if not futures:
+                    continue
                 done, _ = wait(
                     futures,
                     timeout=AI_WAIT_HEARTBEAT_SEC,
@@ -2711,6 +2906,9 @@ def run_fit_brief_generation(
                     brief.brief_json = result.update_params["brief_json"]
                     brief.resume_hash = result.update_params["resume_hash"]
                     brief.job_content_hash = result.update_params["job_content_hash"]
+                    brief.generation_config_hash = result.update_params.get(
+                        "generation_config_hash", fit_brief_config_hash()
+                    )
                     brief.generated_at = result.update_params["generated_at"]
                     brief.schema_version = result.update_params["schema_version"]
                     try:
@@ -2763,6 +2961,7 @@ def select_application_prep_jobs(
 ) -> List[Tuple[Job, JobApplicationPrep]]:
     """Select liked move-forward jobs that need application-prep generation."""
     resume_hash = stable_text_hash(resume_text)
+    config_hash = application_prep_config_hash()
     rows = list(
         session.execute(
             select(Job, JobApplicationPrep)
@@ -2777,8 +2976,8 @@ def select_application_prep_jobs(
     )
     selected: List[Tuple[Job, JobApplicationPrep]] = []
     for job, prep in rows:
-        current_job_hash = job.content_hash or stable_text_hash(
-            "|".join([job.title or "", job.desc or "", job.ai_analysis or ""])
+        current_job_hash = downstream_job_hash(
+            job.title or "", job.desc or "", job.ai_analysis or "", job.content_hash
         )
         status = (prep.status or "queued").strip().lower()
         if force or status in {"queued", "stale"}:
@@ -2790,6 +2989,7 @@ def select_application_prep_jobs(
                 prep.resume_hash != resume_hash
                 or (prep.responsibilities_hash or "") != responsibilities_hash
                 or prep.job_content_hash != current_job_hash
+                or prep.generation_config_hash != config_hash
                 or prep.schema_version != APPLICATION_PREP_SCHEMA_VERSION
             )
         ):
@@ -2806,6 +3006,7 @@ def run_application_prep_generation(
     force: bool = False,
     preflight: bool = True,
     restore_status: Optional[Callable[[], None]] = None,
+    yield_to_ai_refreshes: bool = False,
 ) -> Dict[str, int]:
     """Run high-priority application prep for liked move-forward jobs."""
     init_db()
@@ -2892,6 +3093,7 @@ def run_application_prep_generation(
         future_to_task: Dict[Future, ApplicationPrepTask] = {}
         submitted = 0
         aborted = False
+        priority_refreshed_job_ids: Set[int] = set()
 
         def publish_application_prep_status(message: str) -> None:
             # Heartbeats run on the coordinator and publish through a fresh
@@ -2990,13 +3192,38 @@ def run_application_prep_generation(
             max_workers=AI_CONCURRENCY
         ) as executor:
             while (not aborted and submitted < len(tasks)) or futures:
+                if not futures and submitted and yield_to_ai_refreshes:
+                    session.rollback()
+                    drain_priority_refresh_queue(
+                        resume_text,
+                        preflight=False,
+                        completed_job_ids=priority_refreshed_job_ids,
+                    )
+                    session.expire_all()
+                batch_end = min(len(tasks), submitted + AI_MAX_INFLIGHT) if not futures else submitted
                 while (
                     not aborted
-                    and submitted < len(tasks)
+                    and submitted < batch_end
                     and len(futures) < AI_MAX_INFLIGHT
                 ):
                     task = tasks[submitted]
                     index = submitted + 1
+                    if task.id in priority_refreshed_job_ids:
+                        submitted += 1
+                        totals["skipped"] += 1
+                        prep = session.get(JobApplicationPrep, task.prep_id)
+                        if prep is not None and prep.status == "running":
+                            # Exact refresh skipped prep (for example after the
+                            # new score became ineligible); do not strand the
+                            # preselected lower-priority row as running.
+                            prep.status = "stale"
+                            prep.started_at = None
+                            session.commit()
+                        log(
+                            f"[skip] Application Prep {task.site}:{task.job_id} "
+                            "was completed by a priority AI refresh"
+                        )
+                        continue
                     log(
                         f"[submit] [Application Prep {index}/{len(tasks)}] "
                         f"{task.site}:{task.job_id} title={task.title[:80]!r}"
@@ -3009,6 +3236,8 @@ def run_application_prep_generation(
                         "Application Prep is generating priority materials."
                     )
 
+                if not futures:
+                    continue
                 done, _ = wait(
                     futures,
                     timeout=AI_WAIT_HEARTBEAT_SEC,
@@ -3082,6 +3311,9 @@ def run_application_prep_generation(
                     prep.resume_hash = result.update_params["resume_hash"]
                     prep.responsibilities_hash = result.update_params["responsibilities_hash"]
                     prep.job_content_hash = result.update_params["job_content_hash"]
+                    prep.generation_config_hash = result.update_params.get(
+                        "generation_config_hash", application_prep_config_hash()
+                    )
                     prep.generated_at = result.update_params["generated_at"]
                     prep.schema_version = result.update_params["schema_version"]
                     prep.status = "done"
@@ -3133,6 +3365,492 @@ def run_application_prep_generation(
         return totals
 
 
+class PriorityRefreshError(RuntimeError):
+    """Safe operational failure suitable for the refresh request row and UI."""
+
+
+_SAFE_PRIORITY_REFRESH_ERRORS = {
+    "Job no longer exists",
+    "Job is no longer active",
+    "Job has no title or description to analyze",
+    "Refresh lease was lost",
+    "AI screening failed",
+    "Detailed AI analysis failed",
+    "Fit Brief generation failed",
+    "Application Prep generation failed",
+    "Ollama is unavailable",
+    "AI refresh failed unexpectedly",
+}
+
+
+def sanitize_priority_refresh_error(error_text: Optional[str]) -> Optional[str]:
+    """Allow only known operational messages into dashboard-readable state."""
+    if error_text is None:
+        return None
+    if error_text in _SAFE_PRIORITY_REFRESH_ERRORS:
+        return error_text
+    return "AI refresh failed unexpectedly"
+
+
+def claim_next_ai_refresh_request(
+    *, worker_token: Optional[str] = None, now: Optional[datetime] = None
+) -> Optional[Tuple[int, int, str]]:
+    """Atomically claim the oldest queued request or an expired running lease."""
+    claim_time = now or utc_now_naive()
+    token = worker_token or uuid.uuid4().hex
+    with SessionLocal() as session:
+        candidates = list(
+            session.execute(
+                select(JobAIRefreshRequest)
+                .where(
+                    or_(
+                        JobAIRefreshRequest.status == "queued",
+                        and_(
+                            JobAIRefreshRequest.status == "running",
+                            JobAIRefreshRequest.lease_expires_at.is_not(None),
+                            JobAIRefreshRequest.lease_expires_at <= claim_time,
+                        ),
+                    )
+                )
+                .order_by(JobAIRefreshRequest.requested_at.asc(), JobAIRefreshRequest.job_pk.asc())
+            )
+            .scalars()
+        )
+        for request in candidates:
+            expected_status = request.status
+            expected_token = request.worker_token
+            conditions = [
+                JobAIRefreshRequest.job_pk == request.job_pk,
+                JobAIRefreshRequest.request_generation == request.request_generation,
+                JobAIRefreshRequest.status == expected_status,
+            ]
+            if expected_status == "running":
+                conditions.extend(
+                    [
+                        JobAIRefreshRequest.worker_token == expected_token,
+                        JobAIRefreshRequest.lease_expires_at <= claim_time,
+                    ]
+                )
+            claimed = session.execute(
+                update(JobAIRefreshRequest)
+                .where(*conditions)
+                .values(
+                    status="running",
+                    started_at=claim_time,
+                    finished_at=None,
+                    lease_expires_at=claim_time + timedelta(minutes=AI_REFRESH_LEASE_MINUTES),
+                    worker_token=token,
+                    current_stage="starting",
+                    outcome_json=None,
+                    error_text=None,
+                )
+            )
+            if claimed.rowcount == 1:
+                session.commit()
+                return request.job_pk, request.request_generation, token
+            session.rollback()
+    return None
+
+
+def update_ai_refresh_stage(
+    job_pk: int,
+    generation: int,
+    worker_token: str,
+    stage: str,
+    *,
+    now: Optional[datetime] = None,
+) -> bool:
+    """Advance a claimed request and renew its lease without reviving old work."""
+    update_time = now or utc_now_naive()
+    with SessionLocal() as session:
+        result = session.execute(
+            update(JobAIRefreshRequest)
+            .where(
+                JobAIRefreshRequest.job_pk == job_pk,
+                JobAIRefreshRequest.request_generation == generation,
+                JobAIRefreshRequest.status == "running",
+                JobAIRefreshRequest.worker_token == worker_token,
+            )
+            .values(
+                current_stage=stage,
+                lease_expires_at=update_time + timedelta(minutes=AI_REFRESH_LEASE_MINUTES),
+            )
+        )
+        session.commit()
+        return result.rowcount == 1
+
+
+@contextmanager
+def maintain_ai_refresh_lease(
+    job_pk: int,
+    generation: int,
+    worker_token: str,
+    stage: str,
+    *,
+    interval_seconds: Optional[float] = None,
+):
+    """Renew a refresh lease while one synchronous Ollama stage is running."""
+    stop = threading.Event()
+    lease_lost = threading.Event()
+    interval = interval_seconds or AI_REFRESH_HEARTBEAT_SECONDS
+
+    def heartbeat() -> None:
+        while not stop.wait(interval):
+            try:
+                if not update_ai_refresh_stage(job_pk, generation, worker_token, stage):
+                    lease_lost.set()
+                    return
+            except Exception:
+                # Losing the ability to prove ownership is safer than allowing
+                # this worker to persist output after another worker reclaims it.
+                lease_lost.set()
+                return
+
+    thread = threading.Thread(target=heartbeat, name="ai-refresh-lease", daemon=True)
+    thread.start()
+    try:
+        yield lambda: not lease_lost.is_set()
+    finally:
+        stop.set()
+        thread.join(timeout=max(1.0, min(float(interval), 5.0)))
+
+
+def finish_ai_refresh_request(
+    job_pk: int,
+    generation: int,
+    worker_token: str,
+    *,
+    status: str,
+    outcomes: Dict[str, str],
+    error_text: Optional[str] = None,
+) -> bool:
+    """Finish only the generation and lease owned by this processor."""
+    if status not in {"done", "failed"}:
+        raise ValueError("refresh terminal status must be done or failed")
+    with SessionLocal() as session:
+        result = session.execute(
+            update(JobAIRefreshRequest)
+            .where(
+                JobAIRefreshRequest.job_pk == job_pk,
+                JobAIRefreshRequest.request_generation == generation,
+                JobAIRefreshRequest.status == "running",
+                JobAIRefreshRequest.worker_token == worker_token,
+            )
+            .values(
+                status=status,
+                current_stage="complete" if status == "done" else "failed",
+                outcome_json=json.dumps(outcomes, sort_keys=True, separators=(",", ":")),
+                error_text=sanitize_priority_refresh_error(error_text),
+                finished_at=utc_now_naive(),
+                lease_expires_at=None,
+                worker_token=None,
+            )
+        )
+        session.commit()
+        return result.rowcount == 1
+
+
+def _priority_refresh_task(job: Job) -> JobTask:
+    return JobTask(
+        job.id,
+        job.site or "",
+        job.job_id or "",
+        job.title or "",
+        job.desc or "",
+        job.pay or "",
+        job.run_id,
+        job.content_hash,
+    )
+
+
+def _run_exact_fit_brief(
+    session: Session,
+    resume_text: str,
+    job: Job,
+    lease_guard: Optional[Callable[[], bool]] = None,
+) -> str:
+    if job.ai_match_percentage is None or job.ai_match_percentage < AI_FIT_BRIEF_MIN_MATCH:
+        return "skipped_ineligible"
+    task = FitBriefTask(
+        id=job.id,
+        site=job.site or "",
+        job_id=job.job_id or "",
+        title=job.title or "",
+        desc=job.desc or "",
+        ai_analysis=job.ai_analysis or "",
+        ai_match_percentage=job.ai_match_percentage,
+        content_hash=job.content_hash,
+    )
+    result = analyze_fit_brief_worker(resume_text, task, 1)
+    if result.status != "ok" or result.update_params is None:
+        raise PriorityRefreshError("Fit Brief generation failed")
+    if lease_guard is not None and not lease_guard():
+        raise PriorityRefreshError("Refresh lease was lost")
+    brief = session.execute(
+        select(JobFitBrief).where(JobFitBrief.job_pk == job.id)
+    ).scalars().one_or_none()
+    if brief is None:
+        brief = JobFitBrief(job_pk=job.id, brief_json="{}")
+        session.add(brief)
+    for name in (
+        "brief_json",
+        "resume_hash",
+        "job_content_hash",
+        "generation_config_hash",
+        "generated_at",
+        "schema_version",
+    ):
+        setattr(brief, name, result.update_params[name])
+    session.commit()
+    return "generated"
+
+
+def _run_exact_application_prep(
+    session: Session,
+    resume_text: str,
+    job: Job,
+    lease_guard: Optional[Callable[[], bool]] = None,
+) -> str:
+    swipe = session.execute(
+        select(JobSwipe).where(JobSwipe.job_pk == job.id, JobSwipe.action == "like")
+    ).scalars().one_or_none()
+    if swipe is None:
+        return "skipped_not_moved_forward"
+    settings = session.get(ApplicationPrepSettings, 1)
+    minimum = max(
+        0,
+        min(
+            100,
+            int(getattr(settings, "minimum_match_percentage", APPLICATION_PREP_DEFAULT_MIN_MATCH)),
+        ),
+    )
+    if job.ai_match_percentage is None or job.ai_match_percentage < minimum:
+        return "skipped_ineligible"
+    prep = session.execute(
+        select(JobApplicationPrep).where(JobApplicationPrep.job_pk == job.id)
+    ).scalars().one_or_none()
+    prep_id = prep.id if prep is not None else 0
+    inventory = session.get(ResponsibilitiesInventory, 1)
+    inventory_text = str(getattr(inventory, "markdown", "") or "")
+    bounded_inventory, _, _ = truncate_to_token_budget(
+        inventory_text, APPLICATION_PREP_INVENTORY_MAX_TOKENS
+    )
+    task = ApplicationPrepTask(
+        id=job.id,
+        prep_id=prep_id,
+        site=job.site or "",
+        job_id=job.job_id or "",
+        title=job.title or "",
+        desc=job.desc or "",
+        ai_analysis=job.ai_analysis or "",
+        ai_match_percentage=job.ai_match_percentage,
+        content_hash=job.content_hash,
+        responsibilities_text=bounded_inventory,
+        responsibilities_hash=str(getattr(inventory, "content_hash", "") or ""),
+    )
+    result = analyze_application_prep_worker(resume_text, task, 1)
+    if result.status != "ok" or result.update_params is None:
+        raise PriorityRefreshError("Application Prep generation failed")
+    if lease_guard is not None and not lease_guard():
+        raise PriorityRefreshError("Refresh lease was lost")
+    if prep is None:
+        # Delay creating the intent-backed row until output validates so a
+        # failed refresh does not leave a phantom queued artifact behind.
+        prep = JobApplicationPrep(job_pk=job.id, status="queued", queued_at=utc_now_naive())
+        session.add(prep)
+    for name in (
+        "prep_json",
+        "resume_hash",
+        "responsibilities_hash",
+        "job_content_hash",
+        "generation_config_hash",
+        "generated_at",
+        "schema_version",
+    ):
+        setattr(prep, name, result.update_params[name])
+    prep.status = "done"
+    prep.started_at = None
+    prep.error_text = None
+    session.commit()
+    return "generated"
+
+
+def process_exact_ai_refresh(
+    job_pk: int, generation: int, worker_token: str, resume_text: str
+) -> Dict[str, str]:
+    """Rebuild one job's AI outputs without selecting any unrelated work."""
+    outcomes: Dict[str, str] = {}
+    bounded_resume_text, _, _ = truncate_to_token_budget(resume_text, MAX_RESUME_TOKENS)
+    with SessionLocal() as session:
+        job = session.get(Job, job_pk)
+        if job is None:
+            raise PriorityRefreshError("Job no longer exists")
+        if not job.is_active:
+            raise PriorityRefreshError("Job is no longer active")
+        if not (job.title or "").strip() and not (job.desc or "").strip():
+            raise PriorityRefreshError("Job has no title or description to analyze")
+
+        task = _priority_refresh_task(job)
+        task.screen_input_hash = screen_input_hash(bounded_resume_text, task)
+        task.retry_input_hash = analysis_retry_input_hash(bounded_resume_text, task)
+        # Close the read transaction before the heartbeat thread writes through
+        # a separate connection, which is required for local SQLite as well as
+        # reducing long-lived snapshots on MySQL.
+        session.commit()
+        if not update_ai_refresh_stage(job_pk, generation, worker_token, "screening"):
+            raise PriorityRefreshError("Refresh lease was lost")
+        with maintain_ai_refresh_lease(
+            job_pk, generation, worker_token, "screening"
+        ) as lease_owned:
+            result = analyze_match_screen_worker(bounded_resume_text, task, 1)
+        if not lease_owned():
+            raise PriorityRefreshError("Refresh lease was lost")
+        if result.screen_payload is None:
+            raise PriorityRefreshError("AI screening failed")
+        if not update_ai_refresh_stage(job_pk, generation, worker_token, "detailed_analysis"):
+            raise PriorityRefreshError("Refresh lease was lost")
+        session.merge(
+            JobMatchScreen(
+                job_pk=job.id,
+                input_hash=task.screen_input_hash,
+                match_percentage=result.screen_payload["match_percentage"],
+                experience_match=result.screen_payload["experience_match"],
+                screened_at=utc_now_naive(),
+            )
+        )
+        session.commit()
+        outcomes["screening"] = "generated"
+
+        if result.status == "screened_out":
+            with maintain_ai_refresh_lease(
+                job_pk, generation, worker_token, "detailed_analysis"
+            ) as lease_owned:
+                result = analyze_job_worker(bounded_resume_text, task, 1)
+            if not lease_owned():
+                raise PriorityRefreshError("Refresh lease was lost")
+        if result.status != "ok" or result.payload_json is None or result.update_params is None:
+            raise PriorityRefreshError("Detailed AI analysis failed")
+        if not update_ai_refresh_stage(job_pk, generation, worker_token, "detailed_analysis"):
+            raise PriorityRefreshError("Refresh lease was lost")
+        for name, value in result.update_params.items():
+            setattr(job, name, value)
+        job.ai_analysis = result.payload_json
+        session.add(
+            JobChange(
+                run_id=job.run_id,
+                job_id_text=job.job_id,
+                site=job.site,
+                job_pk=job.id,
+                change_type="update",
+                change_source="ai",
+                old_hash=job.content_hash,
+                new_hash=job.content_hash,
+                changed_fields=ai_changed_fields(result.update_params),
+            )
+        )
+        retry = session.get(JobAnalysisRetry, job.id)
+        if retry is not None:
+            session.delete(retry)
+        session.commit()
+        outcomes["detailed_analysis"] = "generated"
+
+        if not update_ai_refresh_stage(job_pk, generation, worker_token, "fit_brief"):
+            raise PriorityRefreshError("Refresh lease was lost")
+        with maintain_ai_refresh_lease(
+            job_pk, generation, worker_token, "fit_brief"
+        ) as lease_owned:
+            outcomes["fit_brief"] = _run_exact_fit_brief(
+                session,
+                resume_text,
+                job,
+                lease_guard=lambda: lease_owned()
+                and update_ai_refresh_stage(job_pk, generation, worker_token, "fit_brief"),
+            )
+        if not update_ai_refresh_stage(job_pk, generation, worker_token, "application_prep"):
+            raise PriorityRefreshError("Refresh lease was lost")
+        with maintain_ai_refresh_lease(
+            job_pk, generation, worker_token, "application_prep"
+        ) as lease_owned:
+            outcomes["application_prep"] = _run_exact_application_prep(
+                session,
+                resume_text,
+                job,
+                lease_guard=lambda: lease_owned()
+                and update_ai_refresh_stage(
+                    job_pk, generation, worker_token, "application_prep"
+                ),
+            )
+    return outcomes
+
+
+def drain_priority_refresh_queue(
+    resume_text: str,
+    *,
+    preflight: bool = False,
+    completed_job_ids: Optional[Set[int]] = None,
+) -> Dict[str, int]:
+    """Drain all durable per-job refreshes before returning to background work."""
+    totals = {"processed": 0, "failed": 0}
+    checked_ollama = not preflight
+    while True:
+        claim = claim_next_ai_refresh_request()
+        if claim is None:
+            return totals
+        job_pk, generation, worker_token = claim
+        outcomes: Dict[str, str] = {}
+        try:
+            if not checked_ollama:
+                check_ollama_prerequisites()
+                checked_ollama = True
+            outcomes = process_exact_ai_refresh(job_pk, generation, worker_token, resume_text)
+        except PriorityRefreshError as exc:
+            finish_ai_refresh_request(
+                job_pk,
+                generation,
+                worker_token,
+                status="failed",
+                outcomes=outcomes,
+                error_text=str(exc),
+            )
+            totals["failed"] += 1
+            log(f"[err] Priority AI refresh job_pk={job_pk}: {exc}")
+        except OllamaPrerequisiteError:
+            finish_ai_refresh_request(
+                job_pk,
+                generation,
+                worker_token,
+                status="failed",
+                outcomes={},
+                error_text="Ollama is unavailable",
+            )
+            totals["failed"] += 1
+            return totals
+        except Exception:
+            # Provider, prompt, resume, and database details must not be copied
+            # into a dashboard-visible durable row.
+            finish_ai_refresh_request(
+                job_pk,
+                generation,
+                worker_token,
+                status="failed",
+                outcomes={},
+                error_text="AI refresh failed unexpectedly",
+            )
+            totals["failed"] += 1
+            log(f"[err] Priority AI refresh job_pk={job_pk} failed unexpectedly")
+        else:
+            finish_ai_refresh_request(
+                job_pk,
+                generation,
+                worker_token,
+                status="done",
+                outcomes=outcomes,
+            )
+            totals["processed"] += 1
+            if completed_job_ids is not None:
+                completed_job_ids.add(job_pk)
+
+
 # -------------------------------
 # Main
 # -------------------------------
@@ -3150,20 +3868,20 @@ def main() -> None:
     log("------------------------------------------------------")
     log(f"AI Job Analysis started {start.strftime('%Y-%m-%d %H:%M:%S')}")
     log(
-        f"Model={OLLAMA_MODEL} | ONLY_EMPTY={ONLY_EMPTY} | SITE_FILTER='{SITE_FILTER}' | LIMIT={LIMIT} | REDO={args.redo if args.redo is not None else 'off'}"
+        f"ONLY_EMPTY={ONLY_EMPTY} | SITE_FILTER='{SITE_FILTER}' | LIMIT={LIMIT} | REDO={args.redo if args.redo is not None else 'off'}"
     )
     log(
         f"Prompt budgets: resume={token_budget_label(MAX_RESUME_TOKENS)} | job_desc={token_budget_label(MAX_JOB_DESC_TOKENS)}"
     )
-    log(
-        f"Ollama options: think={OLLAMA_THINK!r} | num_ctx={OLLAMA_NUM_CTX} | num_predict={OLLAMA_NUM_PREDICT} | thinking_retry_num_predict={AI_THINKING_RETRY_NUM_PREDICT} | keep_alive={OLLAMA_KEEP_ALIVE}"
-    )
+    for profile in get_ai_profiles().values():
+        log(f"Ollama profile {profile.name}: {profile_log_label(profile)}")
+    log(f"Ollama keep_alive={OLLAMA_KEEP_ALIVE}")
     log(
         f"Parallelism: workers={AI_CONCURRENCY} | max_inflight={AI_MAX_INFLIGHT} | progress_every={AI_BATCH_LOG_EVERY}"
     )
     log(
         f"Timeouts: preflight={OLLAMA_PREFLIGHT_TIMEOUT_SEC}s | "
-        f"request_timeout={AI_REQUEST_TIMEOUT_SEC}s | heartbeat={AI_WAIT_HEARTBEAT_SEC}s"
+        f"heartbeat={AI_WAIT_HEARTBEAT_SEC}s"
     )
     log("------------------------------------------------------")
 
@@ -3196,6 +3914,10 @@ def main() -> None:
             preflight=True,
         )
         return
+
+    # Manual per-job refreshes outrank every scheduled queue. Specialized
+    # command modes above keep their intentionally narrow contracts.
+    drain_priority_refresh_queue(resume_text, preflight=True)
 
     processed = 0
     failures = 0
@@ -3280,8 +4002,15 @@ def main() -> None:
                 resume_text=resume_text,
                 force=False,
                 preflight=True,
+                yield_to_ai_refreshes=True,
             )
-            run_fit_brief_generation(resume_text, force=False, preflight=True)
+            drain_priority_refresh_queue(resume_text, preflight=False)
+            run_fit_brief_generation(
+                resume_text,
+                force=False,
+                preflight=True,
+                yield_to_ai_refreshes=True,
+            )
             return
 
         try:
@@ -3294,6 +4023,7 @@ def main() -> None:
             resume_text=resume_text,
             force=False,
             preflight=False,
+            yield_to_ai_refreshes=True,
         )
 
         upd = sa_text(
@@ -3385,6 +4115,7 @@ def main() -> None:
         future_to_task: Dict[Future, JobTask] = {}
         future_started_at: Dict[Future, float] = {}
         submitted = 0
+        priority_refreshed_job_ids: Set[int] = set()
 
         def publish_live_status(message: str = "Scheduled AI analysis is running.") -> None:
             # The dashboard receives only in-flight job identifiers and titles;
@@ -3548,10 +4279,17 @@ def main() -> None:
                     # Release the MySQL read snapshot before another session
                     # checks priority requests queued since this batch began.
                     s.rollback()
+                    drain_priority_refresh_queue(
+                        resume_text,
+                        preflight=False,
+                        completed_job_ids=priority_refreshed_job_ids,
+                    )
+                    s.expire_all()
                     run_application_prep_generation(
                         resume_text=resume_text,
                         force=False,
                         preflight=False,
+                        yield_to_ai_refreshes=True,
                         restore_status=lambda: publish_live_status(
                             "Resuming scheduled AI analysis after priority Application Prep."
                         ),
@@ -3564,6 +4302,15 @@ def main() -> None:
                 ):
                     task = tasks[submitted]
                     idx = submitted + 1
+                    if task.id in priority_refreshed_job_ids:
+                        submitted += 1
+                        completed += 1
+                        skipped += 1
+                        log(
+                            f"[skip] {task.site}:{task.job_id} was completed by "
+                            "a priority AI refresh"
+                        )
+                        continue
                     log(f"[submit] [Job {idx}/{total}] {task.site}:{task.job_id} title={task.title[:80]!r}")
                     fut = executor.submit(analyze_routed_job_worker, bounded_resume_text, task, idx)
                     futures.add(fut)
@@ -3572,6 +4319,8 @@ def main() -> None:
                     submitted += 1
                     publish_live_status()
 
+                if not futures:
+                    continue
                 done, _ = wait(
                     futures,
                     timeout=AI_WAIT_HEARTBEAT_SEC,
@@ -3654,11 +4403,18 @@ def main() -> None:
             resume_text=resume_text,
             force=False,
             preflight=False,
+            yield_to_ai_refreshes=True,
         )
         # Avoid spending additional background inference on briefs when the
         # primary batch failed completely; priority Application Prep still runs.
         if not all_failed:
-            run_fit_brief_generation(resume_text, force=False, preflight=False)
+            drain_priority_refresh_queue(resume_text, preflight=False)
+            run_fit_brief_generation(
+                resume_text,
+                force=False,
+                preflight=False,
+                yield_to_ai_refreshes=True,
+            )
 
     end = datetime.now()
     log("------------------------------------------------------")

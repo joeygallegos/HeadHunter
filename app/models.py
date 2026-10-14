@@ -8,6 +8,7 @@ from sqlalchemy import (
     String,
     Text,
     ForeignKey,
+    Index,
     UniqueConstraint,
     Boolean,
     func,
@@ -223,6 +224,30 @@ class JobAnalysisRetry(Base):
     retry_after = Column(DateTime(timezone=False), nullable=False, index=True)
 
 
+class JobAIRefreshRequest(Base):
+    """Durable highest-priority request to rebuild every AI artifact for a job."""
+
+    __tablename__ = "job_ai_refresh_requests"
+    __table_args__ = (
+        Index("ix_job_ai_refresh_queue", "status", "requested_at"),
+        {"mysql_charset": "utf8mb4", "mysql_collate": "utf8mb4_unicode_ci"},
+    )
+
+    # This is intentionally not a foreign key. Dashboard and analyzer database
+    # users may have CREATE/UPDATE permission without REFERENCES permission.
+    job_pk = Column(Integer, primary_key=True)
+    status = Column(String(16), nullable=False, default="queued", server_default="queued")
+    request_generation = Column(Integer, nullable=False, default=1, server_default="1")
+    requested_at = Column(DateTime(timezone=False), nullable=False, default=utc_now_naive)
+    started_at = Column(DateTime(timezone=False), nullable=True)
+    finished_at = Column(DateTime(timezone=False), nullable=True)
+    lease_expires_at = Column(DateTime(timezone=False), nullable=True)
+    worker_token = Column(String(64), nullable=True)
+    current_stage = Column(String(32), nullable=True)
+    outcome_json = Column(LONGTEXT().with_variant(Text, "sqlite"), nullable=True)
+    error_text = Column(Text, nullable=True)
+
+
 class JobFitBrief(Base):
     __tablename__ = "job_fit_briefs"
     __table_args__ = (
@@ -235,6 +260,9 @@ class JobFitBrief(Base):
     brief_json = Column(LONGTEXT().with_variant(Text, "sqlite"), nullable=False)
     resume_hash = Column(String(64), nullable=False)
     job_content_hash = Column(String(64), nullable=False)
+    # Kept separate from job_content_hash so dashboard freshness can explain
+    # whether job evidence or generation behavior changed.
+    generation_config_hash = Column(String(64), nullable=True)
     generated_at = Column(DateTime(timezone=False), nullable=False, default=utc_now_naive)
     schema_version = Column(Integer, nullable=False)
 
@@ -258,6 +286,8 @@ class JobApplicationPrep(Base):
     # The responsibilities inventory is a second, user-maintained evidence source.
     responsibilities_hash = Column(String(64), nullable=True)
     job_content_hash = Column(String(64), nullable=True)
+    # Nullable migration makes legacy output stale without blocking table repair.
+    generation_config_hash = Column(String(64), nullable=True)
     schema_version = Column(Integer, nullable=True)
     queued_at = Column(DateTime(timezone=False), nullable=False, default=utc_now_naive)
     started_at = Column(DateTime(timezone=False), nullable=True)
@@ -479,6 +509,7 @@ def ensure_job_fit_briefs_table(bind=None) -> None:
         "brief_json": f"{text_type} NOT NULL",
         "resume_hash": "VARCHAR(64) NOT NULL",
         "job_content_hash": "VARCHAR(64) NOT NULL",
+        "generation_config_hash": "VARCHAR(64)",
         "generated_at": "DATETIME NOT NULL",
         "schema_version": "INTEGER NOT NULL",
     }
@@ -501,6 +532,7 @@ def ensure_job_application_preps_table(bind=None) -> None:
         "resume_hash": "VARCHAR(64)",
         "responsibilities_hash": "VARCHAR(64)",
         "job_content_hash": "VARCHAR(64)",
+        "generation_config_hash": "VARCHAR(64)",
         "schema_version": "INTEGER",
         "queued_at": "DATETIME",
         "started_at": "DATETIME",
@@ -511,6 +543,33 @@ def ensure_job_application_preps_table(bind=None) -> None:
         for name, column_type in definitions.items():
             if name not in columns:
                 conn.execute(text(f"ALTER TABLE job_application_preps ADD COLUMN {name} {column_type}"))
+
+
+def ensure_job_ai_refresh_requests_table(bind=None) -> None:
+    """Create and lightly repair the durable per-job refresh queue."""
+    target = bind or engine
+    Base.metadata.tables["job_ai_refresh_requests"].create(bind=target, checkfirst=True)
+    inspector = sa_inspect(target)
+    columns = {col["name"] for col in inspector.get_columns("job_ai_refresh_requests")}
+    text_type = "LONGTEXT" if target.dialect.name == "mysql" else "TEXT"
+    definitions = {
+        "status": "VARCHAR(16) NOT NULL DEFAULT 'queued'",
+        "request_generation": "INTEGER NOT NULL DEFAULT 1",
+        "requested_at": "DATETIME",
+        "started_at": "DATETIME",
+        "finished_at": "DATETIME",
+        "lease_expires_at": "DATETIME",
+        "worker_token": "VARCHAR(64)",
+        "current_stage": "VARCHAR(32)",
+        "outcome_json": text_type,
+        "error_text": text_type,
+    }
+    with target.begin() as conn:
+        for name, column_type in definitions.items():
+            if name not in columns:
+                conn.execute(text(f"ALTER TABLE job_ai_refresh_requests ADD COLUMN {name} {column_type}"))
+    for queue_index in Base.metadata.tables["job_ai_refresh_requests"].indexes:
+        queue_index.create(bind=target, checkfirst=True)
 
 
 def ensure_application_prep_settings_table(bind=None) -> None:
@@ -606,6 +665,7 @@ def init_db() -> None:
     ensure_job_change_details_column(engine)
     ensure_job_fit_briefs_table(engine)
     ensure_job_application_preps_table(engine)
+    ensure_job_ai_refresh_requests_table(engine)
     ensure_application_prep_settings_table(engine)
     ensure_responsibilities_inventory_table(engine)
     ensure_resume_source_settings_table(engine)

@@ -1,17 +1,20 @@
+import json
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, inspect as sa_inspect
 from sqlalchemy.orm import sessionmaker
 
 import analyze_jobs_ollama as analyzer
 import dashboard
 import email_job_digest as digest
+from app import models
 from app.models import (
     Base,
     IntegrationRun,
     Job,
+    JobAIRefreshRequest,
     JobAnalysisRetry,
     JobApplicationPrep,
     JobMatchScreen,
@@ -21,9 +24,10 @@ from app.models import (
 
 def test_reasoning_only_screen_gets_one_bounded_retry(monkeypatch):
     calls = []
-    monkeypatch.setattr(analyzer, "AI_MAX_ATTEMPTS", 4)
-    monkeypatch.setattr(analyzer, "AI_SCREEN_NUM_PREDICT", 128)
-    monkeypatch.setattr(analyzer, "AI_SCREEN_RETRY_NUM_PREDICT", 512)
+    monkeypatch.setenv("AI_SCREEN_MAX_ATTEMPTS", "4")
+    monkeypatch.setenv("AI_SCREEN_THINK", "false")
+    monkeypatch.setenv("AI_SCREEN_NUM_PREDICT", "128")
+    monkeypatch.setenv("AI_SCREEN_RETRY_NUM_PREDICT", "512")
 
     def invoke(messages, **options):
         calls.append(options)
@@ -37,8 +41,9 @@ def test_reasoning_only_screen_gets_one_bounded_retry(monkeypatch):
     task = analyzer.JobTask(1, "site", "job", "Title", "Description", "", 1, None)
     result = analyzer.analyze_routed_job_worker("resume", task, 1)
     assert result.status == "screened_out"
-    assert calls == [{"num_predict": 128, "think": False},
-                     {"num_predict": 512, "think": False}]
+    assert [call["num_predict"] for call in calls] == [128, 512]
+    assert [call["profile"].name for call in calls] == ["screen", "screen"]
+    assert [call["profile"].think for call in calls] == [False, False]
 
 
 def test_exhausted_screen_preserves_safe_diagnostics(monkeypatch):
@@ -89,6 +94,489 @@ def _jobs(session):
     session.add_all(jobs)
     session.flush()
     return run, jobs
+
+
+def _refresh_job(session, job_id="refresh-job", **overrides):
+    run = IntegrationRun(user="test", mode="steps")
+    session.add(run)
+    session.flush()
+    values = {
+        "site": "site",
+        "job_id": job_id,
+        "title": "Security Engineer",
+        "desc": "Build reliable controls.",
+        "run_id": run.id,
+        "is_active": True,
+        "content_hash": f"hash-{job_id}",
+        "ai_analysis": '{"match_percentage":80}',
+        "ai_match_percentage": 80,
+    }
+    values.update(overrides)
+    job = Job(**values)
+    session.add(job)
+    session.flush()
+    return job
+
+
+def test_init_db_creates_priority_ai_refresh_queue(monkeypatch, tmp_path):
+    engine, _factory = _database(tmp_path)
+    monkeypatch.setattr(models, "engine", engine)
+
+    models.init_db()
+
+    columns = {
+        column["name"]
+        for column in sa_inspect(engine).get_columns("job_ai_refresh_requests")
+    }
+    assert {
+        "job_pk",
+        "status",
+        "request_generation",
+        "requested_at",
+        "started_at",
+        "finished_at",
+        "lease_expires_at",
+        "worker_token",
+        "current_stage",
+        "outcome_json",
+        "error_text",
+    }.issubset(columns)
+
+
+def test_job_refresh_endpoint_queues_and_coalesces(monkeypatch, tmp_path):
+    engine, factory = _database(tmp_path)
+    with factory() as session:
+        job = _refresh_job(session)
+        session.commit()
+        job_id = job.id
+    monkeypatch.setattr(dashboard, "engine", engine)
+    monkeypatch.setattr(dashboard, "SessionLocal", factory)
+    monkeypatch.setattr(dashboard, "_REFERENCE_FIELDS_COLUMN_READY", True)
+
+    client = dashboard.app.test_client()
+    first = client.post(f"/api/jobs/{job_id}/refresh-ai")
+    duplicate = client.post(f"/api/jobs/{job_id}/refresh-ai")
+
+    assert first.status_code == 202
+    assert first.get_json()["coalesced"] is False
+    assert first.get_json()["refresh"]["status"] == "queued"
+    assert duplicate.status_code == 202
+    assert duplicate.get_json()["coalesced"] is True
+    with factory() as session:
+        rows = session.query(JobAIRefreshRequest).all()
+        assert len(rows) == 1
+        assert rows[0].request_generation == 1
+
+
+def test_job_refresh_requeues_terminal_generations_and_resets_private_state(
+    monkeypatch, tmp_path
+):
+    engine, factory = _database(tmp_path)
+    with factory() as session:
+        job = _refresh_job(session)
+        session.commit()
+        job_id = job.id
+    monkeypatch.setattr(dashboard, "engine", engine)
+    monkeypatch.setattr(dashboard, "SessionLocal", factory)
+    monkeypatch.setattr(dashboard, "_REFERENCE_FIELDS_COLUMN_READY", True)
+    dashboard.queue_job_ai_refresh(job_id)
+
+    with factory() as session:
+        refresh = session.get(JobAIRefreshRequest, job_id)
+        refresh.status = "running"
+        refresh.worker_token = "private-worker-token"
+        session.commit()
+    assert dashboard.queue_job_ai_refresh(job_id)["coalesced"] is True
+
+    for expected_generation, terminal_status in ((2, "done"), (3, "failed")):
+        with factory() as session:
+            refresh = session.get(JobAIRefreshRequest, job_id)
+            refresh.status = terminal_status
+            refresh.error_text = "private provider output"
+            session.commit()
+        result = dashboard.queue_job_ai_refresh(job_id)
+        assert result["refresh"]["request_generation"] == expected_generation
+        assert result["refresh"]["status"] == "queued"
+        with factory() as session:
+            refresh = session.get(JobAIRefreshRequest, job_id)
+            assert refresh.worker_token is None
+            assert refresh.error_text is None
+
+
+def test_job_refresh_endpoint_rejects_missing_inactive_and_empty(monkeypatch, tmp_path):
+    engine, factory = _database(tmp_path)
+    with factory() as session:
+        inactive = _refresh_job(session, "inactive", is_active=False)
+        empty = _refresh_job(session, "empty", title="", desc="")
+        session.commit()
+        inactive_id = inactive.id
+        empty_id = empty.id
+    monkeypatch.setattr(dashboard, "engine", engine)
+    monkeypatch.setattr(dashboard, "SessionLocal", factory)
+    monkeypatch.setattr(dashboard, "_REFERENCE_FIELDS_COLUMN_READY", True)
+    client = dashboard.app.test_client()
+
+    assert client.post("/api/jobs/999999/refresh-ai").status_code == 404
+    assert client.post(f"/api/jobs/{inactive_id}/refresh-ai").status_code == 409
+    assert client.post(f"/api/jobs/{empty_id}/refresh-ai").status_code == 409
+    with factory() as session:
+        assert session.query(JobAIRefreshRequest).count() == 0
+
+
+def test_job_detail_serializes_safe_ai_refresh_state(tmp_path):
+    _engine, factory = _database(tmp_path)
+    with factory() as session:
+        job = _refresh_job(session)
+        refresh = JobAIRefreshRequest(
+            job_pk=job.id,
+            status="failed",
+            request_generation=4,
+            current_stage="detailed_analysis",
+            outcome_json='{"screening":"generated","detailed_analysis":"failed"}',
+            worker_token="must-not-leak",
+            error_text="resume and provider output must not leak",
+        )
+        session.add(refresh)
+        session.commit()
+        serialized = dashboard._serialize_job_detail(job, [], ai_refresh=refresh)["ai_refresh"]
+
+    assert serialized["status"] == "failed"
+    assert serialized["request_generation"] == 4
+    assert serialized["outcomes"]["screening"] == "generated"
+    assert serialized["error_message"] == "AI refresh failed. You can retry this job."
+    assert "worker_token" not in serialized
+    assert "provider output" not in json.dumps(serialized)
+
+
+def test_job_lookup_template_exposes_refresh_states_and_polling():
+    template = dashboard.app.jinja_loader.get_source(
+        dashboard.app.jinja_env, "index.html"
+    )[0]
+
+    assert '@click="refreshSelectedJobAi()"' in template
+    assert ':disabled="aiRefreshBusy(selectedJob())"' in template
+    for label in (
+        "Refresh AI details",
+        "Queued for AI refresh",
+        "Refresh complete — refresh again",
+        "Refresh failed — retry",
+    ):
+        assert label in template
+    assert "async pollSelectedJobAiRefresh(jobId, token)" in template
+    assert "/api/job-detail?id=${encodeURIComponent(jobId)}`" in template
+    assert "/refresh-ai`" in template
+
+
+def test_downstream_hashes_change_with_ai_analysis_despite_fixed_content_hash():
+    common = {
+        "id": 1,
+        "site": "site",
+        "job_id": "hash-check",
+        "title": "Security Lead",
+        "desc": "Lead the program.",
+        "ai_match_percentage": 80,
+        "content_hash": "unchanged-source-hash",
+    }
+    brief_a = analyzer.FitBriefTask(ai_analysis='{"match_percentage":80}', **common)
+    brief_b = analyzer.FitBriefTask(ai_analysis='{"match_percentage":90}', **common)
+    prep_a = analyzer.ApplicationPrepTask(
+        prep_id=2, ai_analysis='{"match_percentage":80}', **common
+    )
+    prep_b = analyzer.ApplicationPrepTask(
+        prep_id=2, ai_analysis='{"match_percentage":90}', **common
+    )
+
+    assert analyzer.fit_brief_job_hash(brief_a) != analyzer.fit_brief_job_hash(brief_b)
+    assert analyzer.application_prep_job_hash(prep_a) != analyzer.application_prep_job_hash(
+        prep_b
+    )
+
+
+def test_priority_refresh_claim_is_exclusive_and_respects_leases(monkeypatch, tmp_path):
+    _, factory = _database(tmp_path)
+    now = datetime(2026, 10, 14, 12, 0)
+    with factory() as session:
+        session.add_all(
+            [
+                JobAIRefreshRequest(
+                    job_pk=1,
+                    status="queued",
+                    requested_at=now - timedelta(minutes=10),
+                ),
+                JobAIRefreshRequest(
+                    job_pk=2,
+                    status="running",
+                    requested_at=now - timedelta(minutes=9),
+                    lease_expires_at=now + timedelta(minutes=5),
+                    worker_token="live-owner",
+                ),
+                JobAIRefreshRequest(
+                    job_pk=3,
+                    status="running",
+                    requested_at=now - timedelta(minutes=8),
+                    lease_expires_at=now - timedelta(seconds=1),
+                    worker_token="expired-owner",
+                ),
+            ]
+        )
+        session.commit()
+
+    monkeypatch.setattr(analyzer, "SessionLocal", factory)
+
+    first = analyzer.claim_next_ai_refresh_request(worker_token="worker-a", now=now)
+    second = analyzer.claim_next_ai_refresh_request(worker_token="worker-b", now=now)
+    third = analyzer.claim_next_ai_refresh_request(worker_token="worker-c", now=now)
+
+    assert first == (1, 1, "worker-a")
+    assert second == (3, 1, "worker-b")
+    assert third is None
+    with factory() as session:
+        assert session.get(JobAIRefreshRequest, 1).worker_token == "worker-a"
+        assert session.get(JobAIRefreshRequest, 2).worker_token == "live-owner"
+        assert session.get(JobAIRefreshRequest, 3).worker_token == "worker-b"
+
+
+def test_priority_refresh_lease_heartbeats_during_long_stage(monkeypatch):
+    heartbeat_seen = analyzer.threading.Event()
+    calls = []
+
+    def renew(job_pk, generation, worker_token, stage, **_kwargs):
+        calls.append((job_pk, generation, worker_token, stage))
+        heartbeat_seen.set()
+        return True
+
+    monkeypatch.setattr(analyzer, "update_ai_refresh_stage", renew)
+
+    with analyzer.maintain_ai_refresh_lease(
+        7, 3, "owner", "detailed_analysis", interval_seconds=0.01
+    ) as lease_owned:
+        assert heartbeat_seen.wait(1.0)
+        assert lease_owned() is True
+
+    assert calls
+    assert set(calls) == {(7, 3, "owner", "detailed_analysis")}
+
+
+def test_priority_refreshed_job_is_not_submitted_from_prebuilt_batch(
+    monkeypatch, tmp_path
+):
+    _, factory = _database(tmp_path)
+    with factory() as session:
+        older = _refresh_job(
+            session,
+            "scheduled-first",
+            discovery_date=datetime(2026, 10, 13, 8, 0),
+            ai_analysis=None,
+            ai_match_percentage=None,
+        )
+        newer = _refresh_job(
+            session,
+            "priority-second",
+            discovery_date=datetime(2026, 10, 13, 9, 0),
+            ai_analysis=None,
+            ai_match_percentage=None,
+        )
+        session.commit()
+        newer_id = newer.id
+    resume = tmp_path / "resume.txt"
+    resume.write_text("resume", encoding="utf-8")
+    submitted = []
+    checkpoint_calls = 0
+
+    def drain(_resume, *, completed_job_ids=None, **_kwargs):
+        nonlocal checkpoint_calls
+        checkpoint_calls += 1
+        if completed_job_ids is not None:
+            completed_job_ids.add(newer_id)
+        return {"processed": 1 if completed_job_ids is not None else 0, "failed": 0}
+
+    def worker(_resume, task, index):
+        submitted.append(task.job_id)
+        return analyzer.JobResult(
+            task.id,
+            task.site,
+            task.job_id,
+            "screened_out",
+            None,
+            None,
+            0.0,
+            "",
+            index,
+            {"match_percentage": 20, "experience_match": "underqualified"},
+        )
+
+    monkeypatch.setattr(analyzer, "SessionLocal", factory)
+    monkeypatch.setattr(analyzer, "RESUME_PATH", str(resume))
+    monkeypatch.setattr(analyzer, "init_db", lambda: None)
+    monkeypatch.setattr(analyzer, "check_ollama_prerequisites", lambda: None)
+    monkeypatch.setattr(
+        analyzer,
+        "parse_args",
+        lambda: SimpleNamespace(compensation_only=False, redo=None),
+    )
+    monkeypatch.setattr(analyzer, "drain_priority_refresh_queue", drain)
+    monkeypatch.setattr(analyzer, "run_application_prep_generation", lambda **_kwargs: {})
+    monkeypatch.setattr(analyzer, "run_fit_brief_generation", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(analyzer, "publish_ai_processing_status", lambda **_kwargs: None)
+    monkeypatch.setattr(analyzer, "analyze_routed_job_worker", worker)
+    monkeypatch.setattr(analyzer, "AI_CONCURRENCY", 1)
+    monkeypatch.setattr(analyzer, "AI_MAX_INFLIGHT", 1)
+    monkeypatch.setattr(analyzer, "ONLY_EMPTY", True)
+    monkeypatch.setattr(analyzer, "SITE_FILTER", "")
+    monkeypatch.setattr(analyzer, "LIMIT", 0)
+
+    analyzer.main()
+
+    assert checkpoint_calls >= 2
+    assert submitted == [older.job_id]
+
+
+def test_exact_priority_refresh_forces_detail_after_low_fresh_screen(
+    monkeypatch, tmp_path
+):
+    _, factory = _database(tmp_path)
+    with factory() as session:
+        run = IntegrationRun(user="test", mode="steps")
+        session.add(run)
+        session.flush()
+        job = Job(
+            site="site",
+            job_id="exact-only",
+            title="Security Engineer",
+            desc="Build controls.",
+            run_id=run.id,
+            is_active=True,
+            content_hash="fixed-source-hash",
+        )
+        session.add(job)
+        session.flush()
+        session.add(JobSwipe(job_pk=job.id, action="like"))
+        session.commit()
+        job_id = job.id
+
+    screen_tasks = []
+    detailed_tasks = []
+
+    def screen_worker(_resume, task, index):
+        screen_tasks.append(task)
+        return analyzer.JobResult(
+            task.id,
+            task.site,
+            task.job_id,
+            "screened_out",
+            None,
+            None,
+            0.0,
+            "",
+            index,
+            {"match_percentage": 20, "experience_match": "underqualified"},
+        )
+
+    def detail_worker(_resume, task, index):
+        detailed_tasks.append(task)
+        return analyzer.JobResult(
+            task.id,
+            task.site,
+            task.job_id,
+            "ok",
+            '{"match_percentage":20}',
+            {"ai_match_percentage": 20, "ai_analyzed_at": datetime.now()},
+            0.0,
+            "",
+            index,
+        )
+
+    monkeypatch.setattr(analyzer, "SessionLocal", factory)
+    monkeypatch.setattr(analyzer, "update_ai_refresh_stage", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(analyzer, "analyze_match_screen_worker", screen_worker)
+    monkeypatch.setattr(analyzer, "analyze_job_worker", detail_worker)
+
+    outcomes = analyzer.process_exact_ai_refresh(job_id, 1, "owner", "resume")
+
+    assert [task.job_id for task in screen_tasks] == ["exact-only"]
+    assert screen_tasks[0].cached_screen is None
+    assert [task.job_id for task in detailed_tasks] == ["exact-only"]
+    assert outcomes == {
+        "screening": "generated",
+        "detailed_analysis": "generated",
+        "fit_brief": "skipped_ineligible",
+        "application_prep": "skipped_ineligible",
+    }
+    with factory() as session:
+        job = session.get(Job, job_id)
+        screen = session.get(JobMatchScreen, job_id)
+        assert job.ai_match_percentage == 20
+        assert screen.match_percentage == 20
+
+
+def test_priority_refresh_failure_is_terminal_and_sanitized(monkeypatch, tmp_path):
+    _, factory = _database(tmp_path)
+    with factory() as session:
+        session.add(JobAIRefreshRequest(job_pk=7, status="queued"))
+        session.commit()
+
+    monkeypatch.setattr(analyzer, "SessionLocal", factory)
+    monkeypatch.setattr(
+        analyzer,
+        "process_exact_ai_refresh",
+        lambda *_args: (_ for _ in ()).throw(
+            RuntimeError("private resume and provider response")
+        ),
+    )
+
+    totals = analyzer.drain_priority_refresh_queue("private resume", preflight=False)
+
+    assert totals == {"processed": 0, "failed": 1}
+    with factory() as session:
+        refresh = session.get(JobAIRefreshRequest, 7)
+        assert refresh.status == "failed"
+        assert refresh.worker_token is None
+        assert refresh.lease_expires_at is None
+        assert refresh.error_text == "AI refresh failed unexpectedly"
+        assert "private" not in refresh.error_text
+
+
+def test_main_checks_priority_refresh_before_scheduled_queues(monkeypatch, tmp_path):
+    _, factory = _database(tmp_path)
+    resume = tmp_path / "resume.txt"
+    resume.write_text("resume", encoding="utf-8")
+    events = []
+
+    monkeypatch.setattr(analyzer, "SessionLocal", factory)
+    monkeypatch.setattr(analyzer, "RESUME_PATH", str(resume))
+    monkeypatch.setattr(analyzer, "init_db", lambda: None)
+    monkeypatch.setattr(
+        analyzer,
+        "parse_args",
+        lambda: SimpleNamespace(compensation_only=False, redo=None),
+    )
+    monkeypatch.setattr(
+        analyzer,
+        "drain_priority_refresh_queue",
+        lambda *_args, **_kwargs: events.append("priority") or {"processed": 0, "failed": 0},
+    )
+    monkeypatch.setattr(
+        analyzer,
+        "select_job_ids",
+        lambda *_args, **_kwargs: events.append("scheduled_selection") or [],
+    )
+    monkeypatch.setattr(
+        analyzer,
+        "run_application_prep_generation",
+        lambda **_kwargs: events.append("application_prep") or {},
+    )
+    monkeypatch.setattr(
+        analyzer,
+        "run_fit_brief_generation",
+        lambda *_args, **_kwargs: events.append("fit_brief") or {},
+    )
+    monkeypatch.setattr(analyzer, "publish_ai_processing_status", lambda **_kwargs: None)
+
+    analyzer.main()
+
+    assert events[0:2] == ["priority", "scheduled_selection"]
+    assert events.index("priority") < events.index("application_prep")
+    assert events.index("priority") < events.index("fit_brief")
 
 
 def test_dashboard_separates_screened_jobs_from_pending(monkeypatch, tmp_path):
@@ -143,17 +631,77 @@ def test_job_detail_status_and_reason_share_one_inline_element():
     status_end = template.index("</div>", status_start)
     status_markup = template[status_start:status_end]
 
+    assert 'class="ml-2"' in status_markup
     assert "selectedJob().is_active ? 'Active' : 'Inactive'" in status_markup
-    assert 'class="text-red-700"' in status_markup
     assert (
-        'x-show="selectedJob().application_prep_eligibility?.reason"'
+        "selectedJob().application_prep_eligibility?.reason ? ` - "
+        "${selectedJob().application_prep_eligibility.reason}` : ''"
         in status_markup
     )
-    assert 'x-text="` - ${selectedJob().application_prep_eligibility.reason}`"' in status_markup
-    assert (
-        'x-text="selectedJob().application_prep_eligibility?.reason"'
-        not in template
+    assert 'x-show="selectedJob().application_prep_eligibility?.reason"' not in status_markup
+    assert 'x-text="selectedJob().application_prep_eligibility?.reason"' not in template
+
+
+def test_stage1_screen_out_flows_into_dashboard_coverage(monkeypatch, tmp_path):
+    """Protect the producer/reporting contract when Stage 1 ends processing."""
+    engine, factory = _database(tmp_path)
+    resume = tmp_path / "resume.txt"
+    resume.write_text("resume", encoding="utf-8")
+    with factory() as session:
+        run = IntegrationRun(user="test", mode="steps")
+        session.add(run)
+        session.flush()
+        job = Job(site="site", job_id="screened", title="Screened role",
+                  desc="Role details", run_id=run.id)
+        session.add(job)
+        session.commit()
+        job_pk = job.id
+
+    monkeypatch.setattr(analyzer, "SessionLocal", factory)
+    monkeypatch.setattr(analyzer, "RESUME_PATH", str(resume))
+    monkeypatch.setattr(analyzer, "init_db", lambda: None)
+    monkeypatch.setattr(analyzer, "check_ollama_prerequisites", lambda: None)
+    monkeypatch.setattr(
+        analyzer, "parse_args",
+        lambda: SimpleNamespace(compensation_only=False, redo=None),
     )
+    monkeypatch.setattr(analyzer, "run_application_prep_generation", lambda **kwargs: {})
+    monkeypatch.setattr(analyzer, "run_fit_brief_generation", lambda *args, **kwargs: {})
+    monkeypatch.setattr(analyzer, "publish_ai_processing_status", lambda **kwargs: None)
+    monkeypatch.setattr(analyzer, "AI_CONCURRENCY", 1)
+    monkeypatch.setattr(analyzer, "AI_MAX_INFLIGHT", 1)
+    monkeypatch.setattr(analyzer, "ONLY_EMPTY", True)
+    monkeypatch.setattr(analyzer, "SITE_FILTER", "")
+    monkeypatch.setattr(analyzer, "LIMIT", 0)
+    monkeypatch.setattr(
+        analyzer,
+        "analyze_routed_job_worker",
+        lambda _resume, task, index: analyzer.JobResult(
+            task.id, task.site, task.job_id, "screened_out", None, None,
+            0.0, "", index,
+            {"match_percentage": 40, "experience_match": "qualified"},
+        ),
+    )
+
+    analyzer.main()
+
+    with factory() as session:
+        job = session.get(Job, job_pk)
+        screen = session.get(JobMatchScreen, job_pk)
+        assert job.ai_analysis is None
+        assert job.ai_match_percentage is None
+        assert screen.match_percentage == 40
+
+    monkeypatch.setattr(dashboard, "engine", engine)
+    monkeypatch.setattr(dashboard, "SessionLocal", factory)
+    report = dashboard.fetch_ollama_processing_report()
+
+    assert report["active_count"] == 1
+    assert report["processed_count"] == 1
+    assert report["final_count"] == 0
+    assert report["screened_count"] == 1
+    assert report["awaiting_count"] == 0
+    assert report["jobs"] == []
 
 
 def test_digest_distinguishes_screened_final_and_pending_without_inference(tmp_path):
@@ -360,14 +908,16 @@ def test_changed_retry_fingerprint_resets_failure_count(monkeypatch, tmp_path):
 
 def test_thinking_and_review_settings_change_retry_fingerprint(monkeypatch):
     task = analyzer.JobTask(1, "site", "job", "Title", "Description", "", 1, None)
-    original_think = analyzer.OLLAMA_THINK
+    original_think = analyzer.get_ai_profile("detail").think
     original_review = analyzer.AI_SECOND_PASS_REVIEW
     baseline = analyzer.analysis_retry_input_hash("resume", task)
 
-    monkeypatch.setattr(analyzer, "OLLAMA_THINK", "medium" if original_think != "medium" else "high")
+    monkeypatch.setenv(
+        "AI_DETAIL_THINK", "medium" if original_think != "medium" else "high"
+    )
     assert analyzer.analysis_retry_input_hash("resume", task) != baseline
 
-    monkeypatch.setattr(analyzer, "OLLAMA_THINK", original_think)
+    monkeypatch.setenv("AI_DETAIL_THINK", str(original_think))
     monkeypatch.setattr(analyzer, "AI_SECOND_PASS_REVIEW", not original_review)
     assert analyzer.analysis_retry_input_hash("resume", task) != baseline
 
@@ -458,6 +1008,22 @@ def test_empty_posting_does_not_consume_bounded_queue(monkeypatch, tmp_path):
     monkeypatch.setattr(analyzer, "analyze_routed_job_worker", worker)
     analyzer.main()
     assert submitted == ["valid"]
+
+
+def test_fit_brief_prompt_treats_compatible_remote_work_as_non_risk():
+    prompt = analyzer.render_fit_brief_system_prompt()
+
+    assert "Compatible remote work is not a risk" in prompt
+    assert "Prioritize the most consequential concerns" in prompt
+    assert "Use [] if none are meaningful" in prompt
+
+
+def test_fit_brief_prompt_uses_direct_unnamed_match_explanations():
+    prompt = analyzer.render_fit_brief_system_prompt()
+
+    assert "Do not refer to the applicant by name" in prompt
+    assert "explain the evidence-to-requirement connection directly" in prompt
+    assert "do not begin with or repeatedly use the applicant's name" in prompt
 
 
 def test_fit_brief_repair_explains_the_string_array_contract():

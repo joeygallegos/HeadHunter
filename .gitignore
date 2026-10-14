@@ -41,3 +41,4 @@ JobScrape.code-workspace
 /.pytest_cache/
 /.pytest-tmp*/
 /pytest-tmp*/
+/tmp/

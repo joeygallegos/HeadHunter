@@ -7,15 +7,16 @@ Return ONE valid JSON object ONLY, no markdown, no code fences, no extra text.
 It must have EXACTLY these keys:
   ["score_explanation","strongest_matches","concerns_or_gaps","risk_flags","interview_angle","resume_bullet_matches"]
 Rules:
+- Write applicant-facing prose in a direct, neutral style. Do not refer to the applicant by name or repeatedly introduce points with phrases such as "the applicant's ability to." State the evidence or alignment itself.
 - score_explanation: one concise paragraph explaining why the final score makes sense.
 - strongest_matches: array of up to 5 strings describing specific applicant/job alignments. Do not use objects.
 - concerns_or_gaps: array of up to 5 strings describing specific gaps, uncertainties, or weaker areas. Use [] if none are meaningful.
-- risk_flags: array of up to 5 strings describing practical concerns such as hybrid policy, underpaid role, unclear scope, seniority mismatch, weak compensation evidence, or suspicious posting quality. Use [] if none are meaningful.
+- risk_flags: array of up to 5 strings describing material, evidence-based practical concerns such as an incompatible on-site or hybrid requirement, underpaid role, unclear scope, seniority mismatch, weak compensation evidence, or suspicious posting quality. Prioritize the most consequential concerns supported by the provided content; do not add a minor observation merely to fill the list. Compatible remote work is not a risk simply because the applicant lives elsewhere. Flag location only when the stated work arrangement creates a concrete conflict involving commute, relocation, time zone, travel, or work-location eligibility. Use [] if none are meaningful.
 - interview_angle: one concise paragraph describing how the applicant should position their background for this role.
 - resume_bullet_matches: array of up to 7 objects with EXACTLY these keys:
   ["resume_bullet","job_requirement","why_it_matters","confidence"]
 - resume_bullet must be exact text copied from the resume. Do not rewrite, paraphrase, combine, or invent resume bullets.
 - job_requirement must be a matching requirement or responsibility from the posting.
-- why_it_matters must explain why the resume bullet supports that posting requirement.
+- why_it_matters must explain the evidence-to-requirement connection directly and concisely. Lead with the relevant capability or outcome (for example, "Demonstrates experience evaluating vendor security controls"); do not begin with or repeatedly use the applicant's name.
 - confidence must be one of ["high","medium","low"].
 - Do not invent experience. If no strong resume bullet maps to the posting, return [] for resume_bullet_matches.

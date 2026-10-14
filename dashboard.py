@@ -69,6 +69,7 @@ from app.models import (  # type: ignore
     JobChange,
     JobFitBrief,
     JobMatchScreen,
+    JobAIRefreshRequest,
     JobApplicationPrep,
     JobResumeVariant,
     ResumeSourceSettings,
@@ -80,6 +81,7 @@ from app.models import (  # type: ignore
     ensure_job_compensation_columns,
     ensure_job_fit_briefs_table,
     ensure_job_application_preps_table,
+    ensure_job_ai_refresh_requests_table,
     ensure_application_prep_settings_table,
     ensure_ai_processing_status_table,
     ensure_responsibilities_inventory_table,
@@ -87,6 +89,7 @@ from app.models import (  # type: ignore
     ensure_resume_source_settings_table,
 )
 from app.db import resolve_display_timezone, utc_now_naive
+from app.ai_profiles import generation_config_hash, load_job_profile
 from app.google_resume import (
     GoogleResumeClient,
     GoogleResumeError,
@@ -134,6 +137,33 @@ APPLICATION_PREP_SCHEMA_VERSION = 3
 APPLICATION_PREP_INVENTORY_MAX_TOKENS = max(
     0, int(os.getenv("APPLICATION_PREP_INVENTORY_MAX_TOKENS", "1200"))
 )
+FIT_BRIEF_SCHEMA_VERSION = 1
+FIT_BRIEF_SYSTEM_PROMPT_PATH = os.getenv(
+    "FIT_BRIEF_SYSTEM_PROMPT_PATH",
+    os.path.join(BASE_DIR, "prompts", "stage_3_fit_brief_system.txt"),
+)
+APPLICATION_PREP_SYSTEM_PROMPT_PATH = os.getenv(
+    "APPLICATION_PREP_SYSTEM_PROMPT_PATH",
+    os.path.join(BASE_DIR, "prompts", "application_prep_system.txt"),
+)
+
+
+def _fit_brief_config_hash() -> str:
+    """Mirror the processor fingerprint without importing its worker runtime."""
+    return generation_config_hash(
+        load_job_profile("fit_brief"),
+        FIT_BRIEF_SYSTEM_PROMPT_PATH,
+        FIT_BRIEF_SCHEMA_VERSION,
+    )
+
+
+def _application_prep_config_hash() -> str:
+    """Keep dashboard stale-state decisions aligned with the processor."""
+    return generation_config_hash(
+        load_job_profile("application_prep"),
+        APPLICATION_PREP_SYSTEM_PROMPT_PATH,
+        APPLICATION_PREP_SCHEMA_VERSION,
+    )
 
 
 def read_json_file(path: str, default: Any) -> Any:
@@ -469,6 +499,7 @@ def _ensure_reference_fields_column() -> None:
         ensure_job_compensation_columns(bind)
         ensure_job_fit_briefs_table(bind)
         ensure_job_application_preps_table(bind)
+        ensure_job_ai_refresh_requests_table(bind)
         ensure_application_prep_settings_table(bind)
         ensure_ai_processing_status_table(bind)
         ensure_responsibilities_inventory_table(bind)
@@ -2317,21 +2348,31 @@ def _application_prep_eligibility(j: Job, context: Dict[str, Any]) -> Dict[str, 
 
 
 def _fit_brief_job_hash(j: Job) -> str:
-    return j.content_hash or _stable_text_hash(
-        "|".join([j.title or "", j.desc or "", j.ai_analysis or ""])
+    return _stable_text_hash(
+        json.dumps(
+            [j.content_hash or "", j.title or "", j.desc or "", j.ai_analysis or ""],
+            ensure_ascii=False,
+        )
     )
 
 
 def _application_prep_job_hash(j: Job) -> str:
-    return j.content_hash or _stable_text_hash(
-        "|".join([j.title or "", j.desc or "", j.ai_analysis or ""])
+    return _stable_text_hash(
+        json.dumps(
+            [j.content_hash or "", j.title or "", j.desc or "", j.ai_analysis or ""],
+            ensure_ascii=False,
+        )
     )
 
 
 def _serialize_fit_brief(j: Job) -> Dict[str, Any]:
     brief = getattr(j, "fit_brief", None)
-    if brief is None:
-        eligible = bool(j.is_active) and (j.ai_match_percentage or 0) >= DASH_FIT_BRIEF_MIN_MATCH and bool((j.title or j.desc or "").strip())
+    eligible = (
+        bool(j.is_active)
+        and (j.ai_match_percentage or 0) >= DASH_FIT_BRIEF_MIN_MATCH
+        and bool((j.title or j.desc or "").strip())
+    )
+    if brief is None or not eligible:
         return {
             "available": False,
             "eligible": eligible,
@@ -2346,11 +2387,16 @@ def _serialize_fit_brief(j: Job) -> Dict[str, Any]:
     current_resume_hash = _current_resume_hash()
     stale_resume = bool(current_resume_hash) and brief.resume_hash != current_resume_hash
     stale_job = brief.job_content_hash != _fit_brief_job_hash(j)
+    stale_config = (
+        # A missing hash identifies output generated before profiles existed.
+        brief.schema_version != FIT_BRIEF_SCHEMA_VERSION
+        or brief.generation_config_hash != _fit_brief_config_hash()
+    )
     matches = payload.get("resume_bullet_matches") if isinstance(payload, dict) else []
     return {
         "available": True,
         "eligible": True,
-        "status": "stale" if (stale_resume or stale_job) else "current",
+        "status": "stale" if (stale_resume or stale_job or stale_config) else "current",
         "generated_at": _fmt_dt(getattr(brief, "generated_at", None)) or "",
         "schema_version": getattr(brief, "schema_version", None),
         "resume_bullet_count": len(matches) if isinstance(matches, list) else 0,
@@ -2373,6 +2419,7 @@ def _application_prep_status(
         (current_resume_hash and prep.resume_hash != current_resume_hash)
         or (prep.responsibilities_hash or "") != context["inventory_hash"]
         or prep.job_content_hash != _application_prep_job_hash(j)
+        or prep.generation_config_hash != _application_prep_config_hash()
         or prep.schema_version != APPLICATION_PREP_SCHEMA_VERSION
     ):
         return "stale"
@@ -2411,8 +2458,114 @@ def _serialize_application_prep(
     }
 
 
+def _serialize_ai_refresh_request(
+    refresh: Optional[JobAIRefreshRequest],
+) -> Optional[Dict[str, Any]]:
+    """Expose queue progress without leaking worker identity or provider errors."""
+    if refresh is None:
+        return None
+    outcomes = _safe_json_loads(getattr(refresh, "outcome_json", None))
+    return {
+        "status": (getattr(refresh, "status", None) or "queued").strip().lower(),
+        "request_generation": int(getattr(refresh, "request_generation", 1) or 1),
+        "current_stage": (getattr(refresh, "current_stage", None) or "").strip(),
+        "requested_at": _fmt_dt(getattr(refresh, "requested_at", None)) or "",
+        "started_at": _fmt_dt(getattr(refresh, "started_at", None)) or "",
+        "finished_at": _fmt_dt(getattr(refresh, "finished_at", None)) or "",
+        "outcomes": outcomes if isinstance(outcomes, dict) else {},
+        # Worker/provider exception text stays server-side. The UI only needs an
+        # actionable terminal state and can safely invite a retry.
+        "error_message": (
+            "AI refresh failed. You can retry this job."
+            if (getattr(refresh, "status", None) or "").strip().lower() == "failed"
+            else ""
+        ),
+    }
+
+
+def queue_job_ai_refresh(job_pk: int) -> Dict[str, Any]:
+    """Queue one job above normal AI work, coalescing duplicate active requests."""
+    _ensure_reference_fields_column()
+    with SessionLocal() as session:
+        job = session.get(Job, max(0, int(job_pk or 0)))
+        if job is None:
+            return {"ok": False, "status_code": 404, "error": "Job not found."}
+        if not bool(job.is_active):
+            return {
+                "ok": False,
+                "status_code": 409,
+                "error": "Inactive jobs cannot be refreshed.",
+            }
+        if not (job.title or "").strip() and not (job.desc or "").strip():
+            return {
+                "ok": False,
+                "status_code": 409,
+                "error": "This job needs a title or description before AI details can be refreshed.",
+            }
+
+        refresh = session.get(JobAIRefreshRequest, job.id)
+        active = refresh is not None and (refresh.status or "").strip().lower() in {
+            "queued",
+            "running",
+        }
+        if active:
+            return {
+                "ok": True,
+                "coalesced": True,
+                "refresh": _serialize_ai_refresh_request(refresh),
+            }
+
+        now = utc_now_naive()
+        if refresh is None:
+            refresh = JobAIRefreshRequest(
+                job_pk=job.id,
+                status="queued",
+                request_generation=1,
+                requested_at=now,
+            )
+            session.add(refresh)
+        else:
+            refresh.status = "queued"
+            refresh.request_generation = int(refresh.request_generation or 1) + 1
+            refresh.requested_at = now
+            refresh.started_at = None
+            refresh.finished_at = None
+            refresh.lease_expires_at = None
+            refresh.worker_token = None
+            refresh.current_stage = None
+            refresh.outcome_json = None
+            refresh.error_text = None
+        try:
+            session.commit()
+        except IntegrityError:
+            # Two dashboard hosts may accept the first click at the same time.
+            # The job primary key is the queue's deduplication boundary, so the
+            # loser treats the winning queued/running row as the same request.
+            session.rollback()
+            refresh = session.get(JobAIRefreshRequest, job.id)
+            if refresh is None or (refresh.status or "").strip().lower() not in {
+                "queued",
+                "running",
+            }:
+                raise
+            return {
+                "ok": True,
+                "coalesced": True,
+                "refresh": _serialize_ai_refresh_request(refresh),
+            }
+        session.refresh(refresh)
+        return {
+            "ok": True,
+            "coalesced": False,
+            "refresh": _serialize_ai_refresh_request(refresh),
+        }
+
+
 def _serialize_job_detail(
-    j: Job, changes: List[JobChange], context: Optional[Dict[str, Any]] = None
+    j: Job,
+    changes: List[JobChange],
+    context: Optional[Dict[str, Any]] = None,
+    ai_refresh: Optional[JobAIRefreshRequest] = None,
 ) -> Dict[str, Any]:
     context = context or {
         "minimum_match_percentage": APPLICATION_PREP_DEFAULT_MIN_MATCH,
@@ -2446,6 +2599,7 @@ def _serialize_job_detail(
         "swipe_action": getattr(getattr(j, "swipe", None), "action", None) or "",
         "application_prep_eligibility": _application_prep_eligibility(j, context),
         "application_prep": _serialize_application_prep(j, context),
+        "ai_refresh": _serialize_ai_refresh_request(ai_refresh),
         "changes": [_serialize_change(c) for c in changes],
     }
 
@@ -3711,7 +3865,11 @@ def fetch_job_lookup(query: str, limit: int = 25) -> Dict[str, Any]:
                 .scalars()
                 .all()
             )
-            out.append(_serialize_job_detail(job, changes, context))
+            out.append(
+                _serialize_job_detail(
+                    job, changes, context, session.get(JobAIRefreshRequest, job.id)
+                )
+            )
 
     return {"query": q, "returned": len(out), "exact": bool(exact_jobs), "jobs": out}
 
@@ -3742,7 +3900,9 @@ def fetch_job_detail_by_id(job_pk: int) -> Dict[str, Any]:
         return {
             "id": job_pk,
             "found": True,
-            "job": _serialize_job_detail(job, changes, context),
+            "job": _serialize_job_detail(
+                job, changes, context, session.get(JobAIRefreshRequest, job.id)
+            ),
         }
 
 
@@ -3780,7 +3940,9 @@ def fetch_job_detail_by_identity(site: str, job_id: str) -> Dict[str, Any]:
             "site": site,
             "job_id": job_id,
             "found": True,
-            "job": _serialize_job_detail(job, changes, context),
+            "job": _serialize_job_detail(
+                job, changes, context, session.get(JobAIRefreshRequest, job.id)
+            ),
         }
 
 
@@ -3893,6 +4055,19 @@ def api_job_move_forward(job_pk: int):
         return jsonify(result)
     except Exception as exc:
         return jsonify(error=str(exc)), 500
+
+
+@app.route("/api/jobs/<int:job_pk>/refresh-ai", methods=["POST"])
+def api_job_refresh_ai(job_pk: int):
+    """Enqueue a highest-priority full AI refresh; generation runs elsewhere."""
+    try:
+        result = queue_job_ai_refresh(job_pk)
+        if not result.get("ok"):
+            return jsonify(error=result["error"]), int(result["status_code"])
+        return jsonify(result), 202
+    except Exception:
+        # Do not send database or queue internals to a browser response.
+        return jsonify(error="Could not queue the AI refresh. Please retry."), 500
 
 
 @app.route("/api/interesting/jobs")

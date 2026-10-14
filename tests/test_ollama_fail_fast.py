@@ -11,7 +11,83 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 import analyze_jobs_ollama as analyzer
+from app.ai_profiles import generation_config_hash, load_job_profile
 from app.models import Base, Job
+
+
+def test_detail_profile_uses_legacy_settings_until_overridden(monkeypatch) -> None:
+    monkeypatch.setenv("OLLAMA_MODEL", "baseline-model")
+    monkeypatch.setenv("OLLAMA_NUM_CTX", "4096")
+    monkeypatch.setenv("OLLAMA_NUM_PREDICT", "600")
+    monkeypatch.setenv("AI_THINKING_RETRY_NUM_PREDICT", "1200")
+    monkeypatch.setenv("OLLAMA_THINK", "high")
+    for suffix in (
+        "MODEL",
+        "THINK",
+        "NUM_CTX",
+        "NUM_PREDICT",
+        "RETRY_NUM_PREDICT",
+        "TEMPERATURE",
+        "TIMEOUT_SEC",
+        "MAX_ATTEMPTS",
+    ):
+        monkeypatch.delenv(f"AI_DETAIL_{suffix}", raising=False)
+
+    baseline = load_job_profile("detail")
+    assert (baseline.model, baseline.num_ctx, baseline.num_predict) == (
+        "baseline-model", 4096, 600
+    )
+    assert (baseline.retry_num_predict, baseline.think) == (1200, "high")
+
+    monkeypatch.setenv("AI_DETAIL_MODEL", "detail-model")
+    monkeypatch.setenv("AI_DETAIL_NUM_CTX", "8192")
+    monkeypatch.setenv("AI_DETAIL_THINK", "false")
+    overridden = load_job_profile("detail")
+    assert (overridden.model, overridden.num_ctx, overridden.think) == (
+        "detail-model", 8192, False
+    )
+    assert overridden.num_predict == 600
+
+
+def test_specialized_profiles_preserve_existing_defaults(monkeypatch) -> None:
+    monkeypatch.setenv("OLLAMA_NUM_CTX", "32768")
+    monkeypatch.setenv("OLLAMA_NUM_PREDICT", "6144")
+    monkeypatch.setenv("AI_THINKING_RETRY_NUM_PREDICT", "12288")
+    monkeypatch.setenv("OLLAMA_THINK", "high")
+    for key in (
+        "AI_SCREEN_THINK",
+        "AI_SCREEN_NUM_PREDICT",
+        "AI_SCREEN_RETRY_NUM_PREDICT",
+        "APPLICATION_PREP_THINK",
+        "APPLICATION_PREP_NUM_CTX",
+        "APPLICATION_PREP_NUM_PREDICT",
+        "APPLICATION_PREP_RETRY_NUM_PREDICT",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    screen = load_job_profile("screen")
+    prep = load_job_profile("application_prep")
+    assert (screen.think, screen.num_predict, screen.retry_num_predict) == (
+        False,
+        512,
+        2048,
+    )
+    assert (prep.think, prep.num_ctx, prep.num_predict, prep.retry_num_predict) == (
+        False, 65536, 6144, 12288
+    )
+
+
+def test_generation_hash_changes_with_prompt_or_profile(monkeypatch, tmp_path) -> None:
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("first prompt", encoding="utf-8")
+    baseline = generation_config_hash(load_job_profile("fit_brief"), str(prompt), 1)
+
+    prompt.write_text("updated prompt", encoding="utf-8")
+    assert generation_config_hash(load_job_profile("fit_brief"), str(prompt), 1) != baseline
+
+    prompt.write_text("first prompt", encoding="utf-8")
+    monkeypatch.setenv("AI_FIT_BRIEF_TEMPERATURE", "0.4")
+    assert generation_config_hash(load_job_profile("fit_brief"), str(prompt), 1) != baseline
 
 
 class _Response:
@@ -54,7 +130,11 @@ def test_second_pass_reuses_experience_fit_calibration() -> None:
 def test_preflight_accepts_installed_model_and_latest_alias(
     monkeypatch: pytest.MonkeyPatch, configured: str, installed: str
 ) -> None:
-    monkeypatch.setattr(analyzer, "OLLAMA_MODEL", configured)
+    monkeypatch.setattr(
+        analyzer,
+        "get_ai_profiles",
+        lambda: {"detail": SimpleNamespace(model=configured)},
+    )
     monkeypatch.setattr(
         analyzer.urllib.request,
         "urlopen",
@@ -85,6 +165,11 @@ def test_preflight_starts_ollama_after_unreachable_server(
     calls = 0
     popen_calls: list[list[str]] = []
     messages: list[str] = []
+    monkeypatch.setattr(
+        analyzer,
+        "get_ai_profiles",
+        lambda: {"detail": SimpleNamespace(model=analyzer.OLLAMA_MODEL)},
+    )
 
     def fail(*_args: object, **_kwargs: object) -> None:
         nonlocal calls
@@ -158,7 +243,11 @@ def test_preflight_reports_http_status_without_response_body(
 def test_preflight_reports_exact_pull_command_for_missing_model(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(analyzer, "OLLAMA_MODEL", "deepseek-r1:8b")
+    monkeypatch.setattr(
+        analyzer,
+        "get_ai_profiles",
+        lambda: {"detail": SimpleNamespace(model="deepseek-r1:8b")},
+    )
     monkeypatch.setattr(
         analyzer.urllib.request,
         "urlopen",
@@ -573,7 +662,9 @@ def test_screen_routes_only_relevant_jobs_to_detail(monkeypatch, score):
     monkeypatch.setattr(analyzer, "analyze_job_worker", detailed)
     task = analyzer.JobTask(1, "site", "job", "Engineer", "Requirements", "", 1, None)
     result = analyzer.analyze_routed_job_worker("resume", task, 1)
-    assert calls[0] == {"num_predict": analyzer.AI_SCREEN_NUM_PREDICT, "think": False}
+    screen_profile = analyzer.get_ai_profile("screen")
+    assert calls[0]["num_predict"] == screen_profile.num_predict
+    assert calls[0]["profile"] == screen_profile
     assert ("detail" in calls) == (score >= 75)
     assert result.status == ("ok" if score >= 75 else "screened_out")
     assert result.screen_payload["match_percentage"] == score
@@ -622,7 +713,7 @@ def test_screen_hash_tracks_evidence_but_not_routing_threshold(monkeypatch):
     task.desc = "New requirements"
     assert analyzer.screen_input_hash("resume", task) != original
     task.desc = "Requirements"
-    monkeypatch.setattr(analyzer, "OLLAMA_MODEL", "different-model")
+    monkeypatch.setenv("AI_SCREEN_MODEL", "different-model")
     assert analyzer.screen_input_hash("resume", task) != original
 
 

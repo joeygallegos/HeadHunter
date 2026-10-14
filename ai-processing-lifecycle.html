@@ -19,14 +19,54 @@
 
     h1 { margin-bottom: 0.25rem; }
     .lede { margin-top: 0; max-width: 75ch; }
-    .diagram { overflow-x: auto; padding: 1rem 0; }
-    .diagram svg { min-width: 720px; }
-    .diagram-tools { display: flex; align-items: center; flex-wrap: wrap; gap: 0.5rem; }
+    .diagram {
+      overflow: auto;
+      padding: 1rem;
+      border: 1px solid #cbd5e1;
+      border-radius: 0.5rem;
+      background: #fff;
+      box-shadow: 0 1px 2px rgb(15 23 42 / 8%);
+    }
+    .diagram:focus-visible { outline: 3px solid #2563eb; outline-offset: 2px; }
+    .diagram svg {
+      display: block;
+      width: 100%;
+      /* Width-based zoom enlarges the scrollable layout; transforms would clip the chart visually. */
+      max-width: none !important;
+      height: auto;
+      margin: 0 auto;
+    }
+    .diagram-tools {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+      margin: 0.5rem 0;
+    }
     .diagram-tools button, .diagram-tools input { font: inherit; }
-    .diagram-tools output { min-width: 3.5rem; }
-    #analysis-diagram svg { min-width: 1050px; }
+    .diagram-tools button {
+      min-height: 2.25rem;
+      padding: 0.35rem 0.7rem;
+      border: 1px solid #94a3b8;
+      border-radius: 0.35rem;
+      background: #f8fafc;
+      color: #0f172a;
+      cursor: pointer;
+    }
+    .diagram-tools button:hover { background: #e2e8f0; }
+    .diagram-tools button:focus-visible,
+    .diagram-tools input:focus-visible { outline: 3px solid #2563eb; outline-offset: 2px; }
+    .diagram-tools input { accent-color: #2563eb; }
+    .diagram-tools output { min-width: 3.5rem; font-variant-numeric: tabular-nums; }
+    .diagram-help { color: #475569; font-size: 0.9rem; }
     .notes { max-width: 95ch; }
     code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+
+    @media (prefers-color-scheme: dark) {
+      .diagram { border-color: #475569; }
+      .diagram-tools button { border-color: #64748b; }
+      .diagram-help { color: #cbd5e1; }
+    }
   </style>
 </head>
 <body>
@@ -39,6 +79,38 @@
 
     <!-- These diagrams describe the implemented processor. Future proposals are listed separately.
          Mermaid renders in the browser; the CDN import requires internet access. -->
+    <h2>At a glance: AI decision tree</h2>
+    <div class="diagram">
+      <pre class="mermaid">
+flowchart TD
+    Start([Active job selected]) --> Cached{Fresh valid screen?}
+    Cached -->|No| Screen[AI Stage 1 screens job fit]
+    Cached -->|Yes| ScoreGate{Screen score meets detail threshold?}
+    Screen --> ScoreGate
+    ScoreGate -->|No| Deferred[Keep job searchable; defer detail]
+    ScoreGate -->|Yes| Detail[AI Stage 2 creates detailed analysis]
+    Detail --> DetailValid{Detailed result valid?}
+    DetailValid -->|No| Retry[Preserve existing fields; retry later]
+    DetailValid -->|Yes| BriefGate{Final score meets Fit Brief threshold?}
+    BriefGate -->|No| Dashboard[Dashboard review]
+    BriefGate -->|Yes| Brief[AI Stage 3 generates Fit Brief]
+    Brief --> Dashboard
+    Dashboard --> Forward{User chooses Move forward?}
+    Forward -->|No| Hold[Save for review or pass]
+    Forward -->|Yes| Prep[AI drafts grounded Application Prep]
+    Prep --> Approve{User approves selected changes?}
+    Approve -->|No| NoArtifact[No application artifact created]
+    Approve -->|Yes| Artifact[Create resume variant and optional PDF]
+
+    classDef ai fill:#ede9fe,stroke:#7c3aed,color:#111827;
+    classDef data fill:#ccfbf1,stroke:#0f766e,color:#111827;
+    classDef human fill:#fef3c7,stroke:#d97706,color:#111827;
+    class Screen,Detail,Brief,Prep ai;
+    class Deferred,Retry,Hold,NoArtifact,Artifact data;
+    class Dashboard,Forward,Approve human;
+      </pre>
+    </div>
+
     <h2>1. Optional job-board discovery</h2>
     <div class="diagram">
       <pre class="mermaid">
@@ -62,18 +134,15 @@ flowchart LR
       </pre>
     </div>
 
+    <!-- Keep the dense analysis lifecycle in consecutive stages so each visual answers one
+         routing question without dropping the cache, retry, preservation, or score-gate rules. -->
     <h2>2. Job analysis and Fit Brief generation</h2>
-    <div class="diagram-tools" aria-label="Analysis diagram zoom controls">
-      <button type="button" data-zoom-action="out" aria-controls="analysis-diagram">Zoom out</button>
-      <label for="analysis-zoom">Zoom</label>
-      <input id="analysis-zoom" type="range" min="70" max="200" value="150" step="10">
-      <output id="analysis-zoom-value" for="analysis-zoom" aria-live="polite">150%</output>
-      <button type="button" data-zoom-action="in" aria-controls="analysis-diagram">Zoom in</button>
-      <button type="button" data-zoom-action="reset" aria-controls="analysis-diagram">Reset</button>
-    </div>
-    <div class="diagram" id="analysis-diagram" aria-label="Job analysis and Fit Brief lifecycle diagram">
+    <p class="lede">Follow the three stages in order. Each diagram ends where the next one begins.</p>
+
+    <h3>2a. Select and screen jobs</h3>
+    <div class="diagram" id="analysis-screening-diagram">
       <pre class="mermaid">
-flowchart LR
+flowchart TD
     Jobs[(Jobs database)] --> Select[Active jobs without final analysis: oldest first]
     Resume[Configured resume text] --> Fingerprint[Fingerprint evidence, prompt, model and limits]
     Select --> Fingerprint
@@ -86,35 +155,63 @@ flowchart LR
     Redo[Explicit --redo N: newest first] --> Ready
     Ready -->|No| Stop[Stop batch: preserve existing final fields]
     Ready -->|Normal uncached job| Screen[Stage 1: score and experience fit; request thinking off]
-    Ready -->|Cached qualifying job or redo| Match[Stage 2: detailed fit and compensation]
+    Ready -->|Cached qualifying job or redo| DetailNext([Continue to detailed analysis])
     Screen --> ScreenValid{Strict screen JSON valid?}
     ScreenValid -->|No| Retry[At most two attempts; leave failures pending]
     Retry --> Preserve[Preserve existing final analysis and source Pay]
     ScreenValid -->|Yes| Route{Score at least AI_DEEP_ANALYSIS_MIN_MATCH?}
     Route -->|No: default below 75| Deferred
-    Route -->|Yes: default 75 or higher| Match
+    Route -->|Yes: default 75 or higher| DetailNext
     Route -. Valid screen saved with worker result .-> Cache
+    Deferred --> Searchable[Job remains searchable without a new final score]
+    Searchable --> Dashboard[Dashboard review]
+
+    classDef ai fill:#ede9fe,stroke:#7c3aed,color:#111827;
+    classDef data fill:#ccfbf1,stroke:#0f766e,color:#111827;
+    classDef human fill:#fef3c7,stroke:#d97706,color:#111827;
+    class Screen ai;
+    class Jobs,Cache data;
+    class Dashboard human;
+      </pre>
+    </div>
+
+    <h3>2b. Create and validate detailed analysis</h3>
+    <div class="diagram" id="analysis-detail-diagram">
+      <pre class="mermaid">
+flowchart TD
+    DetailStart([Qualifying screen or explicit redo]) --> Match[Stage 2: detailed fit and compensation]
     Match --> InitialValid{Detailed JSON valid?}
     InitialValid -->|No| DetailRetry[Configured detail retries; retain valid screen]
-    DetailRetry --> Preserve
+    DetailRetry --> Preserve[Preserve existing final analysis and source Pay]
     InitialValid -->|Yes| Review[Optional private review of detailed JSON]
     Review --> Reviewed{Valid review available?}
     Reviewed -->|Yes| Store[Store reviewed analysis, compensation and audit change]
     Reviewed -->|No| Fallback[Keep valid detailed result]
     Fallback --> Store
-    Store --> Eligible{Final score meets Fit Brief threshold?}
+    Store --> BriefNext([Continue to Fit Brief decision])
+
+    classDef ai fill:#ede9fe,stroke:#7c3aed,color:#111827;
+    classDef data fill:#ccfbf1,stroke:#0f766e,color:#111827;
+    class Match,Review ai;
+    class Store data;
+      </pre>
+    </div>
+
+    <h3>2c. Decide whether to generate a Fit Brief</h3>
+    <div class="diagram" id="analysis-brief-diagram">
+      <pre class="mermaid">
+flowchart TD
+    Analysis[(Stored final analysis)] --> Eligible{Final score meets Fit Brief threshold?}
     Eligible -->|Yes: default 75 or higher| Brief[Stage 3: generate and validate Fit Brief]
     Brief --> BriefStore[(job_fit_briefs)]
     Eligible -->|No| Dashboard[Dashboard review]
     BriefStore --> Dashboard
-    Deferred --> Searchable[Job remains searchable without a new final score]
-    Searchable --> Dashboard
 
     classDef ai fill:#ede9fe,stroke:#7c3aed,color:#111827;
     classDef data fill:#ccfbf1,stroke:#0f766e,color:#111827;
     classDef human fill:#fef3c7,stroke:#d97706,color:#111827;
-    class Screen,Match,Review,Brief ai;
-    class Jobs,Cache,Store,BriefStore data;
+    class Brief ai;
+    class Analysis,BriefStore data;
     class Dashboard human;
       </pre>
     </div>
@@ -207,32 +304,76 @@ flowchart LR
 
     await mermaid.run({ nodes: document.querySelectorAll(".mermaid") });
 
-    const analysisDiagram = document.getElementById("analysis-diagram");
-    const analysisZoom = document.getElementById("analysis-zoom");
-    const analysisZoomValue = document.getElementById("analysis-zoom-value");
-    const defaultZoom = 150;
+    const defaultZoom = 100;
+    const minZoom = 70;
+    const maxZoom = 200;
 
-    function setAnalysisZoom(value) {
-      const zoom = Math.max(70, Math.min(200, Number(value)));
-      const svg = analysisDiagram.querySelector("svg");
+    // Every Mermaid chart gets the same progressively enhanced viewer. Keeping the controls
+    // generated here prevents one diagram from drifting into a different interaction pattern.
+    document.querySelectorAll(".diagram").forEach((diagram, index) => {
+      const svg = diagram.querySelector("svg");
       if (!svg) return;
-      svg.style.width = `${zoom}%`;
-      analysisZoom.value = String(zoom);
-      analysisZoomValue.value = `${zoom}%`;
-      analysisZoomValue.textContent = `${zoom}%`;
-    }
 
-    analysisZoom.addEventListener("input", () => setAnalysisZoom(analysisZoom.value));
-    document.querySelectorAll("[data-zoom-action]").forEach((button) => {
-      button.addEventListener("click", () => {
+      const diagramNumber = index + 1;
+      const diagramId = diagram.id || `diagram-${diagramNumber}`;
+      const zoomId = `${diagramId}-zoom`;
+      const helpId = `${diagramId}-help`;
+      // Resolve the visible section heading before inserting the toolbar so it remains the
+      // accessible name for the viewport even if helper content is later added between them.
+      let heading = diagram.previousElementSibling;
+      while (heading && !/^H[1-6]$/.test(heading.tagName)) heading = heading.previousElementSibling;
+      const headingId = heading?.id || `${diagramId}-heading`;
+
+      diagram.id = diagramId;
+      diagram.tabIndex = 0;
+      diagram.setAttribute("role", "region");
+      if (heading) {
+        heading.id = headingId;
+        diagram.setAttribute("aria-labelledby", headingId);
+        diagram.removeAttribute("aria-label");
+      }
+      diagram.setAttribute("aria-describedby", helpId);
+
+      const controls = document.createElement("div");
+      controls.className = "diagram-tools";
+      controls.setAttribute("aria-label", `${heading?.textContent || `Diagram ${diagramNumber}`} view controls`);
+      controls.innerHTML = `
+        <button type="button" data-zoom-action="out" aria-controls="${diagramId}">Zoom out</button>
+        <label for="${zoomId}">Zoom</label>
+        <input id="${zoomId}" type="range" min="${minZoom}" max="${maxZoom}" value="${defaultZoom}" step="10">
+        <output for="${zoomId}" aria-live="polite">${defaultZoom}%</output>
+        <button type="button" data-zoom-action="in" aria-controls="${diagramId}">Zoom in</button>
+        <button type="button" data-zoom-action="fit" aria-controls="${diagramId}">Fit</button>
+        <span class="diagram-help" id="${helpId}">Fit shows the whole chart; zoom in, then scroll to inspect.</span>
+      `;
+      diagram.before(controls);
+
+      const zoomInput = controls.querySelector("input");
+      const zoomOutput = controls.querySelector("output");
+
+      function setZoom(value) {
+        const zoom = Math.max(minZoom, Math.min(maxZoom, Number(value)));
+        // Change the SVG's layout width so enlarged content remains reachable with native
+        // horizontal scrolling and keyboard navigation inside the focused viewport.
+        svg.style.width = `${zoom}%`;
+        zoomInput.value = String(zoom);
+        zoomOutput.value = `${zoom}%`;
+        zoomOutput.textContent = `${zoom}%`;
+        if (zoom === defaultZoom) diagram.scrollLeft = 0;
+      }
+
+      zoomInput.addEventListener("input", () => setZoom(zoomInput.value));
+      controls.addEventListener("click", (event) => {
+        const button = event.target.closest("[data-zoom-action]");
+        if (!button) return;
         const action = button.dataset.zoomAction;
-        const nextZoom = action === "in" ? Number(analysisZoom.value) + 10
-          : action === "out" ? Number(analysisZoom.value) - 10
+        const nextZoom = action === "in" ? Number(zoomInput.value) + 10
+          : action === "out" ? Number(zoomInput.value) - 10
           : defaultZoom;
-        setAnalysisZoom(nextZoom);
+        setZoom(nextZoom);
       });
+      setZoom(defaultZoom);
     });
-    setAnalysisZoom(defaultZoom);
   </script>
 </body>
 </html>

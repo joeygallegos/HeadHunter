@@ -457,7 +457,8 @@ def test_dashboard_creates_resume_variant_pdf_with_validated_pairs(monkeypatch, 
                 prep_json=dashboard.json.dumps(prep_payload),
                 resume_hash="resume-hash",
                 responsibilities_hash="",
-                job_content_hash="job-hash",
+                job_content_hash=dashboard._application_prep_job_hash(job),
+                generation_config_hash=dashboard._application_prep_config_hash(),
                 schema_version=dashboard.APPLICATION_PREP_SCHEMA_VERSION,
             )
         )
@@ -595,7 +596,8 @@ def test_dashboard_builds_swap_analysis_from_synced_baseline_and_prep(monkeypatc
                 prep_json=dashboard.json.dumps(prep_payload),
                 resume_hash="resume-hash",
                 responsibilities_hash="",
-                job_content_hash="job-hash",
+                job_content_hash=dashboard._application_prep_job_hash(job),
+                generation_config_hash=dashboard._application_prep_config_hash(),
                 schema_version=dashboard.APPLICATION_PREP_SCHEMA_VERSION,
             )
         )
@@ -681,7 +683,8 @@ def test_dashboard_swap_analysis_keeps_already_strong_baseline_bullet(monkeypatc
                 prep_json=dashboard.json.dumps(prep_payload),
                 resume_hash="resume-hash",
                 responsibilities_hash="",
-                job_content_hash="job-hash",
+                job_content_hash=dashboard._application_prep_job_hash(job),
+                generation_config_hash=dashboard._application_prep_config_hash(),
                 schema_version=dashboard.APPLICATION_PREP_SCHEMA_VERSION,
             )
         )
@@ -760,7 +763,8 @@ def test_dashboard_rejects_stale_resume_swap_analysis_hash(monkeypatch) -> None:
                 prep_json=dashboard.json.dumps(prep_payload),
                 resume_hash="resume-hash",
                 responsibilities_hash="",
-                job_content_hash="job-hash",
+                job_content_hash=dashboard._application_prep_job_hash(job),
+                generation_config_hash=dashboard._application_prep_config_hash(),
                 schema_version=dashboard.APPLICATION_PREP_SCHEMA_VERSION,
             )
         )
@@ -855,7 +859,8 @@ def test_dashboard_requires_resume_swap_analysis_hash_before_saving(monkeypatch)
                 prep_json=dashboard.json.dumps(prep_payload),
                 resume_hash="resume-hash",
                 responsibilities_hash="",
-                job_content_hash="job-hash",
+                job_content_hash=dashboard._application_prep_job_hash(job),
+                generation_config_hash=dashboard._application_prep_config_hash(),
                 schema_version=dashboard.APPLICATION_PREP_SCHEMA_VERSION,
             )
         )
