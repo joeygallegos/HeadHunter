@@ -405,15 +405,21 @@ def _job_change_details(
 
 
 def _normalize_job(site: str, run_id: int, job_data: Dict[str, Any]) -> Job | None:
-    job_id = _norm_text(str(job_data.get("JobID", "")))
+    def _field_text(name: str) -> str:
+        # JSON APIs commonly use null for absent values. Treat it as empty so a
+        # missing identifier never becomes a real job whose ID is the text "None".
+        value = job_data.get(name, "")
+        return _norm_text("" if value is None else str(value))
+
+    job_id = _field_text("JobID")
     job_id = job_id.strip()
     if not job_id:
         return None
 
-    title = _norm_text(str(job_data.get("JobTitle", "")))
-    url = _norm_text(str(job_data.get("JobUrl", "")))
+    title = _field_text("JobTitle")
+    url = _field_text("JobUrl")
     # Persist readable text even when a JSON API provides an HTML description.
-    desc = _norm_text(html_to_text(str(job_data.get("JobDesc", ""))))
+    desc = _norm_text(html_to_text(_field_text("JobDesc")))
 
     # Make keywords stable across runs (avoid reorder-triggered updates)
     kw = extract_keywords(desc) or []
@@ -423,11 +429,12 @@ def _normalize_job(site: str, run_id: int, job_data: Dict[str, Any]) -> Job | No
     level = get_job_level(title)
 
     # Prefer source-provided pay fields; description scanning is only a fallback.
-    explicit_pay = _norm_text(str(job_data.get("JobPay", "")))
+    explicit_pay = _field_text("JobPay")
     reference_pay_values = [
         _norm_text(str(value))
         for key, value in job_data.items()
-        if key not in {"JobPay", "JobDesc"}
+        if value is not None
+        and key not in {"JobPay", "JobDesc"}
         and any(part in str(key).lower() for part in ("salary", "pay", "compensation"))
     ]
     compensation = choose_deterministic_compensation(
@@ -492,6 +499,14 @@ def _process_site(
         os.makedirs(OUTPUT_DIR, exist_ok=True)
         save_site_json(OUTPUT_DIR, site, jobs_raw)
 
+    if not jobs_raw:
+        # An empty extraction is not proof that every previously known job was
+        # removed. Fail closed here to avoid a cleanup filter deactivating a site.
+        site_log.warning(
+            "no usable jobs after preprocessing; skipping database persistence"
+        )
+        return
+
     # Load existing jobs for the site, keyed by canonical job_id
     existing_rows = s.execute(select(Job).where(Job.site == site)).scalars().all()
     existing_by_cid: Dict[str, Job] = {
@@ -513,6 +528,9 @@ def _process_site(
         )
 
     def _run_op(op_fn, row_log, on_integrity=None):
+        # Each operation changes counters before SQLAlchemy reaches its transaction
+        # boundary. Both commits and savepoints therefore need the same snapshot.
+        counters_before_op = counters.copy()
         if per_job_commit:
             try:
                 op_fn()
@@ -520,6 +538,7 @@ def _process_site(
                 return True
             except IntegrityError:
                 s.rollback()
+                counters.update(counters_before_op)
                 counters["error_count"] += 1
                 row_log.exception("integrity error")
                 if on_integrity:
@@ -527,6 +546,7 @@ def _process_site(
                 return False
             except Exception:
                 s.rollback()
+                counters.update(counters_before_op)
                 counters["error_count"] += 1
                 row_log.exception("row operation failed")
                 return False
@@ -537,12 +557,14 @@ def _process_site(
                     op_fn()
                 return True
             except IntegrityError:
+                counters.update(counters_before_op)
                 counters["error_count"] += 1
                 row_log.exception("integrity error (savepoint)")
                 if on_integrity:
                     on_integrity()
                 return False
             except Exception:
+                counters.update(counters_before_op)
                 counters["error_count"] += 1
                 row_log.exception("row operation failed (savepoint)")
                 return False
@@ -564,8 +586,18 @@ def _process_site(
             row_log.exception("row operation failed (no sp)")
             return False
 
+    saw_valid_job_id = False
     for jd in jobs_raw:
-        job_id_text = _norm_text(str(jd.get("JobID", ""))) or "-"
+        if not isinstance(jd, dict):
+            # Scraper output is external input. Skip malformed placeholders without
+            # logging their potentially sensitive contents or aborting later rows.
+            counters["error_count"] += 1
+            site_log.warning(
+                "skip row: expected object, got %s", type(jd).__name__
+            )
+            continue
+        raw_job_id = jd.get("JobID", "")
+        job_id_text = _norm_text("" if raw_job_id is None else str(raw_job_id)) or "-"
         row_log = get_logger(run_id=run_id, site=site, job_id=job_id_text)
 
         try:
@@ -583,6 +615,7 @@ def _process_site(
             row_log.warning("skip row: missing JobID")
             continue
 
+        saw_valid_job_id = True
         counters["total_seen"] += 1
 
         cid = _canon_job_id(job_obj.job_id)
@@ -617,7 +650,6 @@ def _process_site(
             )
             counters["inserted_count"] += 1
             row_log.info("inserted")
-            existing_by_cid[cid] = job_obj
 
         def _update_existing(target: Job):
             old_hash = target.content_hash
@@ -686,7 +718,11 @@ def _process_site(
                 else:
                     _run_op(lambda: _touch_existing(existing), row_log)
 
-            _run_op(_insert_job, row_log, on_integrity=_on_insert_integrity)
+            if _run_op(_insert_job, row_log, on_integrity=_on_insert_integrity):
+                # Do not cache an inserted ORM object until its transaction is
+                # durable. After rollback SQLAlchemy makes it transient, and a
+                # duplicate later in the same scrape must retry the insert.
+                existing_by_cid[cid] = job_obj
             continue
 
         # Existing row path
@@ -694,6 +730,14 @@ def _process_site(
             _run_op(lambda: _update_existing(prev), row_log)
         else:
             _run_op(lambda: _touch_existing(prev), row_log)
+
+    if not saw_valid_job_id:
+        # Invalid output usually means a selector or upstream schema changed. It is
+        # safer to retain old rows than to interpret malformed output as removals.
+        site_log.warning(
+            "no valid job IDs extracted; skipping missing-job deactivation"
+        )
+        return
 
     # Mark missing: anything previously active that we did NOT see this run
     if missing_cids:
@@ -818,7 +862,7 @@ def main():
                     )
         return
 
-    commit_mode = os.getenv("DB_COMMIT_MODE", "all_at_end").lower()
+    commit_mode = os.getenv("DB_COMMIT_MODE", "all_at_end").strip().lower()
     if commit_mode not in {"all_at_end", "per_site", "per_job"}:
         base_log.warning(
             "invalid DB_COMMIT_MODE=%s; defaulting to all_at_end", commit_mode
@@ -901,6 +945,7 @@ def main():
                     site_log.info("skip empty site")
                     continue
                 site_log.info("begin site transaction")
+                counters_before_site = counters.copy()
                 try:
                     with SessionLocal.begin() as s:
                         with Timer(f"persist {site}", logger=run_log, site=site):
@@ -923,6 +968,11 @@ def main():
                         counters["error_count"],
                     )
                 except Exception:
+                    # The context manager can fail while committing after every row
+                    # savepoint succeeded. Restore the entire site's speculative
+                    # counts because the outer transaction was rolled back.
+                    counters.update(counters_before_site)
+                    counters["error_count"] += 1
                     site_log.exception("rollback site transaction (error)")
                     continue
 

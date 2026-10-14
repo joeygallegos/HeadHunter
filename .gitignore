@@ -12,6 +12,7 @@ JobScrape.code-workspace
 !/tests/test_screen_digest_regression.py
 !/tests/test_resume_variants.py
 !/tests/test_google_resume.py
+!/tests/test_per_job_commit.py
 !/scripts/
 /scripts/*
 !/scripts/migrate_timestamps_to_utc.py
