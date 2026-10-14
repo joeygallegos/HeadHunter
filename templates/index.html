@@ -36,6 +36,11 @@
           class="dashboard-tab px-3 py-2 rounded-lg border border-slate-200 text-sm">
           Job lookup
         </a>
+        <a href="/?view=pipeline"
+          :class="view==='pipeline' ? 'bg-indigo-600 text-white' : 'bg-white text-slate-700'"
+          class="dashboard-tab px-3 py-2 rounded-lg border border-slate-200 text-sm">
+          AI Pipeline
+        </a>
         <button @click="view='applicationPrep'; loadApplicationPrep()"
           :class="view==='applicationPrep' ? 'bg-indigo-600 text-white' : 'bg-white text-slate-700'"
           class="dashboard-tab px-3 py-2 rounded-lg border border-slate-200 text-sm">
@@ -66,6 +71,167 @@
         </a>
       </div>
     </header>
+
+    <!-- ---------------- AI PIPELINE VIEW ---------------- -->
+    <template x-if="view==='pipeline'">
+      <div class="space-y-4">
+        <section class="dashboard-card overflow-hidden">
+          <div class="border-b border-slate-200 bg-slate-950 px-5 py-5 text-white sm:px-6">
+            <div class="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+              <div>
+                <div class="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.18em] text-slate-300">
+                  <span class="h-2.5 w-2.5 rounded-full"
+                    :class="pipelineIsActive() ? 'animate-pulse bg-emerald-400' : 'bg-slate-500'"></span>
+                  <span x-text="pipelineIsActive() ? 'Processor active' : 'Processor idle'"></span>
+                </div>
+                <h2 class="mt-2 text-2xl font-bold tracking-tight sm:text-3xl">AI Processing Pipeline</h2>
+                <p class="mt-2 max-w-2xl text-sm leading-6 text-slate-300">
+                  Priority refreshes move first. Active work and the remaining queues update automatically.
+                </p>
+              </div>
+              <div class="flex items-center gap-3">
+                <span class="text-xs text-slate-400" x-show="pipelineLastUpdated"
+                  x-text="`Updated ${pipelineLastUpdated}`"></span>
+                <button type="button" @click="loadPipeline(true)" :disabled="pipelineLoading"
+                  class="dashboard-button dashboard-button--secondary min-w-24">
+                  <span x-text="pipelineLoading ? 'Refreshing…' : 'Refresh'"></span>
+                </button>
+              </div>
+            </div>
+
+            <div class="mt-5 flex flex-wrap gap-x-6 gap-y-2 text-sm" aria-label="Pipeline summary">
+              <span><strong class="text-lg" x-text="pipelineQueue.priority.count || 0"></strong>
+                <span class="text-slate-300"> priority</span></span>
+              <span><strong class="text-lg" x-text="pipelineActiveCount()"></strong>
+                <span class="text-slate-300"> active</span></span>
+              <span><strong class="text-lg" x-text="pipelineBacklogCount()"></strong>
+                <span class="text-slate-300"> in backlog</span></span>
+            </div>
+          </div>
+
+          <div class="px-5 py-4 sm:px-6">
+            <div class="flex flex-wrap gap-4 text-xs text-slate-600" aria-label="Pipeline color key">
+              <span class="inline-flex items-center gap-2"><span class="h-3 w-3 rounded-full bg-red-500"></span>
+                High-priority refresh</span>
+              <span class="inline-flex items-center gap-2"><span class="h-3 w-3 rounded-full bg-indigo-600"></span>
+                Processing now</span>
+              <span class="inline-flex items-center gap-2"><span class="h-3 w-3 rounded-full bg-blue-500"></span>
+                Queued work</span>
+            </div>
+            <p x-show="pipelineError" x-text="pipelineError" role="alert"
+              class="mt-4 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800"></p>
+          </div>
+
+          <div class="grid divide-y divide-slate-200 border-t border-slate-200 lg:grid-cols-3 lg:divide-x lg:divide-y-0">
+            <section class="min-w-0 p-5 sm:p-6" aria-labelledby="pipeline-priority-heading">
+              <div class="flex items-baseline justify-between gap-3">
+                <div>
+                  <p class="text-xs font-bold uppercase tracking-[0.16em] text-red-700">First in line</p>
+                  <h3 id="pipeline-priority-heading" class="mt-1 text-lg font-semibold text-slate-950">Priority refresh</h3>
+                </div>
+                <span class="text-sm font-semibold text-red-700" x-text="pipelineQueue.priority.count || 0"></span>
+              </div>
+              <p class="mt-2 text-sm leading-5 text-slate-600">Manual full-job refreshes preempt other queued work.</p>
+              <div class="mt-4 flex flex-wrap gap-2.5">
+                <template x-for="item in pipelineQueue.priority.items" :key="`priority-${item.id}`">
+                  <button type="button" @click="openPipelineJob(item)" :disabled="!item.id"
+                    :title="`${item.title} · ${item.site}`"
+                    class="group min-w-36 rounded-2xl border border-red-300 bg-red-50 px-3.5 py-3 text-left shadow-sm transition hover:-translate-y-0.5 hover:border-red-400 hover:bg-red-100 focus:outline-none focus:ring-2 focus:ring-red-300 disabled:cursor-default">
+                    <span class="flex items-center gap-2 text-sm font-bold text-red-950">
+                      <span class="h-2.5 w-2.5 shrink-0 rounded-full bg-red-500"
+                        :class="item.status === 'running' ? 'animate-pulse' : ''"></span>
+                      <span x-text="item.job_id"></span>
+                    </span>
+                    <span class="mt-1 block text-xs font-medium text-red-800"
+                      x-text="`${pipelineStageLabel(item.stage)} · ${pipelineStatusLabel(item.status)}`"></span>
+                  </button>
+                </template>
+              </div>
+              <p class="mt-4 text-sm text-slate-400" x-show="!pipelineQueue.priority.items.length">No priority refreshes queued.</p>
+              <p class="mt-3 text-xs text-slate-500"
+                x-show="pipelineQueue.priority.count > pipelineQueue.priority.items.length">Showing the next <span
+                  x-text="pipelineQueue.priority.items.length"></span> requests.</p>
+            </section>
+
+            <section class="min-w-0 bg-indigo-50/40 p-5 sm:p-6" aria-labelledby="pipeline-active-heading">
+              <div class="flex items-baseline justify-between gap-3">
+                <div>
+                  <p class="text-xs font-bold uppercase tracking-[0.16em] text-indigo-700">On the worker</p>
+                  <h3 id="pipeline-active-heading" class="mt-1 text-lg font-semibold text-slate-950">Active now</h3>
+                </div>
+                <span class="text-sm font-semibold text-indigo-700" x-text="pipelineQueue.active.count || 0"></span>
+              </div>
+              <p class="mt-2 text-sm leading-5 text-slate-600" x-text="ollamaCurrentRun.message || 'Waiting for the next worker heartbeat.'"></p>
+              <div class="mt-4 flex flex-wrap gap-2.5" aria-live="polite">
+                <template x-for="(item, index) in pipelineQueue.active.items" :key="`active-${item.id || index}`">
+                  <button type="button" @click="openPipelineJob(item)" :disabled="!item.id"
+                    :title="`${item.title} · ${item.site}`"
+                    class="min-w-36 rounded-2xl border border-indigo-700 bg-indigo-600 px-3.5 py-3 text-left text-white shadow-sm transition hover:-translate-y-0.5 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-indigo-300 disabled:cursor-default">
+                    <span class="flex items-center gap-2 text-sm font-bold">
+                      <span class="h-2.5 w-2.5 shrink-0 animate-pulse rounded-full bg-white"></span>
+                      <span x-text="item.job_id"></span>
+                    </span>
+                    <span class="mt-1 block text-xs font-medium text-indigo-100" x-text="pipelineStageLabel(item.stage)"></span>
+                  </button>
+                </template>
+              </div>
+              <p class="mt-4 text-sm text-slate-400" x-show="!pipelineQueue.active.items.length">The worker is not processing a background job.</p>
+            </section>
+
+            <section class="min-w-0 p-5 sm:p-6" aria-labelledby="pipeline-queued-heading">
+              <div class="flex items-baseline justify-between gap-3">
+                <div>
+                  <p class="text-xs font-bold uppercase tracking-[0.16em] text-blue-700">Up next</p>
+                  <h3 id="pipeline-queued-heading" class="mt-1 text-lg font-semibold text-slate-950">Queued work</h3>
+                </div>
+                <span class="text-sm font-semibold text-blue-700" x-text="pipelineBacklogCount()"></span>
+              </div>
+              <p class="mt-2 text-sm leading-5 text-slate-600">Application Prep runs before the normal match-analysis backlog.</p>
+
+              <div class="mt-5">
+                <div class="flex items-center justify-between gap-3 text-xs font-bold uppercase tracking-wide text-slate-500">
+                  <span>Application Prep</span>
+                  <span x-text="pipelineQueue.application_prep.count || 0"></span>
+                </div>
+                <div class="mt-2 flex flex-wrap gap-2.5">
+                  <template x-for="item in pipelineQueue.application_prep.items" :key="`prep-${item.id}`">
+                    <button type="button" @click="openPipelineJob(item)" :disabled="!item.id"
+                      :title="`${item.title} · ${item.site}`"
+                      class="min-w-36 rounded-2xl border border-blue-300 bg-blue-50 px-3.5 py-3 text-left shadow-sm transition hover:-translate-y-0.5 hover:border-blue-400 hover:bg-blue-100 focus:outline-none focus:ring-2 focus:ring-blue-300 disabled:cursor-default">
+                      <span class="flex items-center gap-2 text-sm font-bold text-blue-950"><span
+                          class="h-2.5 w-2.5 shrink-0 rounded-full bg-blue-500"></span><span x-text="item.job_id"></span></span>
+                      <span class="mt-1 block text-xs font-medium text-blue-800" x-text="pipelineStatusLabel(item.status)"></span>
+                    </button>
+                  </template>
+                </div>
+                <p class="mt-2 text-sm text-slate-400" x-show="!pipelineQueue.application_prep.items.length">Queue empty.</p>
+              </div>
+
+              <div class="mt-5 border-t border-slate-200 pt-4">
+                <div class="flex items-center justify-between gap-3 text-xs font-bold uppercase tracking-wide text-slate-500">
+                  <span>Match analysis</span>
+                  <span x-text="pipelineQueue.analysis.count || 0"></span>
+                </div>
+                <div class="mt-2 flex flex-wrap gap-2.5">
+                  <template x-for="item in pipelineQueue.analysis.items" :key="`analysis-${item.id}`">
+                    <button type="button" @click="openPipelineJob(item)" :disabled="!item.id"
+                      :title="`${item.title} · ${item.site}`"
+                      class="min-w-36 rounded-2xl border border-blue-300 bg-blue-50 px-3.5 py-3 text-left shadow-sm transition hover:-translate-y-0.5 hover:border-blue-400 hover:bg-blue-100 focus:outline-none focus:ring-2 focus:ring-blue-300 disabled:cursor-default">
+                      <span class="flex items-center gap-2 text-sm font-bold text-blue-950"><span
+                          class="h-2.5 w-2.5 shrink-0 rounded-full bg-blue-500"></span><span x-text="item.job_id"></span></span>
+                      <span class="mt-1 block text-xs font-medium text-blue-800">Match analysis · Queued</span>
+                    </button>
+                  </template>
+                </div>
+                <p class="mt-2 text-sm text-slate-400" x-show="!pipelineQueue.analysis.items.length">Queue empty.</p>
+              </div>
+            </section>
+          </div>
+        </section>
+
+        <p class="px-1 text-xs leading-5 text-slate-500">Select any job bubble to open its Job Lookup details. Queue order is refreshed every five seconds while this page is open.</p>
+      </div>
+    </template>
 
     <!-- ---------------- RUNS VIEW ---------------- -->
     <template x-if="view==='runs'">
@@ -2078,6 +2244,17 @@
                                             ollamaProcessing: { },
     ollamaCurrentRun: { },
     ollamaProcessingPoller: null,
+    pipelineLoading: false,
+      pipelineError: '',
+        pipelineLastUpdated: '',
+          pipelinePoller: null,
+            pipelineQueue: {
+              priority: { count: 0, items: [] },
+              active: { count: 0, items: [] },
+              application_prep: { count: 0, items: [] },
+              analysis: { count: 0, items: [] },
+              display_limit: 25
+            },
 
       // Jobs state
       jobsLoaded: false,
@@ -2252,6 +2429,74 @@
       {
         this.ollamaCurrentRun = { status: 'unavailable', message: err?.message || 'Unable to load AI worker status.' };
       }
+    },
+
+    // Refresh the pipeline independently so opening this page never rebuilds run charts.
+    async loadPipeline(showLoading = false) {
+      if (showLoading) this.pipelineLoading = true;
+      this.pipelineError = '';
+      try
+      {
+        const res = await fetch('/api/ollama-processing');
+        if (!res.ok) throw new Error('Unable to load the AI processing pipeline.');
+        const data = await res.json();
+        const pipeline = data.pipeline || {};
+        this.ollamaProcessing = data;
+        this.ollamaCurrentRun = data.current_run || {};
+        // Preserve a complete view model when an older dashboard response omits a lane.
+        this.pipelineQueue = {
+          priority: pipeline.priority || { count: 0, items: [] },
+          active: pipeline.active || { count: 0, items: [] },
+          application_prep: pipeline.application_prep || { count: 0, items: [] },
+          analysis: pipeline.analysis || { count: 0, items: [] },
+          display_limit: pipeline.display_limit || 25
+        };
+        this.pipelineLastUpdated = new Date().toLocaleTimeString([], {
+          hour: 'numeric', minute: '2-digit', second: '2-digit'
+        });
+      } catch (err)
+      {
+        this.pipelineError = err?.message || 'Unable to load the AI processing pipeline.';
+      } finally
+      {
+        this.pipelineLoading = false;
+      }
+    },
+
+    pipelineBacklogCount() {
+      return (this.pipelineQueue.application_prep.count || 0)
+        + (this.pipelineQueue.analysis.count || 0);
+    },
+
+    pipelineActiveCount() {
+      const priorityRunning = (this.pipelineQueue.priority.items || [])
+        .filter(item => item.status === 'running').length;
+      return (this.pipelineQueue.active.count || 0) + priorityRunning;
+    },
+
+    pipelineIsActive() {
+      return this.pipelineActiveCount() > 0 || this.ollamaCurrentRun.status === 'processing';
+    },
+
+    pipelineStageLabel(stage) {
+      const labels = {
+        starting: 'Starting refresh',
+        full_refresh: 'Full AI refresh',
+        screening: 'Match screening',
+        detailed_analysis: 'Detailed analysis',
+        fit_brief: 'Fit Brief',
+        application_prep: 'Application Prep',
+        analysis: 'Match analysis'
+      };
+      return labels[String(stage || '').toLowerCase()] || 'AI processing';
+    },
+
+    pipelineStatusLabel(status) {
+      return String(status || '').toLowerCase() === 'running' ? 'Processing' : 'Queued';
+    },
+
+    openPipelineJob(item) {
+      if (item?.id) this.openJobDetail(item.id);
     },
 
     // Keep the worker state visually distinct from the completed AI coverage figures.
@@ -4348,9 +4593,16 @@
       {
         if (this.view === 'runs') this.loadOllamaProcessing();
       }, 15000);
+      this.pipelinePoller = window.setInterval(() =>
+      {
+        if (this.view === 'pipeline') this.loadPipeline(false);
+      }, 5000);
       if (this.view === 'runs')
       {
         this.loadRuns();
+      } else if (this.view === 'pipeline')
+      {
+        this.loadPipeline(true);
       } else if (this.view === 'jobs')
       {
         // Query metadata must exist before the builder can safely render and sort typed columns.

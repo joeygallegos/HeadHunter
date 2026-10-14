@@ -37,6 +37,7 @@ if BASE_DIR not in sys.path:
 LOG_DIR = os.path.join(BASE_DIR, "logs")
 CANONICAL_AI_LOG_NAME = "ai-analysis.log"
 LOG_FILE = os.path.join(LOG_DIR, CANONICAL_AI_LOG_NAME)
+ANALYZER_LOCK_FILE = os.path.join(LOG_DIR, "ai-analyzer-process.lock")
 
 
 def _append_to_ai_log(text: str) -> None:
@@ -380,6 +381,7 @@ def profile_log_label(profile: OllamaProfile) -> str:
     """Render safe operational settings without including prompt or job content."""
     return (
         f"model={profile.model} think={profile.think!r} num_ctx={profile.num_ctx} "
+        f"num_gpu={profile.num_gpu if profile.num_gpu is not None else 'auto'} "
         f"num_predict={profile.num_predict}/{profile.retry_num_predict} "
         f"temperature={profile.temperature:g} timeout={profile.timeout_sec}s "
         f"attempts={profile.max_attempts}"
@@ -493,6 +495,17 @@ class OllamaUnavailableError(RuntimeError):
     """Raised when the configured Ollama service cannot accept requests."""
 
 
+OLLAMA_MEMORY_ERROR = (
+    "Ollama could not load the model: insufficient memory. "
+    "Free memory or reduce the model/context size, then retry."
+)
+
+
+def safe_ollama_failure_message(error: Any) -> str:
+    """Keep actionable resource failures without copying provider output."""
+    return OLLAMA_MEMORY_ERROR if str(error) == OLLAMA_MEMORY_ERROR else "Ollama is unavailable"
+
+
 class OllamaPrerequisiteError(RuntimeError):
     """Raised when Ollama is not ready before batch work starts."""
 
@@ -567,6 +580,58 @@ def log(msg: str) -> None:
     except Exception:
         pass
 
+
+class AnalyzerAlreadyRunning(RuntimeError):
+    """Raised when another local analyzer owns the process-lifetime lock."""
+
+
+@contextmanager
+def exclusive_analyzer_lock(lock_path: Optional[str] = None):
+    """Hold a local OS lock for the complete lifetime of one analyzer run.
+
+    The scheduled PowerShell wrapper cannot prove that its Python child exited
+    when the wrapper is restarted. Having Python own this lock makes it safe
+    for the next analyzer to recover durable priority leases immediately.
+    """
+    lock_path = lock_path or ANALYZER_LOCK_FILE
+    os.makedirs(os.path.dirname(os.path.abspath(lock_path)), exist_ok=True)
+    lock_file = open(lock_path, "a+b")
+    acquired = False
+    try:
+        lock_file.seek(0, os.SEEK_END)
+        if lock_file.tell() == 0:
+            lock_file.write(b"\0")
+            lock_file.flush()
+        lock_file.seek(0)
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            raise AnalyzerAlreadyRunning(
+                "Another AI analyzer process is already running."
+            ) from exc
+        acquired = True
+        yield
+    finally:
+        if acquired:
+            lock_file.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        lock_file.close()
+
+
 def _handle_sigint(signum, frame) -> None:
     """Force immediate process exit on Ctrl+C to avoid thread-pool hangs."""
     try:
@@ -578,16 +643,19 @@ def _handle_sigint(signum, frame) -> None:
 def build_llm(profile: Optional[OllamaProfile] = None) -> ChatOllama:
     """Create a ChatOllama client with the current runtime settings."""
     profile = profile or get_ai_profile("detail")
+    options = {
+        "num_ctx": profile.num_ctx,
+        "num_predict": profile.num_predict,
+    }
+    if profile.num_gpu is not None:
+        options["num_gpu"] = profile.num_gpu
     return ChatOllama(
         model=profile.model,
         format="json",
         temperature=profile.temperature,
         keep_alive=OLLAMA_KEEP_ALIVE,
         sync_client_kwargs={"timeout": profile.timeout_sec},
-        options={
-            "num_ctx": profile.num_ctx,
-            "num_predict": profile.num_predict,
-        },
+        options=options,
     )
 
 
@@ -749,6 +817,15 @@ def invoke_ollama_json(
 
     effective_num_predict = num_predict or profile.num_predict
     effective_num_ctx = num_ctx or profile.num_ctx
+    options = {
+        "num_ctx": effective_num_ctx,
+        "num_predict": effective_num_predict,
+        "temperature": profile.temperature,
+    }
+    if profile.num_gpu is not None:
+        # Per-stage placement lets a memory-constrained screen run on CPU
+        # without forcing the larger detail model off a usable GPU.
+        options["num_gpu"] = profile.num_gpu
     payload = {
         "model": profile.model,
         "messages": wire_messages,
@@ -756,11 +833,7 @@ def invoke_ollama_json(
         "format": response_format,
         "think": profile.think if think is None else think,
         "keep_alive": OLLAMA_KEEP_ALIVE,
-        "options": {
-            "num_ctx": effective_num_ctx,
-            "num_predict": effective_num_predict,
-            "temperature": profile.temperature,
-        },
+        "options": options,
     }
     req = urllib.request.Request(
         f"{OLLAMA_BASE_URL}/api/chat",
@@ -774,7 +847,21 @@ def invoke_ollama_json(
     except TimeoutError as exc:
         raise TimeoutError(f"Ollama request timed out after {profile.timeout_sec}s") from exc
     except urllib.error.HTTPError as exc:
+        if exc.code == 500:
+            # Inspect only bounded error metadata; provider errors may include
+            # prompt text or paths, so never echo their response body.
+            try:
+                metadata = json.loads(exc.read(8192).decode("utf-8", "replace"))
+                detail = metadata.get("error", "") if isinstance(metadata, dict) else ""
+            except (OSError, ValueError):
+                detail = ""
+            if isinstance(detail, str) and any(marker in detail.lower() for marker in (
+                "out of memory", "out-of-memory", "unable to allocate", "failed to allocate",
+            )):
+                raise OllamaUnavailableError(OLLAMA_MEMORY_ERROR) from exc
         if exc.code in {502, 503, 504}:
+            # A model-serving failure (including runner startup OOM) is not
+            # invalid job evidence. Stop the batch instead of penalizing jobs.
             raise OllamaUnavailableError(
                 f"Ollama became unavailable at {OLLAMA_BASE_URL} (HTTP {exc.code})"
             ) from exc
@@ -1958,10 +2045,10 @@ def analyze_match_screen_worker(resume_text: str, task: JobTask, index: int) -> 
                 "Return only the required JSON object: match_percentage must be an integer "
                 "0-100 and experience_match must be underqualified, qualified or overqualified."
             ))]
-        except OllamaUnavailableError:
+        except OllamaUnavailableError as exc:
             return JobResult(
                 task.id, task.site, task.job_id, "ollama_unavailable", None, None,
-                took + time.monotonic() - started, "Ollama is unavailable", index,
+                took + time.monotonic() - started, safe_ollama_failure_message(exc), index,
             )
         except OllamaEmptyContentError as exc:
             if exc.done_reason == "length":
@@ -2797,7 +2884,7 @@ def run_fit_brief_generation(
                 if not futures and not aborted:
                     session.rollback()
                     if yield_to_ai_refreshes:
-                        drain_priority_refresh_queue(
+                        require_priority_refresh_queue(
                             resume_text,
                             preflight=False,
                             completed_job_ids=priority_refreshed_job_ids,
@@ -3194,7 +3281,7 @@ def run_application_prep_generation(
             while (not aborted and submitted < len(tasks)) or futures:
                 if not futures and submitted and yield_to_ai_refreshes:
                     session.rollback()
-                    drain_priority_refresh_queue(
+                    require_priority_refresh_queue(
                         resume_text,
                         preflight=False,
                         completed_job_ids=priority_refreshed_job_ids,
@@ -3392,6 +3479,31 @@ def sanitize_priority_refresh_error(error_text: Optional[str]) -> Optional[str]:
     return "AI refresh failed unexpectedly"
 
 
+def recover_interrupted_ai_refresh_requests() -> int:
+    """Return leases from an interrupted analyzer to the priority queue.
+
+    Callers must hold ``exclusive_analyzer_lock``. Preserving the original
+    generation and request time keeps click coalescing and FIFO order intact.
+    """
+    with SessionLocal() as session:
+        recovered = session.execute(
+            update(JobAIRefreshRequest)
+            .where(JobAIRefreshRequest.status == "running")
+            .values(
+                status="queued",
+                started_at=None,
+                finished_at=None,
+                lease_expires_at=None,
+                worker_token=None,
+                current_stage=None,
+                outcome_json=None,
+                error_text=None,
+            )
+        )
+        session.commit()
+        return int(recovered.rowcount or 0)
+
+
 def claim_next_ai_refresh_request(
     *, worker_token: Optional[str] = None, now: Optional[datetime] = None
 ) -> Optional[Tuple[int, int, str]]:
@@ -3477,7 +3589,25 @@ def update_ai_refresh_stage(
             )
         )
         session.commit()
-        return result.rowcount == 1
+        owned = result.rowcount == 1
+        if owned:
+            job = session.get(Job, job_pk)
+            request = session.get(JobAIRefreshRequest, job_pk)
+            # Lease renewals also refresh the shared dashboard heartbeat. Without
+            # this, a long priority call leaves the previous ordinary job visible.
+            if job is not None and request is not None:
+                publish_ai_processing_status(
+                    status="running",
+                    total_jobs=1,
+                    submitted_jobs=1,
+                    current_jobs=[{
+                        "index": 1, "total": 1, "site": job.site,
+                        "job_id": job.job_id, "title": job.title, "stage": stage,
+                    }],
+                    message="Processing a priority AI refresh.",
+                    started_at=request.started_at,
+                )
+        return owned
 
 
 @contextmanager
@@ -3492,27 +3622,48 @@ def maintain_ai_refresh_lease(
     """Renew a refresh lease while one synchronous Ollama stage is running."""
     stop = threading.Event()
     lease_lost = threading.Event()
-    interval = interval_seconds or AI_REFRESH_HEARTBEAT_SECONDS
+    # Match the ordinary batch's visible wait cadence while renewing ownership;
+    # a long synchronous model call should not look like a silent stalled queue.
+    interval = interval_seconds or min(AI_REFRESH_HEARTBEAT_SECONDS, AI_WAIT_HEARTBEAT_SEC)
+    started = time.monotonic()
+    failed = False
+    log(f"[priority] [submit] job_pk={job_pk} stage={stage}")
 
     def heartbeat() -> None:
         while not stop.wait(interval):
             try:
                 if not update_ai_refresh_stage(job_pk, generation, worker_token, stage):
                     lease_lost.set()
+                    log(f"[priority] [err] job_pk={job_pk} stage={stage} lease lost")
                     return
+                log(
+                    f"[priority] [wait] job_pk={job_pk} stage={stage} "
+                    f"elapsed={time.monotonic() - started:.1f}s still processing"
+                )
             except Exception:
                 # Losing the ability to prove ownership is safer than allowing
                 # this worker to persist output after another worker reclaims it.
                 lease_lost.set()
+                log(f"[priority] [err] job_pk={job_pk} stage={stage} lease renewal failed")
                 return
 
     thread = threading.Thread(target=heartbeat, name="ai-refresh-lease", daemon=True)
     thread.start()
     try:
         yield lambda: not lease_lost.is_set()
+    except BaseException:
+        failed = True
+        raise
     finally:
         stop.set()
         thread.join(timeout=max(1.0, min(float(interval), 5.0)))
+        # Returning from a worker is not proof its output validated or committed.
+        # The refresh coordinator reports success/failure after those checks.
+        state = "err" if failed or lease_lost.is_set() else "returned"
+        log(
+            f"[priority] [{state}] job_pk={job_pk} stage={stage} "
+            f"elapsed={time.monotonic() - started:.1f}s"
+        )
 
 
 def finish_ai_refresh_request(
@@ -3582,6 +3733,8 @@ def _run_exact_fit_brief(
         content_hash=job.content_hash,
     )
     result = analyze_fit_brief_worker(resume_text, task, 1)
+    if result.status == "ollama_unavailable":
+        raise OllamaUnavailableError(safe_ollama_failure_message(result.error_text))
     if result.status != "ok" or result.update_params is None:
         raise PriorityRefreshError("Fit Brief generation failed")
     if lease_guard is not None and not lease_guard():
@@ -3649,6 +3802,8 @@ def _run_exact_application_prep(
         responsibilities_hash=str(getattr(inventory, "content_hash", "") or ""),
     )
     result = analyze_application_prep_worker(resume_text, task, 1)
+    if result.status == "ollama_unavailable":
+        raise OllamaUnavailableError(safe_ollama_failure_message(result.error_text))
     if result.status != "ok" or result.update_params is None:
         raise PriorityRefreshError("Application Prep generation failed")
     if lease_guard is not None and not lease_guard():
@@ -3690,6 +3845,11 @@ def process_exact_ai_refresh(
         if not (job.title or "").strip() and not (job.desc or "").strip():
             raise PriorityRefreshError("Job has no title or description to analyze")
 
+        log(
+            f"[priority] processing job_pk={job.id} "
+            f"{job.site or ''}:{job.job_id or ''} title={(job.title or '')[:80]!r}"
+        )
+
         task = _priority_refresh_task(job)
         task.screen_input_hash = screen_input_hash(bounded_resume_text, task)
         task.retry_input_hash = analysis_retry_input_hash(bounded_resume_text, task)
@@ -3705,6 +3865,8 @@ def process_exact_ai_refresh(
             result = analyze_match_screen_worker(bounded_resume_text, task, 1)
         if not lease_owned():
             raise PriorityRefreshError("Refresh lease was lost")
+        if result.status == "ollama_unavailable":
+            raise OllamaUnavailableError(safe_ollama_failure_message(result.error_text))
         if result.screen_payload is None:
             raise PriorityRefreshError("AI screening failed")
         if not update_ai_refresh_stage(job_pk, generation, worker_token, "detailed_analysis"):
@@ -3728,6 +3890,8 @@ def process_exact_ai_refresh(
                 result = analyze_job_worker(bounded_resume_text, task, 1)
             if not lease_owned():
                 raise PriorityRefreshError("Refresh lease was lost")
+        if result.status == "ollama_unavailable":
+            raise OllamaUnavailableError(safe_ollama_failure_message(result.error_text))
         if result.status != "ok" or result.payload_json is None or result.update_params is None:
             raise PriorityRefreshError("Detailed AI analysis failed")
         if not update_ai_refresh_stage(job_pk, generation, worker_token, "detailed_analysis"):
@@ -3814,17 +3978,27 @@ def drain_priority_refresh_queue(
             )
             totals["failed"] += 1
             log(f"[err] Priority AI refresh job_pk={job_pk}: {exc}")
-        except OllamaPrerequisiteError:
-            finish_ai_refresh_request(
-                job_pk,
-                generation,
-                worker_token,
-                status="failed",
-                outcomes={},
-                error_text="Ollama is unavailable",
-            )
+        except (OllamaPrerequisiteError, OllamaUnavailableError) as exc:
+            message = safe_ollama_failure_message(exc)
+            # Preserve FIFO and generation for the next run, but release only
+            # our own claim. Provider outages must not become job failures.
+            with SessionLocal() as session:
+                session.execute(
+                    update(JobAIRefreshRequest).where(
+                        JobAIRefreshRequest.job_pk == job_pk,
+                        JobAIRefreshRequest.request_generation == generation,
+                        JobAIRefreshRequest.status == "running",
+                        JobAIRefreshRequest.worker_token == worker_token,
+                    ).values(
+                        status="queued", current_stage=None, started_at=None,
+                        finished_at=None, lease_expires_at=None, worker_token=None,
+                        error_text=message,
+                    )
+                )
+                session.commit()
             totals["failed"] += 1
-            return totals
+            log(f"[err] Priority AI refresh job_pk={job_pk}: {message} Request remains queued.")
+            raise OllamaUnavailableError(message) from exc
         except Exception:
             # Provider, prompt, resume, and database details must not be copied
             # into a dashboard-visible durable row.
@@ -3847,16 +4021,56 @@ def drain_priority_refresh_queue(
                 outcomes=outcomes,
             )
             totals["processed"] += 1
+            log(
+                f"[priority] completed job_pk={job_pk} generation={generation} "
+                f"outcomes={outcomes}"
+            )
             if completed_job_ids is not None:
                 completed_job_ids.add(job_pk)
+
+
+def require_priority_refresh_queue(
+    resume_text: str,
+    *,
+    preflight: bool = False,
+    completed_job_ids: Optional[Set[int]] = None,
+) -> Dict[str, int]:
+    """Drain priority work and stop this run if any refresh fails.
+
+    A failed manual refresh must not silently release the lower-priority
+    scheduled queue. Stopping here keeps the failure visible and prevents a
+    broken provider from consuming the rest of the batch ahead of the user's
+    requested job.
+    """
+    try:
+        totals = drain_priority_refresh_queue(
+            resume_text,
+            preflight=preflight,
+            completed_job_ids=completed_job_ids,
+        )
+    except OllamaUnavailableError as exc:
+        message = safe_ollama_failure_message(exc) + " Priority refresh remains queued; processing stopped."
+        publish_ai_processing_status(status="failed", message=message, finished_at=utc_now_naive())
+        log(f"[fatal] {message}")
+        raise SystemExit(1) from None
+    if totals["failed"]:
+        message = "Priority AI refresh failed; scheduled processing was stopped."
+        publish_ai_processing_status(
+            status="failed",
+            failed_jobs=totals["failed"],
+            message=message,
+            finished_at=utc_now_naive(),
+        )
+        log(f"[fatal] {message}")
+        raise SystemExit(1)
+    return totals
 
 
 # -------------------------------
 # Main
 # -------------------------------
-def main() -> None:
+def _run_main(args: argparse.Namespace) -> None:
     """Run the batch analysis workflow and persist valid model responses."""
-    args = parse_args()
     signal.signal(signal.SIGINT, _handle_sigint)
     if getattr(args, "compensation_only", False):
         run_compensation_backfill(args)
@@ -3917,7 +4131,13 @@ def main() -> None:
 
     # Manual per-job refreshes outrank every scheduled queue. Specialized
     # command modes above keep their intentionally narrow contracts.
-    drain_priority_refresh_queue(resume_text, preflight=True)
+    recovered_refreshes = recover_interrupted_ai_refresh_requests()
+    if recovered_refreshes:
+        log(
+            f"[priority] recovered {recovered_refreshes} interrupted "
+            "priority refresh request(s)"
+        )
+    require_priority_refresh_queue(resume_text, preflight=True)
 
     processed = 0
     failures = 0
@@ -4004,7 +4224,7 @@ def main() -> None:
                 preflight=True,
                 yield_to_ai_refreshes=True,
             )
-            drain_priority_refresh_queue(resume_text, preflight=False)
+            require_priority_refresh_queue(resume_text, preflight=False)
             run_fit_brief_generation(
                 resume_text,
                 force=False,
@@ -4200,7 +4420,8 @@ def main() -> None:
                 failures += 1
                 aborted = True
                 log(f"[fatal] {result.error_text}; aborting batch")
-                mark_for_retry(result.id)
+                # Model outages do not justify penalizing this job's evidence
+                # with a higher failure count or a delayed retry.
                 return
 
             if result.status == "screened_out":
@@ -4270,6 +4491,17 @@ def main() -> None:
                 log(f"[err] Invalid after retry: {result.error_text}")
             mark_for_retry(result.id)
 
+        # Close the startup gap between the first drain and executor creation.
+        # A request queued during selection or Application Prep must still run
+        # before the first ordinary job is submitted.
+        s.rollback()
+        require_priority_refresh_queue(
+            resume_text,
+            preflight=False,
+            completed_job_ids=priority_refreshed_job_ids,
+        )
+        s.expire_all()
+
         with ThreadPoolExecutor(max_workers=AI_CONCURRENCY) as executor:
             while (not aborted and submitted < total) or futures:
                 # Drain one bounded batch before checking the DB priority queue.
@@ -4279,7 +4511,7 @@ def main() -> None:
                     # Release the MySQL read snapshot before another session
                     # checks priority requests queued since this batch began.
                     s.rollback()
-                    drain_priority_refresh_queue(
+                    require_priority_refresh_queue(
                         resume_text,
                         preflight=False,
                         completed_job_ids=priority_refreshed_job_ids,
@@ -4408,7 +4640,7 @@ def main() -> None:
         # Avoid spending additional background inference on briefs when the
         # primary batch failed completely; priority Application Prep still runs.
         if not all_failed:
-            drain_priority_refresh_queue(resume_text, preflight=False)
+            require_priority_refresh_queue(resume_text, preflight=False)
             run_fit_brief_generation(
                 resume_text,
                 force=False,
@@ -4432,6 +4664,16 @@ def main() -> None:
     log("------------------------------------------------------")
     if aborted or all_failed:
         raise SystemExit(1)
+
+
+def main() -> None:
+    """Serialize analyzer runs so interrupted priority leases are recoverable."""
+    args = parse_args()
+    try:
+        with exclusive_analyzer_lock():
+            _run_main(args)
+    except AnalyzerAlreadyRunning as exc:
+        log(f"[skip] {exc}")
 
 
 if __name__ == "__main__":

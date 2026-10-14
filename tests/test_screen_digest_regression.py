@@ -1,4 +1,5 @@
 import json
+from contextlib import nullcontext
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 
@@ -20,6 +21,17 @@ from app.models import (
     JobMatchScreen,
     JobSwipe,
 )
+
+
+@pytest.fixture(autouse=True)
+def isolate_analyzer_runtime_files(monkeypatch, tmp_path):
+    """Keep tests from locking or logging into the live scheduled analyzer."""
+    monkeypatch.setattr(
+        analyzer,
+        "ANALYZER_LOCK_FILE",
+        str(tmp_path / "ai-analyzer-process.lock"),
+    )
+    monkeypatch.setattr(analyzer, "LOG_FILE", str(tmp_path / "ai-analysis.log"))
 
 
 def test_reasoning_only_screen_gets_one_bounded_retry(monkeypatch):
@@ -336,9 +348,156 @@ def test_priority_refresh_claim_is_exclusive_and_respects_leases(monkeypatch, tm
         assert session.get(JobAIRefreshRequest, 3).worker_token == "worker-b"
 
 
+def test_exclusive_analyzer_lock_rejects_a_second_local_owner(tmp_path):
+    lock_path = str(tmp_path / "analyzer.lock")
+
+    with analyzer.exclusive_analyzer_lock(lock_path):
+        with pytest.raises(analyzer.AnalyzerAlreadyRunning):
+            with analyzer.exclusive_analyzer_lock(lock_path):
+                pytest.fail("a second analyzer acquired the process lock")
+
+
+def test_exclusive_start_recovers_running_priority_requests(monkeypatch, tmp_path):
+    _, factory = _database(tmp_path)
+    requested_at = datetime(2026, 10, 14, 5, 23, 33)
+    with factory() as session:
+        session.add_all(
+            [
+                JobAIRefreshRequest(
+                    job_pk=5872,
+                    status="running",
+                    request_generation=4,
+                    requested_at=requested_at,
+                    started_at=datetime(2026, 10, 14, 5, 41, 4),
+                    lease_expires_at=datetime(2026, 10, 14, 6, 16, 4),
+                    worker_token="interrupted-owner",
+                    current_stage="detailed_analysis",
+                ),
+                JobAIRefreshRequest(
+                    job_pk=6000,
+                    status="queued",
+                    request_generation=2,
+                    requested_at=requested_at + timedelta(minutes=1),
+                ),
+            ]
+        )
+        session.commit()
+
+    monkeypatch.setattr(analyzer, "SessionLocal", factory)
+
+    assert analyzer.recover_interrupted_ai_refresh_requests() == 1
+    with factory() as session:
+        recovered = session.get(JobAIRefreshRequest, 5872)
+        untouched = session.get(JobAIRefreshRequest, 6000)
+        assert recovered.status == "queued"
+        assert recovered.request_generation == 4
+        assert recovered.requested_at == requested_at
+        assert recovered.started_at is None
+        assert recovered.lease_expires_at is None
+        assert recovered.worker_token is None
+        assert recovered.current_stage is None
+        assert untouched.status == "queued"
+        assert untouched.request_generation == 2
+
+    claim = analyzer.claim_next_ai_refresh_request(
+        worker_token="replacement-owner",
+        now=datetime(2026, 10, 14, 5, 50),
+    )
+    assert claim == (5872, 4, "replacement-owner")
+    assert analyzer.update_ai_refresh_stage(
+        5872,
+        4,
+        "interrupted-owner",
+        "detailed_analysis",
+    ) is False
+
+
+def test_priority_stage_publishes_current_job_only_for_lease_owner(monkeypatch, tmp_path):
+    _, factory = _database(tmp_path)
+    with factory() as session:
+        session.add(Job(id=5872, run_id=1, site="crowdstrike", job_id="R30363", title="Priority role"))
+        session.add(JobAIRefreshRequest(
+            job_pk=5872, status="running", request_generation=1,
+            worker_token="owner", started_at=datetime(2026, 10, 14, 6, 5),
+        ))
+        session.commit()
+    monkeypatch.setattr(analyzer, "SessionLocal", factory)
+    publications = []
+    monkeypatch.setattr(analyzer, "publish_ai_processing_status", lambda **kwargs: publications.append(kwargs))
+    assert analyzer.update_ai_refresh_stage(5872, 1, "owner", "screening")
+    assert publications[-1]["current_jobs"][0]["job_id"] == "R30363"
+    assert analyzer.update_ai_refresh_stage(5872, 1, "owner", "detailed_analysis")
+    assert publications[-1]["current_jobs"][0]["stage"] == "detailed_analysis"
+    assert not analyzer.update_ai_refresh_stage(5872, 1, "stale", "screening")
+    assert len(publications) == 2
+
+
+def test_priority_display_overrides_old_batch_until_lease_expires(monkeypatch, tmp_path):
+    _, factory = _database(tmp_path)
+    now = dashboard.utc_now_naive()
+    with factory() as session:
+        session.add(Job(id=5872, run_id=1, site="crowdstrike", job_id="R30363", title="Priority role"))
+        session.add(JobAIRefreshRequest(
+            job_pk=5872, status="running", current_stage="screening",
+            started_at=now, lease_expires_at=now + timedelta(minutes=35),
+        ))
+        session.add(models.AIProcessingStatus(
+            worker_name="primary", status="running", heartbeat_at=now,
+            current_jobs_json='[{"job_id":"ordinary"}]',
+        ))
+        session.commit()
+    monkeypatch.setattr(dashboard, "SessionLocal", factory)
+    monkeypatch.setattr(dashboard, "_ensure_reference_fields_column", lambda: None)
+    report = dashboard._read_current_ollama_run()
+    assert report["jobs"][0]["job_id"] == "R30363"
+    assert report["jobs"][0]["stage"] == "screening"
+    with factory() as session:
+        session.get(JobAIRefreshRequest, 5872).lease_expires_at = now - timedelta(seconds=1)
+        session.commit()
+    assert dashboard._read_current_ollama_run()["jobs"][0]["job_id"] == "ordinary"
+
+
+def test_priority_drain_finishes_every_request_in_fifo_order(monkeypatch, tmp_path):
+    _, factory = _database(tmp_path)
+    now = datetime(2026, 10, 14, 5, 30)
+    with factory() as session:
+        session.add_all(
+            [
+                JobAIRefreshRequest(
+                    job_pk=20,
+                    status="queued",
+                    requested_at=now + timedelta(minutes=1),
+                ),
+                JobAIRefreshRequest(
+                    job_pk=10,
+                    status="queued",
+                    requested_at=now,
+                ),
+            ]
+        )
+        session.commit()
+
+    processed = []
+    monkeypatch.setattr(analyzer, "SessionLocal", factory)
+    monkeypatch.setattr(
+        analyzer,
+        "process_exact_ai_refresh",
+        lambda job_pk, *_args: processed.append(job_pk) or {"screening": "generated"},
+    )
+
+    totals = analyzer.drain_priority_refresh_queue("resume", preflight=False)
+
+    assert totals == {"processed": 2, "failed": 0}
+    assert processed == [10, 20]
+    with factory() as session:
+        assert session.get(JobAIRefreshRequest, 10).status == "done"
+        assert session.get(JobAIRefreshRequest, 20).status == "done"
+
+
 def test_priority_refresh_lease_heartbeats_during_long_stage(monkeypatch):
     heartbeat_seen = analyzer.threading.Event()
     calls = []
+    messages = []
 
     def renew(job_pk, generation, worker_token, stage, **_kwargs):
         calls.append((job_pk, generation, worker_token, stage))
@@ -346,6 +505,7 @@ def test_priority_refresh_lease_heartbeats_during_long_stage(monkeypatch):
         return True
 
     monkeypatch.setattr(analyzer, "update_ai_refresh_stage", renew)
+    monkeypatch.setattr(analyzer, "log", messages.append)
 
     with analyzer.maintain_ai_refresh_lease(
         7, 3, "owner", "detailed_analysis", interval_seconds=0.01
@@ -355,6 +515,20 @@ def test_priority_refresh_lease_heartbeats_during_long_stage(monkeypatch):
 
     assert calls
     assert set(calls) == {(7, 3, "owner", "detailed_analysis")}
+    assert messages[0] == "[priority] [submit] job_pk=7 stage=detailed_analysis"
+    assert any("[wait]" in message and "still processing" in message for message in messages)
+    assert "[returned]" in messages[-1]
+    assert "elapsed=" in messages[-1]
+
+
+def test_priority_stage_exception_logs_failure_without_provider_details(monkeypatch):
+    messages = []
+    monkeypatch.setattr(analyzer, "log", messages.append)
+    with pytest.raises(RuntimeError):
+        with analyzer.maintain_ai_refresh_lease(7, 3, "owner", "screening"):
+            raise RuntimeError("private prompt and provider details")
+    assert "[err]" in messages[-1]
+    assert not any("private" in message or "[returned]" in message for message in messages)
 
 
 def test_priority_refreshed_job_is_not_submitted_from_prebuilt_batch(
@@ -509,6 +683,82 @@ def test_exact_priority_refresh_forces_detail_after_low_fresh_screen(
         assert screen.match_percentage == 20
 
 
+@pytest.mark.parametrize("replacement_owner", [False, True])
+def test_priority_outage_surfaces_memory_error_and_preserves_queue(monkeypatch, tmp_path, replacement_owner):
+    _, factory = _database(tmp_path)
+    requested = datetime(2026, 10, 14, 6, 0)
+    with factory() as session:
+        session.add(JobAIRefreshRequest(job_pk=5872, status="queued", requested_at=requested))
+        session.commit()
+    monkeypatch.setattr(analyzer, "SessionLocal", factory)
+    publications = []
+    monkeypatch.setattr(analyzer, "publish_ai_processing_status", lambda **kwargs: publications.append(kwargs))
+    def outage(*_args):
+        if replacement_owner:
+            with factory() as session:
+                row = session.get(JobAIRefreshRequest, 5872)
+                row.request_generation = 2
+                row.worker_token = "replacement"
+                session.commit()
+        raise analyzer.OllamaUnavailableError(analyzer.OLLAMA_MEMORY_ERROR)
+    monkeypatch.setattr(analyzer, "process_exact_ai_refresh", outage)
+    with pytest.raises(SystemExit):
+        analyzer.require_priority_refresh_queue("resume")
+    assert "insufficient memory" in publications[-1]["message"]
+    with factory() as session:
+        row = session.get(JobAIRefreshRequest, 5872)
+        assert row.requested_at == requested
+        if replacement_owner:
+            assert row.status == "running"
+            assert row.worker_token == "replacement"
+            assert row.request_generation == 2
+        else:
+            assert row.status == "queued"
+            assert row.worker_token is None
+            assert row.lease_expires_at is None
+            assert row.request_generation == 1
+            assert row.error_text == analyzer.OLLAMA_MEMORY_ERROR
+
+
+@pytest.mark.parametrize("stage", ["screening", "detailed_analysis", "fit_brief", "application_prep"])
+def test_exact_refresh_stages_preserve_memory_failure(monkeypatch, tmp_path, stage):
+    _, factory = _database(tmp_path)
+    with factory() as session:
+        session.add(Job(id=5872, run_id=1, site="crowdstrike", job_id="R30363",
+                        title="Priority role", ai_match_percentage=90))
+        session.add(JobSwipe(job_pk=5872, action="like"))
+        session.commit()
+    monkeypatch.setattr(analyzer, "SessionLocal", factory)
+    unavailable = SimpleNamespace(status="ollama_unavailable", error_text=analyzer.OLLAMA_MEMORY_ERROR)
+    monkeypatch.setattr(analyzer, "update_ai_refresh_stage", lambda *_args: True)
+    monkeypatch.setattr(analyzer, "maintain_ai_refresh_lease", lambda *_args: nullcontext(lambda: True))
+    if stage in {"screening", "detailed_analysis"}:
+        screen = unavailable if stage == "screening" else SimpleNamespace(
+            status="screened_out", screen_payload={"match_percentage":90,"experience_match":"qualified"})
+        monkeypatch.setattr(analyzer, "analyze_match_screen_worker", lambda *_args: screen)
+        monkeypatch.setattr(analyzer, "analyze_job_worker", lambda *_args: unavailable)
+        with pytest.raises(analyzer.OllamaUnavailableError, match="insufficient memory"):
+            analyzer.process_exact_ai_refresh(5872, 1, "owner", "resume")
+    else:
+        worker = "analyze_fit_brief_worker" if stage == "fit_brief" else "analyze_application_prep_worker"
+        monkeypatch.setattr(analyzer, worker, lambda *_args: unavailable)
+        with factory() as session:
+            job = session.get(Job, 5872)
+            runner = analyzer._run_exact_fit_brief if stage == "fit_brief" else analyzer._run_exact_application_prep
+            with pytest.raises(analyzer.OllamaUnavailableError, match="insufficient memory"):
+                runner(session, "resume", job)
+
+
+def test_priority_screen_preserves_memory_failure(monkeypatch):
+    def outage(*_args, **_kwargs):
+        raise analyzer.OllamaUnavailableError(analyzer.OLLAMA_MEMORY_ERROR)
+    monkeypatch.setattr(analyzer, "invoke_ollama_json", outage)
+    task = analyzer.JobTask(1, "site", "job", "Title", "Description", "", 1, None)
+    result = analyzer.analyze_match_screen_worker("resume", task, 1)
+    assert result.status == "ollama_unavailable"
+    assert result.error_text == analyzer.OLLAMA_MEMORY_ERROR
+
+
 def test_priority_refresh_failure_is_terminal_and_sanitized(monkeypatch, tmp_path):
     _, factory = _database(tmp_path)
     with factory() as session:
@@ -536,6 +786,50 @@ def test_priority_refresh_failure_is_terminal_and_sanitized(monkeypatch, tmp_pat
         assert "private" not in refresh.error_text
 
 
+def test_main_stops_before_scheduled_work_when_priority_refresh_fails(
+    monkeypatch, tmp_path
+):
+    _, factory = _database(tmp_path)
+    resume = tmp_path / "resume.txt"
+    resume.write_text("resume", encoding="utf-8")
+    selected = []
+    publications = []
+
+    monkeypatch.setattr(analyzer, "SessionLocal", factory)
+    monkeypatch.setattr(analyzer, "RESUME_PATH", str(resume))
+    monkeypatch.setattr(analyzer, "init_db", lambda: None)
+    monkeypatch.setattr(analyzer, "exclusive_analyzer_lock", lambda: nullcontext())
+    monkeypatch.setattr(
+        analyzer,
+        "parse_args",
+        lambda: SimpleNamespace(compensation_only=False, redo=None),
+    )
+    monkeypatch.setattr(analyzer, "recover_interrupted_ai_refresh_requests", lambda: 0)
+    monkeypatch.setattr(
+        analyzer,
+        "drain_priority_refresh_queue",
+        lambda *_args, **_kwargs: {"processed": 0, "failed": 1},
+    )
+    monkeypatch.setattr(
+        analyzer,
+        "select_job_ids",
+        lambda *_args, **_kwargs: selected.append(True) or [],
+    )
+    monkeypatch.setattr(
+        analyzer,
+        "publish_ai_processing_status",
+        lambda **kwargs: publications.append(kwargs),
+    )
+
+    with pytest.raises(SystemExit) as stopped:
+        analyzer.main()
+
+    assert stopped.value.code == 1
+    assert selected == []
+    assert publications[-1]["status"] == "failed"
+    assert "scheduled processing was stopped" in publications[-1]["message"]
+
+
 def test_main_checks_priority_refresh_before_scheduled_queues(monkeypatch, tmp_path):
     _, factory = _database(tmp_path)
     resume = tmp_path / "resume.txt"
@@ -545,10 +839,16 @@ def test_main_checks_priority_refresh_before_scheduled_queues(monkeypatch, tmp_p
     monkeypatch.setattr(analyzer, "SessionLocal", factory)
     monkeypatch.setattr(analyzer, "RESUME_PATH", str(resume))
     monkeypatch.setattr(analyzer, "init_db", lambda: None)
+    monkeypatch.setattr(analyzer, "exclusive_analyzer_lock", lambda: nullcontext())
     monkeypatch.setattr(
         analyzer,
         "parse_args",
         lambda: SimpleNamespace(compensation_only=False, redo=None),
+    )
+    monkeypatch.setattr(
+        analyzer,
+        "recover_interrupted_ai_refresh_requests",
+        lambda: events.append("recover") or 1,
     )
     monkeypatch.setattr(
         analyzer,
@@ -574,7 +874,7 @@ def test_main_checks_priority_refresh_before_scheduled_queues(monkeypatch, tmp_p
 
     analyzer.main()
 
-    assert events[0:2] == ["priority", "scheduled_selection"]
+    assert events[0:3] == ["recover", "priority", "scheduled_selection"]
     assert events.index("priority") < events.index("application_prep")
     assert events.index("priority") < events.index("fit_brief")
 
@@ -609,6 +909,93 @@ def test_dashboard_separates_screened_jobs_from_pending(monkeypatch, tmp_path):
     assert report["screened_count"] == 1
     assert report["awaiting_count"] == 2
     assert {job["job_id"] for job in report["jobs"]} == {"detail-retry", "pending"}
+
+
+def test_dashboard_pipeline_groups_priority_active_and_queued_work(monkeypatch, tmp_path):
+    engine, factory = _database(tmp_path)
+    with factory() as session:
+        priority = _refresh_job(session, "R30364")
+        active = _refresh_job(session, "ACTIVE-22")
+        prep_job = _refresh_job(session, "PREP-9")
+        pending = _refresh_job(
+            session,
+            "WAIT-4",
+            ai_analysis=None,
+            ai_match_percentage=None,
+        )
+        _refresh_job(
+            session,
+            "EMPTY-5",
+            title="",
+            desc="",
+            ai_analysis=None,
+            ai_match_percentage=None,
+        )
+        session.add_all(
+            [
+                JobAIRefreshRequest(
+                    job_pk=priority.id,
+                    status="running",
+                    current_stage="detailed_analysis",
+                ),
+                JobApplicationPrep(job_pk=prep_job.id, status="queued"),
+            ]
+        )
+        session.commit()
+        active_id = active.id
+        pending_id = pending.id
+
+    monkeypatch.setattr(dashboard, "engine", engine)
+    monkeypatch.setattr(dashboard, "SessionLocal", factory)
+    monkeypatch.setattr(
+        dashboard,
+        "_read_current_ollama_run",
+        lambda: {
+            "status": "processing",
+            "message": "Detailed analysis is running.",
+            "jobs": [
+                {
+                    "site": "site",
+                    "job_id": "ACTIVE-22",
+                    "title": "Security Engineer",
+                    "stage": "fit_brief",
+                }
+            ],
+        },
+    )
+
+    pipeline = dashboard.fetch_ollama_processing_report()["pipeline"]
+
+    assert pipeline["priority"]["count"] == 1
+    assert pipeline["priority"]["items"][0]["job_id"] == "R30364"
+    assert pipeline["priority"]["items"][0]["stage"] == "detailed_analysis"
+    assert pipeline["active"]["items"][0]["id"] == active_id
+    assert pipeline["active"]["items"][0]["stage"] == "fit_brief"
+    assert pipeline["application_prep"]["items"][0]["job_id"] == "PREP-9"
+    assert pipeline["analysis"]["count"] == 1
+    assert pipeline["analysis"]["items"][0]["id"] == pending_id
+
+
+def test_ai_pipeline_page_is_addressable_and_exposes_accessible_queue_lanes():
+    response = dashboard.app.test_client().get("/?view=pipeline")
+    template = dashboard.app.jinja_loader.get_source(
+        dashboard.app.jinja_env, "index.html"
+    )[0]
+
+    assert response.status_code == 200
+    assert 'view: "pipeline",' in response.get_data(as_text=True)
+    for label in (
+        "AI Processing Pipeline",
+        "High-priority refresh",
+        "Processing now",
+        "Queued work",
+        "Application Prep",
+        "Match analysis",
+    ):
+        assert label in template
+    assert 'aria-live="polite"' in template
+    assert "if (this.view === 'pipeline') this.loadPipeline(false);" in template
+    assert "@click=\"openPipelineJob(item)\"" in template
 
 
 def test_dashboard_lookup_view_renders_valid_initial_ui_state():

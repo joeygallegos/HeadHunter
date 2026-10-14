@@ -15,6 +15,17 @@ from app.ai_profiles import generation_config_hash, load_job_profile
 from app.models import Base, Job
 
 
+@pytest.fixture(autouse=True)
+def isolate_analyzer_runtime_files(monkeypatch, tmp_path):
+    """Keep tests from locking or logging into the live scheduled analyzer."""
+    monkeypatch.setattr(
+        analyzer,
+        "ANALYZER_LOCK_FILE",
+        str(tmp_path / "ai-analyzer-process.lock"),
+    )
+    monkeypatch.setattr(analyzer, "LOG_FILE", str(tmp_path / "ai-analysis.log"))
+
+
 def test_detail_profile_uses_legacy_settings_until_overridden(monkeypatch) -> None:
     monkeypatch.setenv("OLLAMA_MODEL", "baseline-model")
     monkeypatch.setenv("OLLAMA_NUM_CTX", "4096")
@@ -75,6 +86,15 @@ def test_specialized_profiles_preserve_existing_defaults(monkeypatch) -> None:
     assert (prep.think, prep.num_ctx, prep.num_predict, prep.retry_num_predict) == (
         False, 65536, 6144, 12288
     )
+
+
+def test_screen_profile_can_force_cpu_without_changing_other_stages(monkeypatch) -> None:
+    monkeypatch.delenv("OLLAMA_NUM_GPU", raising=False)
+    monkeypatch.setenv("AI_SCREEN_NUM_GPU", "0")
+    monkeypatch.delenv("AI_DETAIL_NUM_GPU", raising=False)
+
+    assert load_job_profile("screen").num_gpu == 0
+    assert load_job_profile("detail").num_gpu is None
 
 
 def test_generation_hash_changes_with_prompt_or_profile(monkeypatch, tmp_path) -> None:
@@ -263,6 +283,27 @@ def test_preflight_reports_exact_pull_command_for_missing_model(
         analyzer.check_ollama_prerequisites()
 
     assert "ollama pull deepseek-r1:8b" in str(exc_info.value)
+
+
+@pytest.mark.parametrize("body,expected", [
+    ({"error": "llama-server out-of-memory CUDA_Host private prompt"}, analyzer.OllamaUnavailableError),
+    ({"error": "unable to allocate buffer private prompt"}, analyzer.OllamaUnavailableError),
+    ({"error": "unknown internal error private prompt"}, RuntimeError),
+    (["out-of-memory"], RuntimeError),
+    ("malformed response private prompt", RuntimeError),
+])
+def test_chat_memory_failure_is_actionable_without_exposing_response(monkeypatch, body, expected):
+    encoded = json.dumps(body).encode() if not isinstance(body, str) else body.encode()
+    def fail(*_args, **_kwargs):
+        raise urllib.error.HTTPError("http://localhost/api/chat", 500, "server error", {}, io.BytesIO(encoded))
+    monkeypatch.setattr(analyzer.urllib.request, "urlopen", fail)
+    with pytest.raises(expected) as failure:
+        analyzer.invoke_ollama_json([])
+    assert "private" not in str(failure.value)
+    if expected is analyzer.OllamaUnavailableError:
+        assert str(failure.value) == analyzer.OLLAMA_MEMORY_ERROR
+    else:
+        assert not isinstance(failure.value, analyzer.OllamaUnavailableError)
 
 
 def test_chat_connection_failure_is_distinct_from_request_timeout(
@@ -529,6 +570,9 @@ def test_regular_run_aborts_before_submitting_remaining_jobs(
     assert calls < 5
     assert any("unsubmitted=" in message for message in messages)
     assert any("aborting batch" in message for message in messages)
+    from app.models import JobAnalysisRetry
+    with session_factory() as session:
+        assert session.query(JobAnalysisRetry).count() == 0
 
 
 def test_compensation_run_with_no_jobs_does_not_require_ollama(

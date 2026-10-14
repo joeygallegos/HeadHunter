@@ -6,7 +6,7 @@ import hashlib
 import json
 import os
 from dataclasses import asdict, dataclass
-from typing import Any, Mapping
+from typing import Any, Mapping, Optional
 
 
 def parse_ollama_think(value: Any) -> Any:
@@ -33,6 +33,7 @@ class OllamaProfile:
     model: str
     think: Any
     num_ctx: int
+    num_gpu: Optional[int]
     num_predict: int
     retry_num_predict: int
     temperature: float
@@ -61,11 +62,14 @@ def load_ollama_profile(
         num_predict,
         int(_override(prefix, "RETRY_NUM_PREDICT", baseline["retry_num_predict"])),
     )
+    raw_num_gpu = _override(prefix, "NUM_GPU", baseline.get("num_gpu"))
+    num_gpu = None if raw_num_gpu in {None, ""} else max(0, int(raw_num_gpu))
     return OllamaProfile(
         name=name,
         model=str(_override(prefix, "MODEL", baseline["model"])).strip(),
         think=parse_ollama_think(_override(prefix, "THINK", baseline["think"])),
         num_ctx=max(1, int(_override(prefix, "NUM_CTX", baseline["num_ctx"]))),
+        num_gpu=num_gpu,
         num_predict=num_predict,
         retry_num_predict=retry_num_predict,
         temperature=float(_override(prefix, "TEMPERATURE", baseline["temperature"])),
@@ -114,6 +118,7 @@ def load_job_profile(name: str) -> OllamaProfile:
         "model": model,
         "think": think,
         "num_ctx": num_ctx,
+        "num_gpu": os.getenv("OLLAMA_NUM_GPU"),
         "num_predict": num_predict,
         "retry_num_predict": retry_num_predict,
         "temperature": temperature,

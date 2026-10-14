@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Optional
 from flask import Flask, Response, abort, jsonify, render_template, request, send_file
 from sqlalchemy import (
     and_,
+    case,
     Column,
     DateTime,
     ForeignKey,
@@ -2099,13 +2100,14 @@ def fetch_runs_summary(days: int) -> Dict[str, Any]:
 
 
 def fetch_ollama_processing_report(limit: int = 25) -> Dict[str, Any]:
-    """Summarize final, screened-only, and genuinely pending active jobs."""
+    """Summarize AI coverage plus the durable and in-flight processing lanes."""
     no_final_filter = or_(Job.ai_analysis.is_(None), func.trim(Job.ai_analysis) == "")
     content_filter = or_(
         func.length(func.trim(func.coalesce(Job.title, ""))) > 0,
         func.length(func.trim(func.coalesce(Job.desc, ""))) > 0,
     )
     limit = max(1, min(int(limit or 25), 100))
+    current_run = _read_current_ollama_run()
 
     with SessionLocal() as session:
         # Older deployments may serve the dashboard before the analyzer has
@@ -2158,6 +2160,135 @@ def fetch_ollama_processing_report(limit: int = 25) -> Dict[str, Any]:
             .scalars()
             .all()
         )
+        # The legacy coverage table includes content-less jobs for diagnosis,
+        # but they are not processable queue items. Query the bubble lane
+        # separately so missing-content rows cannot consume its display limit.
+        analysis_jobs = (
+            session.execute(
+                select(Job)
+                .where(
+                    Job.is_active.is_(True),
+                    awaiting_filter,
+                    content_filter,
+                )
+                .order_by(Job.discovery_date.asc(), Job.id.asc())
+                .limit(limit)
+            )
+            .scalars()
+            .all()
+        )
+
+        # These are diagnostic reads of the processor's existing durable queues.
+        # Running priority work remains in the red lane so its preemptive nature
+        # stays visible even after the processor has claimed the request.
+        priority_count = session.scalar(
+            select(func.count())
+            .select_from(JobAIRefreshRequest)
+            .where(JobAIRefreshRequest.status.in_(("queued", "running")))
+        ) or 0
+        priority_rows = session.execute(
+            select(JobAIRefreshRequest, Job)
+            .join(Job, Job.id == JobAIRefreshRequest.job_pk)
+            .where(JobAIRefreshRequest.status.in_(("queued", "running")))
+            .order_by(
+                case((JobAIRefreshRequest.status == "running", 0), else_=1),
+                JobAIRefreshRequest.requested_at.asc(),
+                Job.id.asc(),
+            )
+            .limit(limit)
+        ).all()
+
+        application_prep_count = session.scalar(
+            select(func.count())
+            .select_from(JobApplicationPrep)
+            .where(JobApplicationPrep.status.in_(("queued", "running")))
+        ) or 0
+        application_prep_rows = session.execute(
+            select(JobApplicationPrep, Job)
+            .join(Job, Job.id == JobApplicationPrep.job_pk)
+            .where(JobApplicationPrep.status.in_(("queued", "running")))
+            .order_by(JobApplicationPrep.queued_at.asc(), Job.id.asc())
+            .limit(limit)
+        ).all()
+
+        # Worker heartbeats intentionally contain natural identifiers instead
+        # of database keys. Resolve those keys here only to make bubbles link to
+        # Job Lookup; an unresolved heartbeat remains visible but non-clickable.
+        active_identities = {
+            (str(item.get("site") or ""), str(item.get("job_id") or ""))
+            for item in current_run.get("jobs", [])
+            if isinstance(item, dict) and item.get("site") and item.get("job_id")
+        }
+        active_job_ids = {}
+        if active_identities:
+            active_job_ids = {
+                (job.site or "", job.job_id or ""): job.id
+                for job in session.execute(
+                    select(Job).where(tuple_(Job.site, Job.job_id).in_(active_identities))
+                ).scalars()
+            }
+
+    def pipeline_item(
+        job: Job,
+        *,
+        stage: str,
+        status: str,
+        queued_at: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        return {
+            "id": job.id,
+            "site": job.site or "",
+            "job_id": job.job_id or f"DB {job.id}",
+            "title": job.title or "(no title)",
+            "stage": stage,
+            "status": status,
+            "queued_at": _fmt_dt(queued_at) or "",
+        }
+
+    active_items = []
+    for item in current_run.get("jobs", []):
+        if not isinstance(item, dict):
+            continue
+        identity = (str(item.get("site") or ""), str(item.get("job_id") or ""))
+        active_items.append(
+            {
+                "id": active_job_ids.get(identity),
+                "site": identity[0],
+                "job_id": identity[1] or "Unknown job",
+                "title": str(item.get("title") or "(no title)"),
+                "stage": str(item.get("stage") or "analysis"),
+                "status": "running",
+                "queued_at": "",
+            }
+        )
+
+    priority_items = [
+        pipeline_item(
+            job,
+            stage=refresh.current_stage or "full_refresh",
+            status=refresh.status,
+            queued_at=refresh.requested_at,
+        )
+        for refresh, job in priority_rows
+    ]
+    application_prep_items = [
+        pipeline_item(
+            job,
+            stage="application_prep",
+            status=prep.status,
+            queued_at=prep.queued_at,
+        )
+        for prep, job in application_prep_rows
+    ]
+    analysis_items = [
+        pipeline_item(
+            job,
+            stage="analysis",
+            status="queued",
+            queued_at=job.discovery_date,
+        )
+        for job in analysis_jobs
+    ]
 
     # The report is diagnostic only; it does not queue or mutate any job.
     return {
@@ -2180,7 +2311,17 @@ def fetch_ollama_processing_report(limit: int = 25) -> Dict[str, Any]:
             for job in pending_jobs
         ],
         "display_limit": limit,
-        "current_run": _read_current_ollama_run(),
+        "current_run": current_run,
+        "pipeline": {
+            "priority": {"count": int(priority_count), "items": priority_items},
+            "active": {"count": len(active_items), "items": active_items},
+            "application_prep": {
+                "count": int(application_prep_count),
+                "items": application_prep_items,
+            },
+            "analysis": {"count": int(ready_count), "items": analysis_items},
+            "display_limit": limit,
+        },
     }
 
 
@@ -2193,6 +2334,31 @@ def _read_current_ollama_run() -> Dict[str, Any]:
     """
     _ensure_reference_fields_column()
     with SessionLocal() as session:
+        # The claimed refresh is authoritative while its lease is valid, even
+        # when an older processor has not published its priority heartbeat yet.
+        priority = session.execute(
+            select(JobAIRefreshRequest, Job)
+            .join(Job, Job.id == JobAIRefreshRequest.job_pk)
+            .where(
+                JobAIRefreshRequest.status == "running",
+                JobAIRefreshRequest.lease_expires_at > utc_now_naive(),
+            )
+            .order_by(JobAIRefreshRequest.started_at.asc())
+            .limit(1)
+        ).first()
+        if priority is not None:
+            refresh, job = priority
+            return {
+                "status": "processing",
+                "message": "Processing a priority AI refresh.",
+                "started_at": _fmt_dt(refresh.started_at) or "",
+                "inflight_count": 1,
+                "jobs": [{
+                    "index": 1, "total": 1, "site": job.site,
+                    "job_id": job.job_id, "title": job.title,
+                    "stage": refresh.current_stage or "starting",
+                }],
+            }
         status = session.execute(
             select(AIProcessingStatus)
             .where(AIProcessingStatus.worker_name == "primary")
@@ -3963,7 +4129,11 @@ app = Flask(__name__)
 def index():
     # Keep dashboard sections addressable so Application Prep can open one job directly.
     requested_view = (request.args.get("view") or "").strip()
-    initial_view = requested_view if requested_view in {"lookup", "applicationPrep", "settings"} else "runs"
+    initial_view = (
+        requested_view
+        if requested_view in {"lookup", "pipeline", "applicationPrep", "settings"}
+        else "runs"
+    )
     try:
         initial_application_prep_job_id = max(0, int(request.args.get("job", "0")))
     except ValueError:
