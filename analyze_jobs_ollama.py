@@ -84,6 +84,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 # DB
 from sqlalchemy import and_, inspect as sa_inspect, or_, select, text as sa_text, update
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 from app.models import (
     APPLICATION_PREP_DEFAULT_MIN_MATCH,
@@ -1167,7 +1168,13 @@ def validate_compensation(payload: Any) -> Tuple[bool, str]:
         return False, "monetary values require pay_currency"
 
     for key in ("bonus_offered", "equity_offered", "commission_offered"):
-        if payload.get(key) not in {True, None}:
+        if payload.get(key) is False:
+            # The persisted contract distinguishes explicit evidence of an
+            # offered incentive from everything else. A model's false means
+            # "not found" here, so normalize it to unknown rather than reject
+            # otherwise valid analysis or assert that the benefit is absent.
+            payload[key] = None
+        elif payload.get(key) not in {True, None}:
             return False, f"{key} must be true or null"
     if not isinstance(payload.get("multiple_pay_ranges"), bool):
         return False, "multiple_pay_ranges must be boolean"
@@ -1755,7 +1762,10 @@ def validate_fit_brief_schema(payload: Any, resume_text: str) -> Tuple[bool, str
         requirement = str(item.get("job_requirement") or "").strip()
         why = str(item.get("why_it_matters") or "").strip()
         confidence = str(item.get("confidence") or "").strip().lower()
-        if not bullet or bullet not in resume_text:
+        # Resume files and model output can differ only in line wrapping or
+        # repeated whitespace. Keep the evidence contiguous and verbatim after
+        # normalization instead of rejecting an otherwise exact source bullet.
+        if not _is_exact_prompt_evidence(bullet, resume_text):
             return False, "resume_bullet must be exact text from resume"
         if not requirement or not why:
             return False, "job_requirement and why_it_matters must be non-empty"
@@ -3456,6 +3466,10 @@ class PriorityRefreshError(RuntimeError):
     """Safe operational failure suitable for the refresh request row and UI."""
 
 
+class PriorityQueueLockError(RuntimeError):
+    """Raised when MySQL cannot safely update durable priority ownership."""
+
+
 _SAFE_PRIORITY_REFRESH_ERRORS = {
     "Job no longer exists",
     "Job is no longer active",
@@ -3486,22 +3500,52 @@ def recover_interrupted_ai_refresh_requests() -> int:
     generation and request time keeps click coalescing and FIFO order intact.
     """
     with SessionLocal() as session:
-        recovered = session.execute(
-            update(JobAIRefreshRequest)
-            .where(JobAIRefreshRequest.status == "running")
-            .values(
-                status="queued",
-                started_at=None,
-                finished_at=None,
-                lease_expires_at=None,
-                worker_token=None,
-                current_stage=None,
-                outcome_json=None,
-                error_text=None,
-            )
+        running_job_pks = list(
+            session.execute(
+                select(JobAIRefreshRequest.job_pk).where(
+                    JobAIRefreshRequest.status == "running"
+                )
+            ).scalars()
         )
-        session.commit()
-        return int(recovered.rowcount or 0)
+        session.rollback()
+
+    recovered_count = 0
+    for job_pk in running_job_pks:
+        with SessionLocal() as session:
+            try:
+                if session.bind is not None and session.bind.dialect.name == "mysql":
+                    # A stale external transaction must not hold startup for
+                    # MySQL's full default timeout. Exact primary-key updates
+                    # also avoid the range locks caused by the old bulk update.
+                    session.execute(sa_text("SET SESSION innodb_lock_wait_timeout = 5"))
+                recovered = session.execute(
+                    update(JobAIRefreshRequest)
+                    .where(
+                        JobAIRefreshRequest.job_pk == job_pk,
+                        JobAIRefreshRequest.status == "running",
+                    )
+                    .values(
+                        status="queued",
+                        started_at=None,
+                        finished_at=None,
+                        lease_expires_at=None,
+                        worker_token=None,
+                        current_stage=None,
+                        outcome_json=None,
+                        error_text=None,
+                    )
+                )
+                session.commit()
+                recovered_count += int(recovered.rowcount or 0)
+            except OperationalError as exc:
+                session.rollback()
+                error_code = getattr(getattr(exc, "orig", None), "args", (None,))[0]
+                if error_code == 1205:
+                    raise PriorityQueueLockError(
+                        "Priority refresh recovery is waiting on a database lock."
+                    ) from exc
+                raise
+    return recovered_count
 
 
 def claim_next_ai_refresh_request(
@@ -3511,56 +3555,71 @@ def claim_next_ai_refresh_request(
     claim_time = now or utc_now_naive()
     token = worker_token or uuid.uuid4().hex
     with SessionLocal() as session:
-        candidates = list(
-            session.execute(
-                select(JobAIRefreshRequest)
-                .where(
-                    or_(
-                        JobAIRefreshRequest.status == "queued",
-                        and_(
-                            JobAIRefreshRequest.status == "running",
-                            JobAIRefreshRequest.lease_expires_at.is_not(None),
-                            JobAIRefreshRequest.lease_expires_at <= claim_time,
-                        ),
+        try:
+            if session.bind is not None and session.bind.dialect.name == "mysql":
+                session.execute(sa_text("SET SESSION innodb_lock_wait_timeout = 5"))
+            candidates = list(
+                session.execute(
+                    select(JobAIRefreshRequest)
+                    .where(
+                        or_(
+                            JobAIRefreshRequest.status == "queued",
+                            and_(
+                                JobAIRefreshRequest.status == "running",
+                                JobAIRefreshRequest.lease_expires_at.is_not(None),
+                                JobAIRefreshRequest.lease_expires_at <= claim_time,
+                            ),
+                        )
+                    )
+                    .order_by(
+                        JobAIRefreshRequest.requested_at.asc(),
+                        JobAIRefreshRequest.job_pk.asc(),
                     )
                 )
-                .order_by(JobAIRefreshRequest.requested_at.asc(), JobAIRefreshRequest.job_pk.asc())
+                .scalars()
             )
-            .scalars()
-        )
-        for request in candidates:
-            expected_status = request.status
-            expected_token = request.worker_token
-            conditions = [
-                JobAIRefreshRequest.job_pk == request.job_pk,
-                JobAIRefreshRequest.request_generation == request.request_generation,
-                JobAIRefreshRequest.status == expected_status,
-            ]
-            if expected_status == "running":
-                conditions.extend(
-                    [
-                        JobAIRefreshRequest.worker_token == expected_token,
-                        JobAIRefreshRequest.lease_expires_at <= claim_time,
-                    ]
+            for request in candidates:
+                expected_status = request.status
+                expected_token = request.worker_token
+                conditions = [
+                    JobAIRefreshRequest.job_pk == request.job_pk,
+                    JobAIRefreshRequest.request_generation == request.request_generation,
+                    JobAIRefreshRequest.status == expected_status,
+                ]
+                if expected_status == "running":
+                    conditions.extend(
+                        [
+                            JobAIRefreshRequest.worker_token == expected_token,
+                            JobAIRefreshRequest.lease_expires_at <= claim_time,
+                        ]
+                    )
+                claimed = session.execute(
+                    update(JobAIRefreshRequest)
+                    .where(*conditions)
+                    .values(
+                        status="running",
+                        started_at=claim_time,
+                        finished_at=None,
+                        lease_expires_at=claim_time
+                        + timedelta(minutes=AI_REFRESH_LEASE_MINUTES),
+                        worker_token=token,
+                        current_stage="starting",
+                        outcome_json=None,
+                        error_text=None,
+                    )
                 )
-            claimed = session.execute(
-                update(JobAIRefreshRequest)
-                .where(*conditions)
-                .values(
-                    status="running",
-                    started_at=claim_time,
-                    finished_at=None,
-                    lease_expires_at=claim_time + timedelta(minutes=AI_REFRESH_LEASE_MINUTES),
-                    worker_token=token,
-                    current_stage="starting",
-                    outcome_json=None,
-                    error_text=None,
-                )
-            )
-            if claimed.rowcount == 1:
-                session.commit()
-                return request.job_pk, request.request_generation, token
+                if claimed.rowcount == 1:
+                    session.commit()
+                    return request.job_pk, request.request_generation, token
+                session.rollback()
+        except OperationalError as exc:
             session.rollback()
+            error_code = getattr(getattr(exc, "orig", None), "args", (None,))[0]
+            if error_code == 1205:
+                raise PriorityQueueLockError(
+                    "Priority refresh claim is waiting on a database lock."
+                ) from exc
+            raise
     return None
 
 
@@ -4048,6 +4107,13 @@ def require_priority_refresh_queue(
             preflight=preflight,
             completed_job_ids=completed_job_ids,
         )
+    except PriorityQueueLockError as exc:
+        message = f"{exc} Processing stopped; retry after the lock clears."
+        publish_ai_processing_status(
+            status="failed", message=message, finished_at=utc_now_naive()
+        )
+        log(f"[fatal] {message}")
+        raise SystemExit(1) from None
     except OllamaUnavailableError as exc:
         message = safe_ollama_failure_message(exc) + " Priority refresh remains queued; processing stopped."
         publish_ai_processing_status(status="failed", message=message, finished_at=utc_now_naive())
@@ -4131,7 +4197,15 @@ def _run_main(args: argparse.Namespace) -> None:
 
     # Manual per-job refreshes outrank every scheduled queue. Specialized
     # command modes above keep their intentionally narrow contracts.
-    recovered_refreshes = recover_interrupted_ai_refresh_requests()
+    try:
+        recovered_refreshes = recover_interrupted_ai_refresh_requests()
+    except PriorityQueueLockError as exc:
+        message = f"{exc} Scheduled processing stopped; retry after the lock clears."
+        publish_ai_processing_status(
+            status="failed", message=message, finished_at=utc_now_naive()
+        )
+        log(f"[fatal] {message}")
+        raise SystemExit(1) from None
     if recovered_refreshes:
         log(
             f"[priority] recovered {recovered_refreshes} interrupted "

@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import create_engine, inspect as sa_inspect
+from sqlalchemy import create_engine, event, inspect as sa_inspect
 from sqlalchemy.orm import sessionmaker
 
 import analyze_jobs_ollama as analyzer
@@ -358,7 +358,14 @@ def test_exclusive_analyzer_lock_rejects_a_second_local_owner(tmp_path):
 
 
 def test_exclusive_start_recovers_running_priority_requests(monkeypatch, tmp_path):
-    _, factory = _database(tmp_path)
+    engine, factory = _database(tmp_path)
+    recovery_updates = []
+
+    def capture_recovery_update(_conn, _cursor, statement, _params, _context, _many):
+        if statement.lstrip().upper().startswith("UPDATE JOB_AI_REFRESH_REQUESTS"):
+            recovery_updates.append(statement)
+
+    event.listen(engine, "before_cursor_execute", capture_recovery_update)
     requested_at = datetime(2026, 10, 14, 5, 23, 33)
     with factory() as session:
         session.add_all(
@@ -386,6 +393,8 @@ def test_exclusive_start_recovers_running_priority_requests(monkeypatch, tmp_pat
     monkeypatch.setattr(analyzer, "SessionLocal", factory)
 
     assert analyzer.recover_interrupted_ai_refresh_requests() == 1
+    assert len(recovery_updates) == 1
+    assert "job_pk" in recovery_updates[0]
     with factory() as session:
         recovered = session.get(JobAIRefreshRequest, 5872)
         untouched = session.get(JobAIRefreshRequest, 6000)
@@ -410,6 +419,26 @@ def test_exclusive_start_recovers_running_priority_requests(monkeypatch, tmp_pat
         "interrupted-owner",
         "detailed_analysis",
     ) is False
+
+
+def test_priority_recovery_does_not_issue_a_bulk_update_when_nothing_is_running(
+    monkeypatch, tmp_path
+):
+    engine, factory = _database(tmp_path)
+    updates = []
+    event.listen(
+        engine,
+        "before_cursor_execute",
+        lambda _conn, _cursor, statement, _params, _context, _many: (
+            updates.append(statement)
+            if statement.lstrip().upper().startswith("UPDATE JOB_AI_REFRESH_REQUESTS")
+            else None
+        ),
+    )
+    monkeypatch.setattr(analyzer, "SessionLocal", factory)
+
+    assert analyzer.recover_interrupted_ai_refresh_requests() == 0
+    assert updates == []
 
 
 def test_priority_stage_publishes_current_job_only_for_lease_owner(monkeypatch, tmp_path):
@@ -828,6 +857,50 @@ def test_main_stops_before_scheduled_work_when_priority_refresh_fails(
     assert selected == []
     assert publications[-1]["status"] == "failed"
     assert "scheduled processing was stopped" in publications[-1]["message"]
+
+
+def test_main_stops_cleanly_when_priority_recovery_is_database_locked(
+    monkeypatch, tmp_path
+):
+    _, factory = _database(tmp_path)
+    resume = tmp_path / "resume.txt"
+    resume.write_text("resume", encoding="utf-8")
+    events = []
+
+    monkeypatch.setattr(analyzer, "SessionLocal", factory)
+    monkeypatch.setattr(analyzer, "RESUME_PATH", str(resume))
+    monkeypatch.setattr(analyzer, "init_db", lambda: None)
+    monkeypatch.setattr(analyzer, "exclusive_analyzer_lock", lambda: nullcontext())
+    monkeypatch.setattr(
+        analyzer,
+        "parse_args",
+        lambda: SimpleNamespace(compensation_only=False, redo=None),
+    )
+    monkeypatch.setattr(
+        analyzer,
+        "recover_interrupted_ai_refresh_requests",
+        lambda: (_ for _ in ()).throw(
+            analyzer.PriorityQueueLockError("Priority recovery is database locked.")
+        ),
+    )
+    monkeypatch.setattr(
+        analyzer,
+        "drain_priority_refresh_queue",
+        lambda *_args, **_kwargs: events.append("priority") or {"processed": 0, "failed": 0},
+    )
+    monkeypatch.setattr(
+        analyzer,
+        "publish_ai_processing_status",
+        lambda **kwargs: events.append(kwargs),
+    )
+
+    with pytest.raises(SystemExit) as stopped:
+        analyzer.main()
+
+    assert stopped.value.code == 1
+    assert "priority" not in events
+    assert events[-1]["status"] == "failed"
+    assert "retry after the lock clears" in events[-1]["message"]
 
 
 def test_main_checks_priority_refresh_before_scheduled_queues(monkeypatch, tmp_path):
@@ -1417,6 +1490,55 @@ def test_fit_brief_repair_explains_the_string_array_contract():
     prompt = analyzer.fit_brief_repair_prompt("{}", "strongest_matches must be list[str]")
     assert "arrays of strings, not objects" in prompt
     assert "Validation failure: strongest_matches must be list[str]" in prompt
+
+
+def test_fit_brief_accepts_exact_resume_evidence_with_normalized_whitespace():
+    payload = {
+        "score_explanation": "Strong alignment.",
+        "strongest_matches": ["Relevant experience"],
+        "concerns_or_gaps": [],
+        "risk_flags": [],
+        "interview_angle": "Explain the experience.",
+        "resume_bullet_matches": [{
+            "resume_bullet": "Led vendor security reviews across 20 critical suppliers.",
+            "job_requirement": "Evaluate vendor security controls.",
+            "why_it_matters": "Demonstrates direct third-party risk experience.",
+            "confidence": "high",
+        }],
+    }
+
+    valid, reason = analyzer.validate_fit_brief_schema(
+        payload,
+        "Led vendor security reviews\nacross 20 critical suppliers.",
+    )
+
+    assert valid is True
+    assert reason == ""
+
+
+def test_compensation_normalizes_unconfirmed_offering_flags_to_unknown():
+    compensation = {
+        "base_pay_low": None,
+        "base_pay_high": None,
+        "pay_currency": None,
+        "pay_period": None,
+        "ote_low": None,
+        "ote_high": None,
+        "bonus_offered": False,
+        "equity_offered": False,
+        "commission_offered": False,
+        "multiple_pay_ranges": False,
+        "compensation_text": None,
+        "compensation_notes": None,
+    }
+
+    valid, reason = analyzer.validate_compensation(compensation)
+
+    assert valid is True
+    assert reason == ""
+    assert compensation["bonus_offered"] is None
+    assert compensation["equity_offered"] is None
+    assert compensation["commission_offered"] is None
 
 
 def test_fit_brief_worker_supplies_actionable_type_repair(monkeypatch):
