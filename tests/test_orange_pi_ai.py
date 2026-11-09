@@ -1,6 +1,9 @@
 import io
 import json
+import shutil
+import subprocess
 import sys
+from pathlib import Path
 from urllib.error import HTTPError, URLError
 
 import pytest
@@ -38,6 +41,7 @@ def test_sends_prompt_and_prints_metrics(monkeypatch, capsys):
     assert benchmark.main() == 0
     output = capsys.readouterr().out
     assert "Hello!" in output
+    assert "socket timeout: 90 s" in output
     assert "Total response time" in output
     assert "Model load time: 0.50 s" in output
     assert "32.00 tokens/s" in output
@@ -91,3 +95,48 @@ def test_reports_failure(monkeypatch, capsys, reply, message):
 
     assert benchmark.main() == 1
     assert message in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("args", "expected"),
+    [
+        (
+            ["--prompt", "Say hello.", "--timeout", "3000"],
+            ["--model", "qwen2.5:1.5b", "--timeout", "3000", "--prompt", "Say hello."],
+        ),
+        (["--model", "qwen2.5:0.5b"], ["--model", "qwen2.5:0.5b", "--timeout", "180"]),
+        (["qwen2.5:0.5b", "300"], ["--model", "qwen2.5:0.5b", "--timeout", "300"]),
+        (["--prompt", "--timeout", "300"], None),
+    ],
+)
+def test_launcher_forwards_options_to_both_runs(args, expected):
+    bash = shutil.which("bash")
+    if bash is None or (sys.platform == "win32" and Path(bash).parent.name.lower() == "system32"):
+        pytest.skip("Requires Bash that can run local files directly")
+
+    launcher = Path(benchmark.__file__).with_name("run_orange_pi_ai_test.sh")
+    # Stub external commands so the test never installs packages or sends prompts.
+    harness = '''
+ollama() {
+    if [[ "$1" == show ]]; then return 1; fi
+    printf 'ollama %s\\n' "$*"
+}
+python3() { shift; printf 'arg=%s\\n' "$@"; }
+sudo() { return 99; }
+export -f ollama python3 sudo
+exec "$BASH" "$@"
+'''
+    result = subprocess.run(
+        [bash, "-c", harness, "test", launcher.as_posix(), *args],
+        capture_output=True, text=True, timeout=10,
+    )
+
+    if expected is None:
+        assert result.returncode == 2
+        assert "Provide a value for --prompt" in result.stderr
+        assert not result.stdout
+    else:
+        assert result.returncode == 0, result.stderr
+        lines = result.stdout.splitlines()
+        assert f"ollama pull {expected[1]}" in lines
+        assert [line[4:] for line in lines if line.startswith("arg=")] == expected * 2

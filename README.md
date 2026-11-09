@@ -231,6 +231,15 @@ Search expansion depends on normal web access to Bing RSS and may return fewer r
 
 For a fresh 64-bit Ubuntu setup, copy `scripts/run_orange_pi_ai_test.sh` and `scripts/orange_pi_ai_test.py` into the same directory on the Pi. From that directory, run `bash run_orange_pi_ai_test.sh`. The script uses `sudo` if it needs to install packages or start the Ollama service. It downloads the model if needed, runs the same prompt twice, and shows which processor Ollama used.
 
+Pass `--prompt` to set the prompt for both runs and `--timeout` to set the socket timeout in seconds. If the first request times out, you can also choose a smaller model with `--model`.
+
+```sh
+bash run_orange_pi_ai_test.sh --prompt "Say hello." --timeout 300
+bash run_orange_pi_ai_test.sh --model qwen2.5:0.5b --timeout 300
+```
+
+If the request still times out, check the Ollama service log with `sudo journalctl -u ollama -n 60 --no-pager`.
+
 ### Manual setup
 
 On 64-bit Ubuntu, install the prerequisites and run the [official Ollama Linux installer](https://docs.ollama.com/linux#install). The installer selects ARM64 on the Pi and sets up an Ollama service on systemd-based Ubuntu.

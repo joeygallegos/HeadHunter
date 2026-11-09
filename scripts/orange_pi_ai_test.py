@@ -47,7 +47,10 @@ def main() -> int:
     )
     # Bypass system proxies so the prompt goes directly to the local server.
     opener = build_opener(ProxyHandler({}))
-    print(f"Model: {args.model}\nWaiting for local Ollama...", flush=True)
+    print(
+        f"Model: {args.model}\nWaiting for local Ollama (socket timeout: {args.timeout} s)...",
+        flush=True,
+    )
     started = perf_counter()
     try:
         with opener.open(request, timeout=args.timeout) as response:

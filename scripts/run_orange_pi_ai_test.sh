@@ -3,7 +3,46 @@ set -euo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 benchmark="$script_dir/orange_pi_ai_test.py"
-model='qwen2.5:1.5b'
+model=qwen2.5:1.5b
+timeout=180
+prompt_args=()
+usage='Usage: bash run_orange_pi_ai_test.sh [--model MODEL] [--prompt TEXT] [--timeout SECONDS]'
+
+# Keep the earlier positional model and timeout syntax working.
+if [[ ${1-} != -* ]] && (( $# == 1 || $# == 2 )); then
+    set -- --model "$1" --timeout "${2-180}"
+fi
+
+while (( $# > 0 )); do
+    case "$1" in
+        -h|--help)
+            printf '%s\n' "$usage"
+            exit 0
+            ;;
+        --model|--prompt|--timeout)
+            if (( $# < 2 )) || [[ $2 == --* || ! $2 =~ [^[:space:]] ]]; then
+                printf 'Provide a value for %s.\n%s\n' "$1" "$usage" >&2
+                exit 2
+            fi
+            case "$1" in
+                --model) model=$2 ;;
+                --prompt) prompt_args=(--prompt "$2") ;;
+                --timeout) timeout=$2 ;;
+            esac
+            shift 2
+            ;;
+        *)
+            printf '%s\n' "$usage" >&2
+            exit 2
+            ;;
+    esac
+done
+
+# Validate overrides before setup can install packages or download a model.
+if [[ ! "$model" =~ ^[[:alnum:]] || ! "$timeout" =~ ^[1-9][0-9]*$ ]]; then
+    printf 'Provide a model tag and a positive timeout in seconds.\n%s\n' "$usage" >&2
+    exit 2
+fi
 
 if [[ ! -r "$benchmark" ]]; then
     printf 'Copy orange_pi_ai_test.py into the same directory as this script.\n' >&2
@@ -50,7 +89,7 @@ fi
 
 for run in 1 2; do
     printf '\nBenchmark run %s of 2\n' "$run"
-    python3 "$benchmark" --model "$model"
+    python3 "$benchmark" --model "$model" --timeout "$timeout" "${prompt_args[@]}"
 done
 
 printf '\nOllama processor report\n'
