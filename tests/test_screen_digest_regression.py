@@ -18,6 +18,7 @@ from app.models import (
     JobAIRefreshRequest,
     JobAnalysisRetry,
     JobApplicationPrep,
+    JobFitBrief,
     JobMatchScreen,
     JobSwipe,
 )
@@ -1064,11 +1065,66 @@ def test_ai_pipeline_page_is_addressable_and_exposes_accessible_queue_lanes():
         "Queued work",
         "Application Prep",
         "Match analysis",
+        "processed since opening the page",
     ):
         assert label in template
     assert 'aria-live="polite"' in template
     assert "if (this.view === 'pipeline') this.loadPipeline(false);" in template
     assert "@click=\"openPipelineJob(item)\"" in template
+
+
+def test_ai_pipeline_counts_saved_results_since_each_page_opened(monkeypatch, tmp_path):
+    engine, factory = _database(tmp_path)
+    monkeypatch.setattr(dashboard, "engine", engine)
+    monkeypatch.setattr(dashboard, "SessionLocal", factory)
+    monkeypatch.setattr(dashboard, "_read_current_ollama_run", lambda: {})
+    opened = datetime(2026, 11, 8, 18, 0)
+    finished = opened + timedelta(seconds=1)
+    reopened = finished + timedelta(seconds=1)
+    clock = iter([opened, reopened])
+    monkeypatch.setattr(dashboard, "utc_now_naive", lambda: next(clock))
+    client = dashboard.app.test_client()
+
+    def poll(since):
+        response = client.get("/api/ollama-processing", query_string={"processed_since": since})
+        assert response.status_code == 200
+        return response.get_json()["pipeline"]["processed_since_count"]
+
+    with factory() as session:
+        _refresh_job(session, "old", ai_analyzed_at=opened - timedelta(seconds=1))
+        session.commit()
+
+    page = client.get("/?view=pipeline").get_data(as_text=True)
+    assert f'pipelineOpenedAt: "{opened.isoformat()}"' in page
+    assert poll(opened.isoformat()) == 0
+
+    with factory() as session:
+        analyzed = _refresh_job(session, "analyzed", ai_analyzed_at=finished)
+        screened = _refresh_job(session, "screened", ai_analysis=None)
+        pending = _refresh_job(session, "pending", ai_analysis=None)
+        prepared = _refresh_job(session, "prepared")
+        refreshed = _refresh_job(session, "refreshed")
+        brief = _refresh_job(session, "brief")
+        session.add_all([
+            JobMatchScreen(job_pk=screened.id, input_hash="a" * 64, match_percentage=30,
+                           experience_match="qualified", screened_at=finished),
+            JobMatchScreen(job_pk=pending.id, input_hash="b" * 64, match_percentage=100,
+                           experience_match="qualified", screened_at=finished),
+            JobAIRefreshRequest(job_pk=pending.id, status="failed", finished_at=finished),
+            JobAIRefreshRequest(job_pk=refreshed.id, status="done", finished_at=finished),
+            JobApplicationPrep(job_pk=prepared.id, status="done", generated_at=finished),
+            JobApplicationPrep(job_pk=analyzed.id, status="done", generated_at=finished),
+            JobFitBrief(job_pk=brief.id, brief_json="{}", resume_hash="a" * 64,
+                        job_content_hash="b" * 64, generated_at=finished, schema_version=1),
+        ])
+        session.commit()
+
+    assert poll(opened.isoformat()) == 5
+    page = client.get("/?view=pipeline").get_data(as_text=True)
+    assert f'pipelineOpenedAt: "{reopened.isoformat()}"' in page
+    assert poll(reopened.isoformat()) == 0
+    assert poll(opened.isoformat()) == 5
+    assert client.get("/api/ollama-processing?processed_since=invalid").status_code == 400
 
 
 def test_dashboard_lookup_view_renders_valid_initial_ui_state():

@@ -106,6 +106,8 @@
                 <span class="text-slate-300"> active</span></span>
               <span><strong class="text-lg" x-text="pipelineBacklogCount()"></strong>
                 <span class="text-slate-300"> in backlog</span></span>
+              <span><strong class="text-lg" x-text="pipelineQueue.processed_since_count"></strong>
+                <span class="text-slate-300"> processed since opening the page</span></span>
             </div>
           </div>
 
@@ -2219,6 +2221,8 @@
         jobDetailPage: {{ job_detail_page | tojson }},
         initialJob: {{ initial_job | tojson }},
         initialApplicationPrepJobId: {{ initial_application_prep_job_id | tojson }},
+        // The server and saved results use UTC; keep the same start time on every refresh.
+        pipelineOpenedAt: {{ pipeline_opened_at | default(none) | tojson }},
 
     // Runs state
     days: 30,
@@ -2249,6 +2253,7 @@
         pipelineLastUpdated: '',
           pipelinePoller: null,
             pipelineQueue: {
+              processed_since_count: 0,
               priority: { count: 0, items: [] },
               active: { count: 0, items: [] },
               application_prep: { count: 0, items: [] },
@@ -2437,7 +2442,8 @@
       this.pipelineError = '';
       try
       {
-        const res = await fetch('/api/ollama-processing');
+        const params = new URLSearchParams({ processed_since: this.pipelineOpenedAt });
+        const res = await fetch(`/api/ollama-processing?${params}`);
         if (!res.ok) throw new Error('Unable to load the AI processing pipeline.');
         const data = await res.json();
         const pipeline = data.pipeline || {};
@@ -2445,6 +2451,7 @@
         this.ollamaCurrentRun = data.current_run || {};
         // Preserve a complete view model when an older dashboard response omits a lane.
         this.pipelineQueue = {
+          processed_since_count: pipeline.processed_since_count || 0,
           priority: pipeline.priority || { count: 0, items: [] },
           active: pipeline.active || { count: 0, items: [] },
           application_prep: pipeline.application_prep || { count: 0, items: [] },

@@ -37,6 +37,7 @@ from sqlalchemy import (
     select,
     text as sa_text,
     tuple_,
+    union,
 )
 from sqlalchemy.exc import IntegrityError
 
@@ -2099,7 +2100,9 @@ def fetch_runs_summary(days: int) -> Dict[str, Any]:
     }
 
 
-def fetch_ollama_processing_report(limit: int = 25) -> Dict[str, Any]:
+def fetch_ollama_processing_report(
+    limit: int = 25, *, processed_since: Optional[datetime] = None
+) -> Dict[str, Any]:
     """Summarize AI coverage plus the durable and in-flight processing lanes."""
     no_final_filter = or_(Job.ai_analysis.is_(None), func.trim(Job.ai_analysis) == "")
     content_filter = or_(
@@ -2211,6 +2214,34 @@ def fetch_ollama_processing_report(limit: int = 25) -> Dict[str, Any]:
             .limit(limit)
         ).all()
 
+        processed_since_count = 0
+        if processed_since is not None:
+            # Use saved results so new queue arrivals and worker restarts do not
+            # affect the count. One job can produce results in several stages.
+            completed_jobs = [
+                select(Job.id).where(Job.ai_analyzed_at >= processed_since, ~no_final_filter),
+                select(JobFitBrief.job_pk).where(JobFitBrief.generated_at >= processed_since),
+                # Requeueing prep can change its status without undoing its last saved result.
+                select(JobApplicationPrep.job_pk).where(
+                    JobApplicationPrep.generated_at >= processed_since
+                ),
+                select(JobAIRefreshRequest.job_pk).where(
+                    JobAIRefreshRequest.finished_at >= processed_since,
+                    JobAIRefreshRequest.status == "done",
+                ),
+            ]
+            if has_screen_cache:
+                # Only a screen below the threshold finishes the analysis lane.
+                completed_jobs.append(
+                    select(JobMatchScreen.job_pk).where(
+                        JobMatchScreen.screened_at >= processed_since,
+                        JobMatchScreen.match_percentage < DASH_DEEP_ANALYSIS_MIN_MATCH,
+                    )
+                )
+            processed_since_count = session.scalar(
+                select(func.count()).select_from(union(*completed_jobs).subquery())
+            ) or 0
+
         # Worker heartbeats intentionally contain natural identifiers instead
         # of database keys. Resolve those keys here only to make bubbles link to
         # Job Lookup; an unresolved heartbeat remains visible but non-clickable.
@@ -2313,6 +2344,7 @@ def fetch_ollama_processing_report(limit: int = 25) -> Dict[str, Any]:
         "display_limit": limit,
         "current_run": current_run,
         "pipeline": {
+            "processed_since_count": int(processed_since_count),
             "priority": {"count": int(priority_count), "items": priority_items},
             "active": {"count": len(active_items), "items": active_items},
             "application_prep": {
@@ -4144,6 +4176,7 @@ def index():
         job_detail_page=False,
         initial_job=None,
         initial_application_prep_job_id=initial_application_prep_job_id,
+        pipeline_opened_at=utc_now_naive().isoformat() if initial_view == "pipeline" else None,
     )
 
 
@@ -4372,7 +4405,14 @@ def api_runs_summary():
 @app.route("/api/ollama-processing")
 def api_ollama_processing():
     """Return live AI coverage and worker heartbeat without rebuilding run charts."""
-    return jsonify(fetch_ollama_processing_report())
+    since = request.args.get("processed_since")
+    if since is None:
+        return jsonify(fetch_ollama_processing_report())
+    try:
+        processed_since = _as_utc(datetime.fromisoformat(since)).replace(tzinfo=None)
+    except (ValueError, OverflowError):
+        return jsonify(error="Invalid AI pipeline start time."), 400
+    return jsonify(fetch_ollama_processing_report(processed_since=processed_since))
 
 
 @app.route("/api/jobs")
