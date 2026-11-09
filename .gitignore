@@ -9,6 +9,7 @@ JobScrape.code-workspace
 /tests/*
 !/tests/test_timestamp_consistency.py
 !/tests/test_ollama_fail_fast.py
+!/tests/test_orange_pi_ai.py
 !/tests/test_screen_digest_regression.py
 !/tests/test_resume_variants.py
 !/tests/test_google_resume.py
@@ -16,7 +17,9 @@ JobScrape.code-workspace
 !/scripts/
 /scripts/*
 !/scripts/migrate_timestamps_to_utc.py
+!/scripts/orange_pi_ai_test.py
 !/scripts/repair_missing_ai_compensation_overwrites.py
+!/scripts/run_orange_pi_ai_test.sh
 !/scripts/sql/
 /scripts/sql/*
 !/scripts/sql/verify_timestamp_utc.mysql.sql

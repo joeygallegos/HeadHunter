@@ -227,6 +227,33 @@ Open the dashboard and use the `Discovery` tab to watch the journey log and revi
 
 Search expansion depends on normal web access to Bing RSS and may return fewer results if the endpoint rate-limits, blocks, or changes response format. In that case the script logs the failed search event and continues with configured seeds.
 
+## Orange Pi 5 AI test
+
+For a fresh 64-bit Ubuntu setup, copy `scripts/run_orange_pi_ai_test.sh` and `scripts/orange_pi_ai_test.py` into the same directory on the Pi. From that directory, run `bash run_orange_pi_ai_test.sh`. The script uses `sudo` if it needs to install packages or start the Ollama service. It downloads the model if needed, runs the same prompt twice, and shows which processor Ollama used.
+
+### Manual setup
+
+On 64-bit Ubuntu, install the prerequisites and run the [official Ollama Linux installer](https://docs.ollama.com/linux#install). The installer selects ARM64 on the Pi and sets up an Ollama service on systemd-based Ubuntu.
+
+```sh
+sudo apt update
+sudo apt install python3 curl zstd
+curl -fsSL https://ollama.com/install.sh -o ollama-install.sh && sh ollama-install.sh
+ollama list
+```
+
+`ollama list` checks that the CLI can reach the service. An empty model list is normal on a fresh install. If it cannot connect, check `systemctl status ollama` and start the service with `sudo systemctl start ollama`. On an image without systemd, run `ollama serve` in a separate terminal and leave it open.
+
+Copy `scripts/orange_pi_ai_test.py` to the Orange Pi and run these commands from the directory containing the copied file. The model download requires internet access. The benchmark uses Python's standard library and sends the prompt to Ollama on the same machine.
+
+```sh
+ollama pull qwen2.5:1.5b
+python3 orange_pi_ai_test.py
+python3 orange_pi_ai_test.py --prompt "Summarize why regular backups matter in two sentences."
+```
+
+Use `--model` to try another installed model and `--timeout` if the Pi needs more time to respond. The script prints the answer, end-to-end response time, and Ollama's load time and generation speed when available. The first run may include model loading. Repeat the same prompt to see how it performs with the model already loaded.
+
 ## Ubuntu / OrangePi 5 Deployment
 
 The scraper uses Selenium with Chrome-compatible browsers. On Ubuntu servers, Chromium is supported; set the scraper to headless mode and point Selenium at Chromium/ChromeDriver if auto-discovery cannot find them.
